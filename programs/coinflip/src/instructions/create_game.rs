@@ -46,9 +46,9 @@ pub struct CreateGame<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Deny-list per the design spec: transfer-fee breaks the payout math,
-/// transfer hooks change the wire format, a permanent delegate can drain
-/// the escrow. Freeze authority is allowed (USDC) — documented risk.
+/// Allow-list per the design spec, deny by default: an extension this
+/// program hasn't reviewed must never silently pass. Freeze authority is
+/// allowed (USDC) — documented risk.
 fn validate_mint(mint_info: &AccountInfo) -> Result<()> {
     if *mint_info.owner == anchor_spl::token::ID {
         return Ok(());
@@ -61,12 +61,26 @@ fn validate_mint(mint_info: &AccountInfo) -> Result<()> {
         .map_err(|_| error!(CoinflipError::UnsupportedMintExtension))?;
     for extension in extensions {
         match extension {
-            ExtensionType::TransferFeeConfig
-            | ExtensionType::TransferHook
-            | ExtensionType::PermanentDelegate => {
-                return err!(CoinflipError::UnsupportedMintExtension)
-            }
-            _ => {}
+            // Known-safe: display/metadata/grouping, confidential mint config,
+            // interest/scaled display, mint close (only closable at 0 supply),
+            // default account state (fails closed at transfer time).
+            ExtensionType::MintCloseAuthority
+            | ExtensionType::InterestBearingConfig
+            | ExtensionType::ScaledUiAmount
+            | ExtensionType::MetadataPointer
+            | ExtensionType::TokenMetadata
+            | ExtensionType::GroupPointer
+            | ExtensionType::GroupMemberPointer
+            | ExtensionType::TokenGroup
+            | ExtensionType::TokenGroupMember
+            | ExtensionType::ConfidentialTransferMint
+            | ExtensionType::DefaultAccountState => {}
+            // Everything else — including TransferFeeConfig/TransferHook
+            // (break payout math), PermanentDelegate (escrow drain),
+            // Pausable (global freeze), ConfidentialTransferFeeConfig,
+            // NonTransferable (can never pay out), and any extension a future
+            // dependency bump introduces — is denied.
+            _ => return err!(CoinflipError::UnsupportedMintExtension),
         }
     }
     Ok(())
@@ -74,6 +88,7 @@ fn validate_mint(mint_info: &AccountInfo) -> Result<()> {
 
 pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
     require!(amount > 0, CoinflipError::ZeroAmount);
+    require!(amount <= u64::MAX / 2, CoinflipError::NumericalOverflow);
     let side = Side::from_byte(side)?;
     validate_mint(&ctx.accounts.mint.to_account_info())?;
 
@@ -112,6 +127,7 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
         mint: game.token_mint,
         amount,
         host_side: game.host_side,
+        fee_bps: game.fee_bps,
     });
     Ok(())
 }

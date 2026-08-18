@@ -7,6 +7,8 @@ pub struct GameCreated {
     pub mint: Pubkey,
     pub amount: u64,
     pub host_side: u8,
+    /// Fee snapshot the game was created under.
+    pub fee_bps: u16,
 }
 
 #[event]

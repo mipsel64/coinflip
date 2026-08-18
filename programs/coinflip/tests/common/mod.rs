@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
 use anchor_lang::{
-    AccountDeserialize, AnchorSerialize, Discriminator, InstructionData, ToAccountMetas,
+    AccountDeserialize, AnchorDeserialize, AnchorSerialize, Discriminator, InstructionData,
+    ToAccountMetas,
 };
 // Not yet called from this module; later tasks' helpers (e.g. treasury/joiner ATAs) use it.
 #[allow(unused_imports)]
@@ -30,6 +31,7 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::{Transaction, TransactionError},
 };
+pub use spl_token_2022::extension::ExtensionType;
 // `solana_sdk::system_program` is soft-deprecated in favor of `solana_system_interface::program`;
 // keep using the re-export to avoid adding a new direct dependency for a single constant.
 #[allow(deprecated)]
@@ -294,25 +296,43 @@ pub fn write_token_account_at_for_program(
     .unwrap();
 }
 
-/// Token-2022 mint carrying a TransferFeeConfig extension — used to prove the
-/// deny-list rejects it. Crafted with spl-token-2022's own TLV packing.
-pub fn create_t22_transfer_fee_mint(svm: &mut LiteSVM, decimals: u8) -> Pubkey {
+/// Token-2022 mint carrying the given extensions (zeroed/default field
+/// values) — used to prove the allow-list rejects the denied ones. Crafted
+/// with spl-token-2022's own TLV packing.
+pub fn create_t22_mint_with_extensions(
+    svm: &mut LiteSVM,
+    decimals: u8,
+    extensions: &[ExtensionType],
+) -> Pubkey {
     use spl_token_2022::extension::{
-        transfer_fee::TransferFeeConfig, BaseStateWithExtensionsMut, ExtensionType,
-        StateWithExtensionsMut,
+        permanent_delegate::PermanentDelegate, transfer_fee::TransferFeeConfig,
+        transfer_hook::TransferHook, BaseStateWithExtensionsMut, StateWithExtensionsMut,
     };
 
     let mint = Pubkey::new_unique();
-    let account_len = ExtensionType::try_calculate_account_len::<spl_token_2022::state::Mint>(&[
-        ExtensionType::TransferFeeConfig,
-    ])
-    .unwrap();
+    let account_len =
+        ExtensionType::try_calculate_account_len::<spl_token_2022::state::Mint>(extensions)
+            .unwrap();
     let mut data = vec![0u8; account_len];
     let mut state =
         StateWithExtensionsMut::<spl_token_2022::state::Mint>::unpack_uninitialized(&mut data)
             .unwrap();
-    // Zeroed/default fee fields are fine — the deny-list only checks presence.
-    state.init_extension::<TransferFeeConfig>(true).unwrap();
+    // Zeroed/default extension fields are fine — the allow-list only checks
+    // presence of the extension, not its configured values.
+    for extension in extensions {
+        match extension {
+            ExtensionType::TransferFeeConfig => {
+                state.init_extension::<TransferFeeConfig>(true).unwrap();
+            }
+            ExtensionType::TransferHook => {
+                state.init_extension::<TransferHook>(true).unwrap();
+            }
+            ExtensionType::PermanentDelegate => {
+                state.init_extension::<PermanentDelegate>(true).unwrap();
+            }
+            other => panic!("create_t22_mint_with_extensions: unsupported extension {other:?}"),
+        }
+    }
     state.base = spl_token_2022::state::Mint {
         mint_authority: COption::None,
         supply: 1_000_000_000_000,
@@ -338,16 +358,64 @@ pub fn create_t22_transfer_fee_mint(svm: &mut LiteSVM, decimals: u8) -> Pubkey {
     mint
 }
 
-pub fn token_balance(svm: &LiteSVM, address: &Pubkey) -> u64 {
+/// Reads the base token-account fields (owner, mint, amount, ...) from either
+/// a legacy SPL Token account or a Token-2022 account (with or without
+/// extensions) — `StateWithExtensions` falls back to a plain base unpack when
+/// there's no TLV data trailing the base account, so a legacy 165-byte
+/// account round-trips the same way.
+pub fn read_token_account(svm: &LiteSVM, address: &Pubkey) -> spl_token_2022::state::Account {
     let account = svm.get_account(address).expect("token account missing");
-    spl_token::state::Account::unpack(&account.data)
-        .unwrap()
-        .amount
+    spl_token_2022::extension::StateWithExtensions::<spl_token_2022::state::Account>::unpack(
+        &account.data,
+    )
+    .unwrap()
+    .base
+}
+
+pub fn token_balance(svm: &LiteSVM, address: &Pubkey) -> u64 {
+    read_token_account(svm, address).amount
 }
 
 pub fn read_game(svm: &LiteSVM, address: &Pubkey) -> Game {
     let account = svm.get_account(address).expect("game account missing");
     Game::try_deserialize(&mut &account.data[..]).expect("failed to deserialize Game")
+}
+
+/// Finds the first inner instruction that is an `emit_cpi!`'d `T` event
+/// originating from `program_id`, and decodes it.
+///
+/// `ixs`/`payer` must be exactly what was passed to the `send`/`send_ok` call
+/// that produced `meta`: resolving each inner instruction's
+/// `program_id_index` requires re-deriving the same account-key ordering
+/// `Transaction::new_signed_with_payer` used when compiling the sent
+/// transaction (it calls `Message::new(instructions, payer)` internally, so
+/// calling it again here with the same inputs reproduces the same ordering).
+pub fn find_cpi_event<T: AnchorDeserialize + Discriminator>(
+    ixs: &[Instruction],
+    payer: &Pubkey,
+    program_id: &Pubkey,
+    meta: &TransactionMetadata,
+) -> Option<T> {
+    let message = solana_sdk::message::Message::new(ixs, Some(payer));
+    for inner in meta.inner_instructions.iter().flatten() {
+        let compiled = &inner.instruction;
+        if message.account_keys.get(compiled.program_id_index as usize) != Some(program_id) {
+            continue;
+        }
+        let Some(rest) = compiled
+            .data
+            .strip_prefix(anchor_lang::event::EVENT_IX_TAG_LE)
+        else {
+            continue;
+        };
+        let Some(fields) = rest.strip_prefix(T::DISCRIMINATOR) else {
+            continue;
+        };
+        if let Ok(event) = T::try_from_slice(fields) {
+            return Some(event);
+        }
+    }
+    None
 }
 
 pub struct OraoEnv {
@@ -571,7 +639,13 @@ pub struct GameFixture {
 }
 
 /// initialize_config + mint + funded host + create_game (host_side = Heads).
-pub fn setup_open_game(svm: &mut LiteSVM, payer: &Keypair, amount: u64) -> GameFixture {
+/// Also returns the create_game transaction's metadata, so callers can assert
+/// on its emitted events (see `find_cpi_event`) without re-sending.
+pub fn setup_open_game(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    amount: u64,
+) -> (GameFixture, TransactionMetadata) {
     let treasury = Pubkey::new_unique();
     send_ok(
         svm,
@@ -588,10 +662,11 @@ pub fn setup_open_game(svm: &mut LiteSVM, payer: &Keypair, amount: u64) -> GameF
     let host = Keypair::new();
     svm.airdrop(&host.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
     let mint = create_mint(svm, 9);
-    let host_token_account = create_token_account(svm, mint, host.pubkey(), amount * 10);
+    let host_token_account =
+        create_token_account(svm, mint, host.pubkey(), amount.saturating_mul(10));
 
     let game = Keypair::new();
-    send_ok(
+    let meta = send_ok(
         svm,
         &[&host, &game],
         &[ix_create_game(
@@ -605,15 +680,18 @@ pub fn setup_open_game(svm: &mut LiteSVM, payer: &Keypair, amount: u64) -> GameF
     );
 
     let escrow = escrow_pda(&game.pubkey());
-    GameFixture {
-        host,
-        game,
-        mint,
-        host_token_account,
-        escrow,
-        treasury,
-        amount,
-    }
+    (
+        GameFixture {
+            host,
+            game,
+            mint,
+            host_token_account,
+            escrow,
+            treasury,
+            amount,
+        },
+        meta,
+    )
 }
 
 pub fn ix_update_config(
