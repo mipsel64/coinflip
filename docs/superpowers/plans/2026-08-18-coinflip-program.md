@@ -635,11 +635,18 @@ pub struct GameSettled {
 #[event]
 pub struct GameCancelled {
     pub game: Pubkey,
+    pub host: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
 }
 
 #[event]
 pub struct GameRefunded {
     pub game: Pubkey,
+    pub host: Pubkey,
+    pub joiner: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
 }
 ```
 
@@ -1582,7 +1589,12 @@ pub(crate) fn handle(ctx: Context<CancelGame>) -> Result<()> {
     ))?;
 
     ctx.accounts.game.state = GameState::Cancelled.into();
-    emit_cpi!(GameCancelled { game: game_key });
+    emit_cpi!(GameCancelled {
+        game: game_key,
+        host: ctx.accounts.game.host,
+        mint: ctx.accounts.game.token_mint,
+        amount: ctx.accounts.game.amount,
+    });
     Ok(())
 }
 ```
@@ -1650,6 +1662,15 @@ anchor build && cargo test -p coinflip --test e2e_create_cancel
 git add -A && git commit -m "feat: cancel_game"
 ```
 Expected: PASS (5 tests).
+
+> **Post-review amendments (applied after Task 9's code review):** the cancel
+> suite grew to 12 tests (stake-cap boundary, liveness refund accounts,
+> wrong-mint/non-owned refund rejections, event + rent-delta assertions);
+> `ix_cancel_game` delegates to `ix_cancel_game_with_refund_account`;
+> `GameCancelled`/`GameRefunded` were enriched pre-ABI for standalone
+> indexability (see the Task 5 snippet, already updated). Note: the
+> `state = Cancelled` write is dead (Anchor `close` skips serialization) — the
+> re-cancel guard is account closure itself; never make that byte load-bearing.
 
 ---
 
@@ -1957,6 +1978,15 @@ pub fn setup_joined_game(svm: &mut LiteSVM, payer: &Keypair, amount: u64) -> Joi
     JoinedGame { fixture, joiner, joiner_token_account, treasury_token_account, orao, request }
 }
 ```
+
+- [ ] **Step 5 (carried from Task 9 review): two additional tests**
+
+In `tests/e2e_create_cancel.rs`: `cancel_after_join_fails` — after a full join
+(state AwaitingRandomness), host attempts cancel → `InvalidGameState` (this is
+the guard between a joined game and the host stealing the joiner's stake — first
+testable now). And a Token-2022 ALLOWED-extension happy path: a t22 mint with
+`MetadataPointer` flows create → cancel end-to-end (needs the crafter to support
+an allowed extension and a token_program parameter on the cancel builder).
 
 - [ ] **Step 5: Write `tests/e2e_join.rs`**
 
@@ -2701,7 +2731,13 @@ pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
     ))?;
 
     ctx.accounts.game.state = GameState::Refunded.into();
-    emit_cpi!(GameRefunded { game: game_key });
+    emit_cpi!(GameRefunded {
+        game: game_key,
+        host: ctx.accounts.game.host,
+        joiner: ctx.accounts.game.joiner,
+        mint: ctx.accounts.game.token_mint,
+        amount: ctx.accounts.game.amount,
+    });
     Ok(())
 }
 ```

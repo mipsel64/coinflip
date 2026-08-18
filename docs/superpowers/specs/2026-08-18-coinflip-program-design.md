@@ -237,8 +237,10 @@ gap without any special authority:
 
 `#[event_cpi]` + `emit_cpi!` (playbook Phase 7), one `events.rs`:
 `GameCreated`, `GameJoined`, `GameSettled { game, winner, mint, outcome, pot, fee }`,
-`GameCancelled`, `GameRefunded`. Game + escrow accounts are closed on terminal
-states, so events are the durable history for any indexer/frontend.
+`GameCancelled { game, host, mint, amount }`,
+`GameRefunded { game, host, joiner, mint, amount }`. Game + escrow accounts are
+closed on terminal states, so events are the durable history for any
+indexer/frontend — terminal events carry enough to be interpreted standalone.
 
 ## Repo layout
 
