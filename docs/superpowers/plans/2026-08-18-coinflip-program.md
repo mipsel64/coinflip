@@ -1683,7 +1683,7 @@ Expected: PASS (5 tests).
 
 The callback account list is FIXED here, at request time. Order (after ORAO's 4 fixed accounts) — this order must match `SettleCallback`'s struct order in Task 12 exactly:
 `game(w), escrow(w), host(w), host_token_account(w), joiner_token_account(w), treasury_token_account(w), mint(ro), token_program(ro), event_authority(ro), program(ro)`.
-All five writables are "arbitrary writable" — they must ALSO be appended as writable remaining accounts to the Request CPI (that's how ORAO authorizes them).
+All six writables are "arbitrary writable" — they must ALSO be appended as writable remaining accounts to the Request CPI (that's how ORAO authorizes them).
 
 - [ ] **Step 1: Write `instructions/join_game.rs`**
 
@@ -3024,7 +3024,10 @@ jobs:
       - run: cargo test
 ```
 
-- [ ] **Step 2: Write `README.md`** — cover: what the game is (spec summary + the 5 SOL / 9.9 SOL example), the instruction table from the spec, the ORAO callback flow diagram (create → join(request) → oracle callback → settled; fallback + refund backstops), how to build/test (`anchor build && cargo test`), deployment steps (deploy → `initialize_config` → `scripts register` → `deposit`), and the note that the crank/dealer bot lives in the backend repo. Point to `docs/superpowers/specs/2026-08-18-coinflip-program-design.md` for the full design.
+- [ ] **Step 2: Write `README.md`** — cover (include a Limitations note: the e2e
+  suite exercises Token-2022 only on create/cancel; joins/settlements are tested
+  on classic SPL — a T22 join needs a program-parameterized join builder and
+  `get_associated_token_address_with_program_id` for the treasury ATA): what the game is (spec summary + the 5 SOL / 9.9 SOL example), the instruction table from the spec, the ORAO callback flow diagram (create → join(request) → oracle callback → settled; fallback + refund backstops), how to build/test (`anchor build && cargo test`), deployment steps (deploy → `initialize_config` → `scripts register` → `deposit`), and the note that the crank/dealer bot lives in the backend repo. Point to `docs/superpowers/specs/2026-08-18-coinflip-program-design.md` for the full design.
 
 - [ ] **Step 3: Write `CHANGELOG.md`** (Keep a Changelog format)
 
