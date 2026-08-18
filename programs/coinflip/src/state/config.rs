@@ -1,7 +1,10 @@
 use anchor_lang::prelude::*;
 use static_assertions::const_assert_eq;
 
-use crate::{constants::MAX_FEE_BPS, errors::CoinflipError};
+use crate::{
+    constants::{MAX_FEE_BPS, MAX_REFUND_TIMEOUT_SLOTS, MIN_REFUND_TIMEOUT_SLOTS},
+    errors::CoinflipError,
+};
 
 #[account]
 #[derive(InitSpace)]
@@ -28,6 +31,14 @@ impl Config {
         require!(fee_bps <= MAX_FEE_BPS, CoinflipError::FeeTooHigh);
         Ok(())
     }
+
+    pub fn validate_timeout(refund_timeout_slots: u64) -> Result<()> {
+        require!(
+            (MIN_REFUND_TIMEOUT_SLOTS..=MAX_REFUND_TIMEOUT_SLOTS).contains(&refund_timeout_slots),
+            CoinflipError::InvalidTimeout
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -40,6 +51,14 @@ mod tests {
     fn fee_cap_boundary() {
         assert!(Config::validate_fee(1_000).is_ok());
         assert!(Config::validate_fee(1_001).is_err());
+    }
+
+    #[test]
+    fn timeout_bounds() {
+        assert!(Config::validate_timeout(999).is_err());
+        assert!(Config::validate_timeout(1_000).is_ok());
+        assert!(Config::validate_timeout(10_000_000).is_ok());
+        assert!(Config::validate_timeout(10_000_001).is_err());
     }
 
     #[test]

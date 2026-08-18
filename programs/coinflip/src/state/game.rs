@@ -55,15 +55,18 @@ pub struct Game {
     pub token_mint: Pubkey,
     /// Per-player stake in base units.
     pub amount: u64,
+    /// Fee snapshot from Config at create — settlement uses this, so admin
+    /// fee changes never retro-apply to existing games.
+    pub fee_bps: u16,
     pub host_token_account: Pubkey,
     pub joiner_token_account: Pubkey,
     pub joined_at_slot: u64,
-    pub _reserved: [u8; 64],
+    pub _reserved: [u8; 62],
 }
 
 const_assert_eq!(
     Game::INIT_SPACE,
-    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 32 + 32 + 8 + 64
+    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 2 + 32 + 32 + 8 + 62
 );
 
 impl Game {
@@ -145,10 +148,11 @@ mod tests {
             joiner: Pubkey::new_unique(),
             token_mint: Pubkey::new_unique(),
             amount: 5,
+            fee_bps: 100,
             host_token_account: Pubkey::new_unique(),
             joiner_token_account: Pubkey::new_unique(),
             joined_at_slot: 0,
-            _reserved: [0; 64],
+            _reserved: [0; 62],
         }
     }
 
@@ -176,10 +180,11 @@ mod tests {
             joiner: Pubkey::new_unique(),
             token_mint: Pubkey::new_unique(),
             amount: 42,
+            fee_bps: 100,
             host_token_account: Pubkey::new_unique(),
             joiner_token_account: Pubkey::new_unique(),
             joined_at_slot: 123,
-            _reserved: [7; 64],
+            _reserved: [7; 62],
         };
         let bytes = game.try_to_vec().unwrap();
         assert_eq!(bytes.len(), Game::INIT_SPACE); // borsh runtime == InitSpace

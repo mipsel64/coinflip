@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-use crate::{constants::CONFIG_SEED, state::Config};
+use crate::{constants::CONFIG_SEED, errors::CoinflipError, state::Config};
 
 #[derive(Accounts)]
 pub struct InitializeConfig<'info> {
@@ -17,7 +17,7 @@ pub struct InitializeConfig<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handle(
+pub(crate) fn handle(
     ctx: Context<InitializeConfig>,
     admin: Pubkey,
     treasury: Pubkey,
@@ -25,6 +25,12 @@ pub fn handle(
     refund_timeout_slots: u64,
 ) -> Result<()> {
     Config::validate_fee(fee_bps)?;
+    require!(admin != Pubkey::default(), CoinflipError::InvalidAuthority);
+    require!(
+        treasury != Pubkey::default(),
+        CoinflipError::InvalidAuthority
+    );
+    Config::validate_timeout(refund_timeout_slots)?;
     let config = &mut ctx.accounts.config;
     config.version = Config::LAYOUT_VERSION;
     config.bump = ctx.bumps.config;

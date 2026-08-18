@@ -14,7 +14,7 @@ pub struct UpdateConfig<'info> {
     pub config: Account<'info, Config>,
 }
 
-pub fn handle(
+pub(crate) fn handle(
     ctx: Context<UpdateConfig>,
     new_admin: Option<Pubkey>,
     new_treasury: Option<Pubkey>,
@@ -26,13 +26,22 @@ pub fn handle(
         Config::validate_fee(fee_bps)?;
         config.fee_bps = fee_bps;
     }
+    // Rotation is authorized by the OLD admin (has_one checks pre-update state).
     if let Some(admin) = new_admin {
+        require!(admin != Pubkey::default(), CoinflipError::InvalidAuthority);
         config.admin = admin;
     }
+    // Only affects future games' fee routing; in-flight joined games' callbacks
+    // reference the old treasury ATA (settle those via settle_fallback if needed).
     if let Some(treasury) = new_treasury {
+        require!(
+            treasury != Pubkey::default(),
+            CoinflipError::InvalidAuthority
+        );
         config.treasury = treasury;
     }
     if let Some(slots) = new_refund_timeout_slots {
+        Config::validate_timeout(slots)?;
         config.refund_timeout_slots = slots;
     }
     Ok(())

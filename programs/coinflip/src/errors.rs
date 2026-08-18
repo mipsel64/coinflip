@@ -30,4 +30,8 @@ pub enum CoinflipError {
     NumericalOverflow, // 6011
     #[msg("account does not match the expected authority")]
     OwnerMismatch, // 6012
+    #[msg("authority pubkey cannot be the default key")]
+    InvalidAuthority, // 6013
+    #[msg("refund timeout is out of bounds")]
+    InvalidTimeout, // 6014
 }
