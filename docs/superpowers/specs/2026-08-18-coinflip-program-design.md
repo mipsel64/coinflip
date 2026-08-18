@@ -71,7 +71,7 @@ routes fee reimbursements (see the Config section below).
 | `admin` | `Pubkey` | Can call `update_config` |
 | `treasury` | `Pubkey` | Authority whose ATA receives fees |
 | `fee_bps` | `u16` | Default 100 (1%); hard cap `MAX_FEE_BPS = 1000` (10%) |
-| `refund_timeout_slots` | `u64` | Slots after join before `refund_timeout` is allowed |
+| `refund_timeout_slots` | `u64` | Slots after join before `refund_timeout` is allowed; bounded to [`MIN_REFUND_TIMEOUT_SLOTS`, `MAX_REFUND_TIMEOUT_SLOTS`] |
 | `_reserved` | `[u8; 64]` | Zeroed tail for future fields |
 
 `Config` doubles as the registered VRF **state PDA**: it signs `Request` CPIs and is
@@ -92,10 +92,11 @@ than a stored field, with nothing to keep in sync.
 | `joiner` | `Pubkey` | `Pubkey::default()` until joined |
 | `token_mint` | `Pubkey` | |
 | `amount` | `u64` | Per-player stake, in base units |
+| `fee_bps` | `u16` | Fee snapshot taken from `Config` at create; settlement uses this, so later admin fee changes never apply to already-created games |
 | `host_token_account` | `Pubkey` | Payout target, recorded at create |
 | `joiner_token_account` | `Pubkey` | Payout target, recorded at join |
 | `joined_at_slot` | `u64` | Set at join; drives the refund timeout |
-| `_reserved` | `[u8; 64]` | |
+| `_reserved` | `[u8; 62]` | |
 
 The **VRF seed is the game's pubkey** — unique per game by construction, so no
 stored force field is needed. Enums stored as `u8`, defined `#[repr(u8)]` with
@@ -117,8 +118,8 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 
 | # | Instruction | Signer | Behavior |
 |---|---|---|---|
-| 1 | `initialize_config(fee_bps, refund_timeout_slots)` | deployer | One-time. `fee_bps <= MAX_FEE_BPS`. Admin/treasury = provided keys |
-| 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout |
+| 1 | `initialize_config(admin, treasury, fee_bps, refund_timeout_slots)` | deployer (first caller — initialize immediately after deploy) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to [MIN, MAX]_REFUND_TIMEOUT_SLOTS; admin/treasury must be non-default keys |
+| 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). Treasury rotation: in-flight joined games' callbacks still reference the old treasury ATA — settle them via `settle_fallback` with the new treasury ATA if the callback starts failing |
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. State = Open |
 | 4 | `cancel_game` | host | Requires state == Open. Refund host stake, close escrow + game (rent to host) |
 | 5 | `join_game` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; ensure treasury ATA exists (`init_if_needed`, payer = joiner). Transfer the current VRF fee (read from ORAO `NetworkState`) in lamports joiner → Client PDA. CPI ORAO `Request` (seed = game pubkey, `Config` PDA signs, Client PDA pays) with a request-level callback targeting `settle_callback` and carrying: game, escrow, host + joiner token accounts, treasury ATA, mint, token program. Record joiner, joiner token account, `joined_at_slot`. State = AwaitingRandomness |
@@ -129,7 +130,7 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 **Core settlement** (shared by 6 and 7): verify the request account is the ORAO PDA
 for seed = game pubkey under our client; `outcome = fulfilled_randomness[0] & 1`
 (0 = Heads, 1 = Tails); winner = host if outcome == host_side else joiner;
-`pot = 2 * amount`; `fee = pot * fee_bps / 10_000` (u128 widening, floor); fee →
+`pot = 2 * amount`; `fee = pot * game.fee_bps / 10_000` (fee snapshotted at create; u128 widening, floor); fee →
 treasury ATA, `pot - fee` → winner's recorded token account. Set state = Settled
 before transfers, close escrow + game, rent to host.
 
@@ -209,7 +210,8 @@ gap without any special authority:
   Initial set: `FeeTooHigh`, `InvalidGameState`, `InvalidSide`, `ZeroAmount`,
   `HostCannotJoin`, `MintMismatch`, `UnsupportedMintExtension`,
   `RandomnessNotFulfilled`, `AlreadyFulfilled`, `UnauthorizedVrfClient`,
-  `TimeoutNotReached`, `NumericalOverflow`, `OwnerMismatch`.
+  `TimeoutNotReached`, `NumericalOverflow`, `OwnerMismatch`, `InvalidAuthority`,
+  `InvalidTimeout`.
 - Every Anchor `constraint` carries `@ TypedError`.
 
 ## Events

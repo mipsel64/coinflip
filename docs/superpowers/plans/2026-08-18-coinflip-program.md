@@ -684,7 +684,7 @@ pub struct InitializeConfig<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handle(
+pub(crate) fn handle(
     ctx: Context<InitializeConfig>,
     admin: Pubkey,
     treasury: Pubkey,
@@ -723,7 +723,7 @@ pub struct UpdateConfig<'info> {
     pub config: Account<'info, Config>,
 }
 
-pub fn handle(
+pub(crate) fn handle(
     ctx: Context<UpdateConfig>,
     new_admin: Option<Pubkey>,
     new_treasury: Option<Pubkey>,
@@ -802,6 +802,16 @@ pub mod coinflip {
 anchor build
 git add -A && git commit -m "feat: config instructions"
 ```
+
+> **Post-review amendments (applied after Task 6's code review):** handlers are
+> `pub(crate) fn handle` and `instructions/mod.rs` uses plain glob re-exports (no
+> `#[allow(ambiguous_glob_reexports)]`); both config handlers guard
+> admin/treasury against `Pubkey::default()` (`InvalidAuthority`, 6013) and bound
+> `refund_timeout_slots` to `[MIN_REFUND_TIMEOUT_SLOTS, MAX_REFUND_TIMEOUT_SLOTS]`
+> (`InvalidTimeout`, 6014) via `Config::validate_timeout`; `Game` gained a
+> `fee_bps: u16` snapshot field (reserved shrunk to 62) written at create and
+> used by settlement, so admin fee changes never retro-apply. Later tasks'
+> snippets already reflect all of this.
 
 ---
 
@@ -1130,7 +1140,56 @@ fn update_config_rejects_non_admin() {
     let result = send(&mut svm, &[&mallory], &[ix_update_config(
         mallory.pubkey(), None, None, Some(0), None,
     )]);
-    assert!(result.is_err()); // has_one = admin fails (ConstraintHasOne)
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+}
+
+#[test]
+fn initialize_config_is_one_shot() {
+    let (mut svm, payer) = setup();
+    let ix = ix_initialize_config(
+        payer.pubkey(), payer.pubkey(), Pubkey::new_unique(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    );
+    send(&mut svm, &[&payer], &[ix.clone()]).unwrap();
+    // second init must fail: the PDA already exists
+    assert!(send(&mut svm, &[&payer], &[ix]).is_err());
+}
+
+#[test]
+fn update_config_rejects_fee_above_cap_and_bad_timeout() {
+    let (mut svm, payer) = setup();
+    let admin = payer.pubkey();
+    send(&mut svm, &[&payer], &[ix_initialize_config(
+        payer.pubkey(), admin, Pubkey::new_unique(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    )])
+    .unwrap();
+    let result = send(&mut svm, &[&payer], &[ix_update_config(admin, None, None, Some(1_001), None)]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::FeeTooHigh);
+    let result = send(&mut svm, &[&payer], &[ix_update_config(admin, None, None, None, Some(0))]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidTimeout);
+}
+
+#[test]
+fn admin_rotation_round_trip() {
+    let (mut svm, payer) = setup();
+    send(&mut svm, &[&payer], &[ix_initialize_config(
+        payer.pubkey(), payer.pubkey(), Pubkey::new_unique(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    )])
+    .unwrap();
+    let new_admin = solana_sdk::signature::Keypair::new();
+    svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+    // old admin rotates to new
+    send(&mut svm, &[&payer], &[ix_update_config(
+        payer.pubkey(), Some(new_admin.pubkey()), None, None, None,
+    )])
+    .unwrap();
+    // old admin is now rejected
+    let result = send(&mut svm, &[&payer], &[ix_update_config(payer.pubkey(), None, None, Some(200), None)]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+    // new admin works
+    send(&mut svm, &[&new_admin], &[ix_update_config(
+        new_admin.pubkey(), None, None, Some(200), None,
+    )])
+    .unwrap();
 }
 ```
 
@@ -1169,10 +1228,10 @@ use anchor_spl::{
 };
 
 use crate::{
-    constants::ESCROW_SEED,
+    constants::{CONFIG_SEED, ESCROW_SEED},
     errors::CoinflipError,
     events::GameCreated,
-    state::{Game, GameState, Side},
+    state::{Config, Game, GameState, Side},
 };
 
 #[event_cpi]
@@ -1180,6 +1239,9 @@ use crate::{
 pub struct CreateGame<'info> {
     #[account(mut)]
     pub host: Signer<'info>,
+    /// Fee snapshot source; games settle at the fee they were created under.
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
     /// Fresh keypair account — its pubkey IS the game id (it signs init only).
     #[account(init, payer = host, space = 8 + Game::INIT_SPACE)]
     pub game: Box<Account<'info, Game>>,
@@ -1229,7 +1291,7 @@ fn validate_mint(mint_info: &AccountInfo) -> Result<()> {
     Ok(())
 }
 
-pub fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
+pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
     require!(amount > 0, CoinflipError::ZeroAmount);
     let side = Side::from_byte(side)?;
     validate_mint(&ctx.accounts.mint.to_account_info())?;
@@ -1257,6 +1319,7 @@ pub fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
     game.joiner = Pubkey::default();
     game.token_mint = ctx.accounts.mint.key();
     game.amount = amount;
+    game.fee_bps = ctx.accounts.config.fee_bps;
     game.host_token_account = ctx.accounts.host_token_account.key();
     game.joiner_token_account = Pubkey::default();
     game.joined_at_slot = 0;
@@ -1296,6 +1359,7 @@ pub fn ix_create_game(
         program_id: coinflip::ID,
         accounts: coinflip::accounts::CreateGame {
             host,
+            config: config_pda(),
             game,
             mint,
             escrow: escrow_pda(&game),
@@ -1451,7 +1515,7 @@ pub struct CancelGame<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn handle(ctx: Context<CancelGame>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<CancelGame>) -> Result<()> {
     ctx.accounts.game.require_state(GameState::Open)?;
 
     let game_key = ctx.accounts.game.key();
@@ -1662,7 +1726,7 @@ pub struct JoinGame<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handle(ctx: Context<JoinGame>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
     ctx.accounts.game.require_state(GameState::Open)?;
     require!(
         ctx.accounts.joiner.key() != ctx.accounts.game.host,
@@ -1774,7 +1838,7 @@ pub struct SettleCallback<'info> {
     pub client: AccountInfo<'info>,
 }
 
-pub fn handle(_ctx: Context<SettleCallback>) -> Result<()> {
+pub(crate) fn handle(_ctx: Context<SettleCallback>) -> Result<()> {
     err!(CoinflipError::RandomnessNotFulfilled)
 }
 ```
@@ -1970,9 +2034,10 @@ pub(crate) fn execute_settlement<'info>(
     treasury_token_account: &InterfaceAccount<'info, TokenAccount>,
     token_program: &Interface<'info, TokenInterface>,
     host: &AccountInfo<'info>,
-    fee_bps: u16,
     randomness: &[u8; 64],
 ) -> Result<SettlementOutcome> {
+    // Fee comes from the game's snapshot, never live config: admin fee
+    // changes must not retro-apply to already-created games.
     game.require_state(GameState::AwaitingRandomness)?;
 
     let outcome = Side::from_randomness(randomness);
@@ -1983,7 +2048,7 @@ pub(crate) fn execute_settlement<'info>(
     };
 
     let pot = escrow.amount;
-    let fee = fee_amount(pot, fee_bps)?;
+    let fee = fee_amount(pot, game.fee_bps)?;
     let payout = pot.checked_sub(fee).ok_or(CoinflipError::NumericalOverflow)?;
 
     let game_key = game.key();
@@ -2095,7 +2160,7 @@ pub struct SettleFallback<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn handle(ctx: Context<SettleFallback>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<SettleFallback>) -> Result<()> {
     let randomness = ctx
         .accounts
         .request
@@ -2112,7 +2177,6 @@ pub fn handle(ctx: Context<SettleFallback>) -> Result<()> {
         &ctx.accounts.treasury_token_account,
         &ctx.accounts.token_program,
         &ctx.accounts.host,
-        ctx.accounts.config.fee_bps,
         &randomness,
     )?;
 
@@ -2319,7 +2383,7 @@ pub struct SettleCallback<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn handle(ctx: Context<SettleCallback>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<SettleCallback>) -> Result<()> {
     let randomness = ctx
         .accounts
         .request
@@ -2336,7 +2400,6 @@ pub fn handle(ctx: Context<SettleCallback>) -> Result<()> {
         &ctx.accounts.treasury_token_account,
         &ctx.accounts.token_program,
         &ctx.accounts.host,
-        ctx.accounts.config.fee_bps,
         &randomness,
     )?;
 
@@ -2513,7 +2576,7 @@ pub struct RefundTimeout<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
     ctx.accounts.game.require_state(GameState::AwaitingRandomness)?;
     // A fulfilled request must be settled on its outcome, never refunded.
     require!(
