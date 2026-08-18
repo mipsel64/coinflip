@@ -48,4 +48,12 @@ pub mod coinflip {
     pub fn cancel_game(ctx: Context<CancelGame>) -> Result<()> {
         instructions::cancel_game::handle(ctx)
     }
+
+    pub fn join_game(ctx: Context<JoinGame>) -> Result<()> {
+        instructions::join_game::handle(ctx)
+    }
+
+    pub fn settle_callback(ctx: Context<SettleCallback>) -> Result<()> {
+        instructions::settle_callback::handle(ctx)
+    }
 }

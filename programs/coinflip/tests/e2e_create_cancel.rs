@@ -393,6 +393,85 @@ fn cancel_rejects_non_host_owned_refund_account() {
 }
 
 #[test]
+fn cancel_after_join_fails() {
+    let (mut svm, payer) = setup();
+    let (joined, _meta) = setup_joined_game(&mut svm, &payer, 1_000);
+    // A joined game holds the joiner's stake too: cancelling here would let
+    // the host walk off with it.
+    let result = send(
+        &mut svm,
+        &[&joined.fixture.host],
+        &[ix_cancel_game(&joined.fixture)],
+    );
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidGameState);
+    assert_eq!(token_balance(&svm, &joined.fixture.escrow), 2_000);
+}
+
+/// The mint allow-list's positive side: a Token-2022 mint carrying only an
+/// allowed extension flows create -> cancel end to end.
+#[test]
+fn t22_allowed_extension_mint_creates_and_cancels() {
+    let (mut svm, payer) = setup();
+    let treasury = solana_sdk::pubkey::Pubkey::new_unique();
+    send_ok(
+        &mut svm,
+        &[&payer],
+        &[ix_initialize_config(
+            payer.pubkey(),
+            payer.pubkey(),
+            treasury,
+            DEFAULT_FEE_BPS,
+            DEFAULT_TIMEOUT_SLOTS,
+        )],
+    );
+    let host = Keypair::new();
+    svm.airdrop(&host.pubkey(), 10_000_000_000).unwrap();
+    let token_program = anchor_spl::token_2022::ID;
+    let mint = create_t22_mint_with_extensions(&mut svm, 9, &[ExtensionType::MetadataPointer]);
+    let host_ta =
+        create_token_account_for_program(&mut svm, token_program, mint, host.pubkey(), 1_000);
+
+    let game = Keypair::new();
+    let amount = 100;
+    send_ok(
+        &mut svm,
+        &[&host, &game],
+        &[ix_create_game_with_program(
+            host.pubkey(),
+            game.pubkey(),
+            mint,
+            host_ta,
+            token_program,
+            0,
+            amount,
+        )],
+    );
+    let escrow = escrow_pda(&game.pubkey());
+    assert_eq!(token_balance(&svm, &escrow), amount);
+    assert_eq!(token_balance(&svm, &host_ta), 900);
+
+    let f = GameFixture {
+        host,
+        game,
+        mint,
+        host_token_account: host_ta,
+        escrow,
+        treasury,
+        amount,
+    };
+    send_ok(
+        &mut svm,
+        &[&f.host],
+        &[ix_cancel_game_with_program(&f, token_program)],
+    );
+    assert_eq!(token_balance(&svm, &f.host_token_account), 1_000);
+    assert!(svm.get_account(&f.escrow).is_none_or(|a| a.lamports == 0));
+    assert!(svm
+        .get_account(&f.game.pubkey())
+        .is_none_or(|a| a.lamports == 0));
+}
+
+#[test]
 fn cancel_rejects_wrong_mint_refund_account() {
     let (mut svm, payer) = setup();
     let (f, _meta) = setup_open_game(&mut svm, &payer, 1_000);

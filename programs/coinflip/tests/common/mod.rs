@@ -4,8 +4,6 @@ use anchor_lang::{
     AccountDeserialize, AnchorDeserialize, AnchorSerialize, Discriminator, InstructionData,
     ToAccountMetas,
 };
-// Not yet called from this module; later tasks' helpers (e.g. treasury/joiner ATAs) use it.
-#[allow(unused_imports)]
 use anchor_spl::associated_token::get_associated_token_address;
 use anchor_spl::token::spl_token;
 use anchor_spl::token_2022::spl_token_2022;
@@ -38,6 +36,9 @@ pub use spl_token_2022::extension::ExtensionType;
 use solana_sdk::system_program;
 
 pub const REQUEST_FEE: u64 = 1_000_000; // what our crafted NetworkState charges
+/// Starting balance of the crafted ORAO treasury — tests assert request-fee
+/// deltas against it.
+pub const ORAO_TREASURY_START_LAMPORTS: u64 = LAMPORTS_PER_SOL;
 pub const DEFAULT_FEE_BPS: u16 = 100;
 pub const DEFAULT_TIMEOUT_SLOTS: u64 = 1_000;
 
@@ -297,16 +298,17 @@ pub fn write_token_account_at_for_program(
 }
 
 /// Token-2022 mint carrying the given extensions (zeroed/default field
-/// values) — used to prove the allow-list rejects the denied ones. Crafted
-/// with spl-token-2022's own TLV packing.
+/// values) — used to prove the allow-list rejects the denied ones and accepts
+/// the allowed ones. Crafted with spl-token-2022's own TLV packing.
 pub fn create_t22_mint_with_extensions(
     svm: &mut LiteSVM,
     decimals: u8,
     extensions: &[ExtensionType],
 ) -> Pubkey {
     use spl_token_2022::extension::{
-        permanent_delegate::PermanentDelegate, transfer_fee::TransferFeeConfig,
-        transfer_hook::TransferHook, BaseStateWithExtensionsMut, StateWithExtensionsMut,
+        metadata_pointer::MetadataPointer, permanent_delegate::PermanentDelegate,
+        transfer_fee::TransferFeeConfig, transfer_hook::TransferHook, BaseStateWithExtensionsMut,
+        StateWithExtensionsMut,
     };
 
     let mint = Pubkey::new_unique();
@@ -329,6 +331,11 @@ pub fn create_t22_mint_with_extensions(
             }
             ExtensionType::PermanentDelegate => {
                 state.init_extension::<PermanentDelegate>(true).unwrap();
+            }
+            // Allowed by the mint allow-list: zeroed authority/metadata_address
+            // both decode as `None`.
+            ExtensionType::MetadataPointer => {
+                state.init_extension::<MetadataPointer>(true).unwrap();
             }
             other => panic!("create_t22_mint_with_extensions: unsupported extension {other:?}"),
         }
@@ -428,7 +435,8 @@ pub struct OraoEnv {
 /// off-chain deployment step; tests fabricate its result).
 pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
     let orao_treasury = Pubkey::new_unique();
-    svm.airdrop(&orao_treasury, LAMPORTS_PER_SOL).unwrap();
+    svm.airdrop(&orao_treasury, ORAO_TREASURY_START_LAMPORTS)
+        .unwrap();
 
     let (ns_addr, ns_bump) = NetworkState::find_address(&orao_solana_vrf_cb::ID);
     let mut network_state = NetworkState::new(
@@ -534,6 +542,17 @@ pub fn write_fulfilled_request_unchecked(
 /// its callback's remaining accounts, in order. Task 10 uses this to pin
 /// callback account ordering against the real ORAO callback CPI.
 pub fn request_callback_accounts(svm: &LiteSVM, request: &Pubkey) -> Vec<Pubkey> {
+    request_callback_account_metas(svm, request)
+        .into_iter()
+        .map(|(pubkey, _)| pubkey)
+        .collect()
+}
+
+/// Like `request_callback_accounts`, but also reports each account's
+/// writability *as ORAO validated it* — an `arbitrary_writable` the oracle
+/// refused to authorize is silently downgraded to read-only here, and would
+/// only blow up later, at callback time.
+pub fn request_callback_account_metas(svm: &LiteSVM, request: &Pubkey) -> Vec<(Pubkey, bool)> {
     let acct = svm.get_account(request).expect("request account missing");
     let request_account = RequestAccount::try_deserialize(&mut &acct.data[..])
         .expect("failed to deserialize RequestAccount");
@@ -547,7 +566,7 @@ pub fn request_callback_accounts(svm: &LiteSVM, request: &Pubkey) -> Vec<Pubkey>
     callback
         .remaining_accounts()
         .iter()
-        .map(|ra| *ra.pubkey())
+        .map(|ra| (*ra.pubkey(), ra.is_writable()))
         .collect()
 }
 
@@ -705,6 +724,20 @@ pub fn ix_cancel_game_with_refund_account(
     f: &GameFixture,
     host_token_account: Pubkey,
 ) -> Instruction {
+    ix_cancel_game_full(f, host_token_account, spl_token::ID)
+}
+
+/// Like `ix_cancel_game`, but lets the caller pick the token program (a
+/// Token-2022 game must be cancelled through `spl_token_2022::ID`).
+pub fn ix_cancel_game_with_program(f: &GameFixture, token_program: Pubkey) -> Instruction {
+    ix_cancel_game_full(f, f.host_token_account, token_program)
+}
+
+pub fn ix_cancel_game_full(
+    f: &GameFixture,
+    host_token_account: Pubkey,
+    token_program: Pubkey,
+) -> Instruction {
     Instruction {
         program_id: coinflip::ID,
         accounts: coinflip::accounts::CancelGame {
@@ -713,13 +746,105 @@ pub fn ix_cancel_game_with_refund_account(
             mint: f.mint,
             escrow: f.escrow,
             host_token_account,
-            token_program: spl_token::ID,
+            token_program,
             event_authority: event_authority(),
             program: coinflip::ID,
         }
         .to_account_metas(None),
         data: coinflip::instruction::CancelGame {}.data(),
     }
+}
+
+pub struct JoinedGame {
+    pub fixture: GameFixture,
+    pub joiner: Keypair,
+    pub joiner_token_account: Pubkey,
+    pub treasury_token_account: Pubkey,
+    pub orao: OraoEnv,
+    pub request: Pubkey,
+}
+
+pub fn ix_join_game(
+    f: &GameFixture,
+    orao: &OraoEnv,
+    joiner: Pubkey,
+    joiner_token_account: Pubkey,
+) -> Instruction {
+    let treasury_token_account = get_associated_token_address(&f.treasury, &f.mint);
+    let request = request_pda(&orao.client, &f.game.pubkey());
+    Instruction {
+        program_id: coinflip::ID,
+        accounts: coinflip::accounts::JoinGame {
+            joiner,
+            config: config_pda(),
+            game: f.game.pubkey(),
+            host: f.host.pubkey(),
+            mint: f.mint,
+            escrow: f.escrow,
+            joiner_token_account,
+            host_token_account: f.host_token_account,
+            treasury: f.treasury,
+            treasury_token_account,
+            vrf: orao_solana_vrf_cb::ID,
+            client: orao.client,
+            network_state: orao.network_state,
+            orao_treasury: orao.orao_treasury,
+            request,
+            associated_token_program: anchor_spl::associated_token::ID,
+            token_program: spl_token::ID,
+            system_program: system_program::ID,
+            event_authority: event_authority(),
+            program: coinflip::ID,
+        }
+        .to_account_metas(None),
+        data: coinflip::instruction::JoinGame {}.data(),
+    }
+}
+
+/// Full flow: open game + ORAO env + join. Game ends AwaitingRandomness
+/// with a REAL pending request account created by the dumped ORAO program.
+///
+/// Returns the join transaction's metadata alongside the fixture (same shape
+/// as `setup_open_game`) so callers can assert on the emitted `GameJoined`.
+pub fn setup_joined_game(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    amount: u64,
+) -> (JoinedGame, TransactionMetadata) {
+    let (fixture, _create_meta) = setup_open_game(svm, payer, amount);
+    let orao = setup_orao(svm);
+    let joiner = Keypair::new();
+    svm.airdrop(&joiner.pubkey(), 10 * LAMPORTS_PER_SOL)
+        .unwrap();
+    let joiner_token_account = create_token_account(
+        svm,
+        fixture.mint,
+        joiner.pubkey(),
+        amount.saturating_mul(10),
+    );
+    let meta = send_ok(
+        svm,
+        &[&joiner],
+        &[ix_join_game(
+            &fixture,
+            &orao,
+            joiner.pubkey(),
+            joiner_token_account,
+        )],
+    );
+    let treasury_token_account = get_associated_token_address(&fixture.treasury, &fixture.mint);
+    let request = request_pda(&orao.client, &fixture.game.pubkey());
+    (
+        JoinedGame {
+            fixture,
+            joiner,
+            joiner_token_account,
+            treasury_token_account,
+            orao,
+            request,
+        },
+        meta,
+    )
 }
 
 pub fn ix_update_config(
