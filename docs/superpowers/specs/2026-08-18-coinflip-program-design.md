@@ -45,8 +45,11 @@ Anchor workspace (`anchor init` layout), single program `coinflip`.
 - `rust-toolchain.toml` pins the Rust channel; `Anchor.toml` `[toolchain]` pins Anchor
   and Solana versions; `[profile.release]` sets `overflow-checks = true`, `lto = "fat"`,
   `codegen-units = 1` (playbook Phase 0).
-- ORAO Callback VRF via the `orao-solana-vrf-cb` crate (CPI). Exact crate/oracle
-  versions pinned during implementation; the ORAO `.so` is checked in for tests.
+- **Anchor is pinned to 0.32.1**, not the 1.x line the playbook's reference repo uses:
+  `orao-solana-vrf-cb` 0.4 pins `anchor-lang = "0.32.1"` and its account types appear in
+  our `Accounts` structs. Revisit when ORAO ships a 1.x-compatible release.
+- ORAO Callback VRF via the `orao-solana-vrf-cb` crate (CPI feature); the ORAO `.so`
+  is checked in for tests.
 
 ### ORAO client registration (deployment step, not a program instruction)
 
@@ -67,13 +70,15 @@ route fee reimbursements.
 | `bump` | `u8` | |
 | `admin` | `Pubkey` | Can call `update_config` |
 | `treasury` | `Pubkey` | Authority whose ATA receives fees |
-| `vrf_client` | `Pubkey` | ORAO Client PDA; callbacks must be signed by it |
 | `fee_bps` | `u16` | Default 100 (1%); hard cap `MAX_FEE_BPS = 1000` (10%) |
 | `refund_timeout_slots` | `u64` | Slots after join before `refund_timeout` is allowed |
 | `_reserved` | `[u8; 64]` | Zeroed tail for future fields |
 
 `Config` doubles as the registered VRF **state PDA**: it signs `Request` CPIs and is
-passed (writable) into every callback by the VRF program.
+passed (writable) into every callback by the VRF program. The ORAO Client PDA is not
+stored: it is fully determined by seeds `[CB_CLIENT_ACCOUNT_SEED, program_id, config]`
+under the ORAO program, so every instruction validates it by derivation — stronger
+than a stored field, with nothing to keep in sync.
 
 ### `Game` — keypair account (signs at `create_game`, key discarded after)
 
@@ -178,7 +183,8 @@ gap without any special authority:
   with mint decimals.
 - Mint validation at `create_game` (deny-by-default per playbook Phase 6):
   - **Reject** mints with `TransferFeeConfig` or `TransferHook` extensions — they
-    break the stake/payout math.
+    break the stake/payout math — and `PermanentDelegate`, which could drain the
+    escrow outright.
   - **Allow** freeze authority (rejecting it would exclude USDC). Documented risk:
     a freezable escrow can strand a game; a frozen payout account also fails the
     callback, leaving `settle_fallback` (with a thawed account) as the recovery
