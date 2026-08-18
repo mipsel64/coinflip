@@ -162,7 +162,8 @@ The callback resolves games in the normal case, but a game can sit in
 backstop instructions are permissionless, a small off-chain **crank** closes that
 gap without any special authority:
 
-- A Rust binary (`crank/`) in the same workspace, run by anyone (we run one).
+- Lives in the separate coinflip backend repo (**not** in this repo — this repo is
+  the program only). Noted here as a required companion component.
 - Loop: `getProgramAccounts` filtered on `state == AwaitingRandomness` (games stay
   on-chain until a terminal state closes them), and for each stuck game:
   - request account fulfilled → send `settle_fallback`
@@ -216,7 +217,6 @@ programs/coinflip/src/
   state/{mod,config,game}.rs
   instructions/{mod,initialize_config,update_config,create_game,cancel_game,
                 join_game,settle_callback,settle_fallback,refund_timeout}.rs
-crank/                  # dealer bot: settles/refunds stuck games (permissionless)
 scripts/                # one-time ORAO Register + Client PDA funding
 tests/                  # LiteSVM e2e (Rust)
 .github/workflows/ci.yml
@@ -249,7 +249,8 @@ tests/                  # LiteSVM e2e (Rust)
 
 ## Out of scope (v1)
 
-- Frontend/client SDK (separate repo; this repo is the program only).
+- Frontend/client SDK and the crank/dealer bot (separate backend repo; this repo is
+  the program only).
 - Native-SOL lamport escrow (frontend wraps to wSOL).
 - Leaderboards / game history accounts (events carry history).
 - Multi-player or multi-round games.
