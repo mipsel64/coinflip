@@ -473,15 +473,17 @@ pub struct Game {
     pub token_mint: Pubkey,
     /// Per-player stake in base units.
     pub amount: u64,
+    /// Fee snapshot from Config at create (added in the Task 6 review round).
+    pub fee_bps: u16,
     pub host_token_account: Pubkey,
     pub joiner_token_account: Pubkey,
     pub joined_at_slot: u64,
-    pub _reserved: [u8; 64],
+    pub _reserved: [u8; 62],
 }
 
 const_assert_eq!(
     Game::INIT_SPACE,
-    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 32 + 32 + 8 + 64
+    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 2 + 32 + 32 + 8 + 62
 );
 
 impl Game {
@@ -554,10 +556,11 @@ mod tests {
             joiner,
             token_mint: Pubkey::new_unique(),
             amount: 5,
+            fee_bps: 100,
             host_token_account: host_ta,
             joiner_token_account: joiner_ta,
             joined_at_slot: 0,
-            _reserved: [0; 64],
+            _reserved: [0; 62],
         };
         assert_eq!(game.winner(Side::Heads).unwrap(), (host, host_ta));
         assert_eq!(game.winner(Side::Tails).unwrap(), (joiner, joiner_ta));
@@ -1169,6 +1172,24 @@ fn update_config_rejects_fee_above_cap_and_bad_timeout() {
 }
 
 #[test]
+fn default_key_authorities_are_rejected() {
+    let (mut svm, payer) = setup();
+    let result = send(&mut svm, &[&payer], &[ix_initialize_config(
+        payer.pubkey(), payer.pubkey(), Pubkey::default(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    )]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidAuthority);
+
+    send(&mut svm, &[&payer], &[ix_initialize_config(
+        payer.pubkey(), payer.pubkey(), Pubkey::new_unique(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    )])
+    .unwrap();
+    let result = send(&mut svm, &[&payer], &[ix_update_config(
+        payer.pubkey(), Some(Pubkey::default()), None, None, None,
+    )]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidAuthority);
+}
+
+#[test]
 fn admin_rotation_round_trip() {
     let (mut svm, payer) = setup();
     send(&mut svm, &[&payer], &[ix_initialize_config(
@@ -1323,7 +1344,7 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
     game.host_token_account = ctx.accounts.host_token_account.key();
     game.joiner_token_account = Pubkey::default();
     game.joined_at_slot = 0;
-    game._reserved = [0; 64];
+    game._reserved = [0; 62];
 
     emit_cpi!(GameCreated {
         game: game.key(),

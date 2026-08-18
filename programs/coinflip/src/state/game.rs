@@ -190,6 +190,8 @@ mod tests {
         assert_eq!(bytes.len(), Game::INIT_SPACE); // borsh runtime == InitSpace
         assert_eq!(bytes[1], game.state); // crank memcmp offset 9 == 8 (discriminator) + 1 (version)
         assert_eq!(bytes[2], game.host_side);
+        // fee_bps sits after 4 u8s + 3 pubkeys + amount: the money path reads it
+        assert_eq!(&bytes[108..110], &game.fee_bps.to_le_bytes());
     }
 
     #[test]
