@@ -9,8 +9,8 @@ skip-lint = false
 [programs.localnet]
 coinflip = "7ZsoAuFYBBtTHt3jeCd8wWZvKcp7sqxEqAPscSNFte1n"
 
-[registry]
-url = "https://api.apr.dev"
+[programs.devnet]
+coinflip = "7ZsoAuFYBBtTHt3jeCd8wWZvKcp7sqxEqAPscSNFte1n"
 
 [provider]
 cluster = "localnet"
