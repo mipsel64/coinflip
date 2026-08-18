@@ -29,3 +29,31 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use anchor_lang::AnchorSerialize;
+
+    use super::*;
+
+    #[test]
+    fn fee_cap_boundary() {
+        assert!(Config::validate_fee(1_000).is_ok());
+        assert!(Config::validate_fee(1_001).is_err());
+    }
+
+    #[test]
+    fn layout_is_pinned() {
+        let config = Config {
+            version: Config::LAYOUT_VERSION,
+            bump: 255,
+            admin: Pubkey::new_unique(),
+            treasury: Pubkey::new_unique(),
+            fee_bps: 100,
+            refund_timeout_slots: 1_000,
+            _reserved: [0; 64],
+        };
+        let bytes = config.try_to_vec().unwrap();
+        assert_eq!(bytes.len(), Config::INIT_SPACE);
+    }
+}

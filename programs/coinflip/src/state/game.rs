@@ -23,6 +23,14 @@ pub enum Side {
 }
 
 impl Side {
+    pub fn from_byte(byte: u8) -> Result<Self> {
+        Side::try_from(byte).map_err(|_| error!(CoinflipError::InvalidSide))
+    }
+
+    /// One bit of the fulfilled randomness decides the flip. ORAO's value is
+    /// the XOR of a >=2/3 quorum of oracle ed25519 signatures, so byte 0's
+    /// parity is uniform for honest oracles; a griefing last-responder could
+    /// grind any bit equally, so hashing all 64 bytes would buy nothing.
     pub fn from_randomness(randomness: &[u8; 64]) -> Self {
         if randomness[0] & 1 == 0 {
             Side::Heads
@@ -66,7 +74,7 @@ impl Game {
     }
 
     pub fn host_side(&self) -> Result<Side> {
-        Side::try_from(self.host_side).map_err(|_| error!(CoinflipError::InvalidSide))
+        Side::from_byte(self.host_side)
     }
 
     pub fn require_state(&self, expected: GameState) -> Result<()> {
@@ -74,19 +82,20 @@ impl Game {
         Ok(())
     }
 
-    /// Returns (winner, winner_token_account) for the flipped outcome.
-    pub fn winner(&self, outcome: Side) -> Result<(Pubkey, Pubkey)> {
-        if outcome == self.host_side()? {
-            Ok((self.host, self.host_token_account))
-        } else {
-            Ok((self.joiner, self.joiner_token_account))
-        }
+    /// True when the flipped outcome matches the host's chosen side.
+    ///
+    /// Callers pick the payout account themselves from the game's recorded
+    /// fields; this returns only the decision so no pubkey re-comparison
+    /// happens in the payout path.
+    pub fn winner_is_host(&self, outcome: Side) -> Result<bool> {
+        Ok(outcome == self.host_side()?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anchor_lang::AnchorSerialize;
 
     #[test]
     fn enum_bytes_round_trip() {
@@ -101,6 +110,19 @@ mod tests {
         }
         assert!(GameState::try_from(5u8).is_err());
         assert!(Side::try_from(2u8).is_err());
+
+        // On-chain ABI: the IDL doesn't carry discriminant values, so pin them.
+        assert_eq!(u8::from(GameState::Open), 0);
+        assert_eq!(u8::from(GameState::AwaitingRandomness), 1);
+        assert_eq!(u8::from(GameState::Settled), 2);
+        assert_eq!(u8::from(GameState::Cancelled), 3);
+        assert_eq!(u8::from(GameState::Refunded), 4);
+        assert_eq!(u8::from(Side::Heads), 0);
+        assert_eq!(u8::from(Side::Tails), 1);
+
+        assert_eq!(Side::from_byte(0).unwrap(), Side::Heads);
+        assert_eq!(Side::from_byte(1).unwrap(), Side::Tails);
+        assert!(Side::from_byte(2).is_err());
     }
 
     #[test]
@@ -113,29 +135,71 @@ mod tests {
         assert_eq!(Side::from_randomness(&r), Side::Heads);
     }
 
-    #[test]
-    fn winner_mapping() {
-        let host = Pubkey::new_unique();
-        let joiner = Pubkey::new_unique();
-        let host_ta = Pubkey::new_unique();
-        let joiner_ta = Pubkey::new_unique();
-        let mut game = Game {
-            version: 1,
+    fn sample_game() -> Game {
+        Game {
+            version: Game::LAYOUT_VERSION,
             state: GameState::AwaitingRandomness.into(),
             host_side: Side::Heads.into(),
             escrow_bump: 255,
-            host,
-            joiner,
+            host: Pubkey::new_unique(),
+            joiner: Pubkey::new_unique(),
             token_mint: Pubkey::new_unique(),
             amount: 5,
-            host_token_account: host_ta,
-            joiner_token_account: joiner_ta,
+            host_token_account: Pubkey::new_unique(),
+            joiner_token_account: Pubkey::new_unique(),
             joined_at_slot: 0,
             _reserved: [0; 64],
-        };
-        assert_eq!(game.winner(Side::Heads).unwrap(), (host, host_ta));
-        assert_eq!(game.winner(Side::Tails).unwrap(), (joiner, joiner_ta));
+        }
+    }
+
+    #[test]
+    fn winner_mapping() {
+        let mut game = sample_game();
+
+        game.host_side = Side::Heads.into();
+        assert!(game.winner_is_host(Side::Heads).unwrap());
+        assert!(!game.winner_is_host(Side::Tails).unwrap());
+
         game.host_side = Side::Tails.into();
-        assert_eq!(game.winner(Side::Tails).unwrap(), (host, host_ta));
+        assert!(!game.winner_is_host(Side::Heads).unwrap());
+        assert!(game.winner_is_host(Side::Tails).unwrap());
+    }
+
+    #[test]
+    fn layout_is_pinned() {
+        let game = Game {
+            version: Game::LAYOUT_VERSION,
+            state: GameState::Settled.into(),
+            host_side: Side::Tails.into(),
+            escrow_bump: 254,
+            host: Pubkey::new_unique(),
+            joiner: Pubkey::new_unique(),
+            token_mint: Pubkey::new_unique(),
+            amount: 42,
+            host_token_account: Pubkey::new_unique(),
+            joiner_token_account: Pubkey::new_unique(),
+            joined_at_slot: 123,
+            _reserved: [7; 64],
+        };
+        let bytes = game.try_to_vec().unwrap();
+        assert_eq!(bytes.len(), Game::INIT_SPACE); // borsh runtime == InitSpace
+        assert_eq!(bytes[1], game.state); // crank memcmp offset 9 == 8 (discriminator) + 1 (version)
+        assert_eq!(bytes[2], game.host_side);
+    }
+
+    #[test]
+    fn helper_error_paths() {
+        let mut game = sample_game();
+        game.state = 9;
+        assert!(game.state().is_err());
+        game.host_side = 7;
+        assert!(game.host_side().is_err());
+
+        let mut game = sample_game();
+        game.state = GameState::Open.into();
+        assert!(game.require_state(GameState::Open).is_ok());
+
+        game.state = GameState::Settled.into();
+        assert!(game.require_state(GameState::Open).is_err());
     }
 }
