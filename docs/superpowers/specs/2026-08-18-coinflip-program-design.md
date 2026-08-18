@@ -191,8 +191,19 @@ gap without any special authority:
   with mint decimals.
 - Mint validation at `create_game` (deny-by-default per playbook Phase 6):
   - **Reject** mints with `TransferFeeConfig` or `TransferHook` extensions — they
-    break the stake/payout math — and `PermanentDelegate`, which could drain the
-    escrow outright.
+    break the stake/payout math — `PermanentDelegate` (could drain the escrow),
+    `Pausable` (a pause authority stops every transfer for the mint at once —
+    strictly worse than per-account freeze), `ConfidentialTransferFeeConfig`
+    (implies transfer fees), and `NonTransferable` (a game that can never pay
+    out). Validation is allow-listed with deny-by-default: extensions not
+    explicitly known-safe (metadata/group pointers, interest-bearing and scaled
+    display, confidential transfer mint, mint close authority, default account
+    state) are rejected, so a dependency bump can never silently admit a new
+    extension.
+  - Native SOL via **wSOL is in scope**: the escrow becomes a native token
+    account; permissionless `SyncNative` after stray lamport transfers only
+    inflates the escrow balance, which settlement pays to the winner (pot =
+    actual escrow balance) — a donation vector, never a shortfall.
   - **Allow** freeze authority (rejecting it would exclude USDC). Documented risk:
     a freezable escrow can strand a game; a frozen payout account also fails the
     callback, leaving `settle_fallback` (with a thawed account) as the recovery
@@ -202,6 +213,11 @@ gap without any special authority:
   and must be OWNED by the respective player — staking from a delegated third
   party's account is rejected so winnings always land in the winner's own
   account.
+- Liveness rule: `settle_callback` pays the exact recorded accounts (its account
+  list is frozen at request time), but `cancel_game`, `settle_fallback`, and
+  `refund_timeout` accept **any** token account owned by the respective player
+  for the right mint — so a player who closed their recorded account can never
+  strand a payout or block the other player's refund.
 - Fees are collected in the bet token, into the treasury's ATA for that mint
   (existence ensured at join).
 

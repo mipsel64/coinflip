@@ -610,6 +610,9 @@ pub struct GameCreated {
     pub mint: Pubkey,
     pub amount: u64,
     pub host_side: u8,
+    /// Fee snapshot the game was created under (events are the only durable
+    /// history once accounts close).
+    pub fee_bps: u16,
 }
 
 #[event]
@@ -1353,6 +1356,7 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
         mint: game.token_mint,
         amount,
         host_side: game.host_side,
+        fee_bps: game.fee_bps,
     });
     Ok(())
 }
@@ -1532,7 +1536,13 @@ pub struct CancelGame<'info> {
     pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mut, seeds = [ESCROW_SEED, game.key().as_ref()], bump = game.escrow_bump)]
     pub escrow: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(mut, address = game.host_token_account @ CoinflipError::MintMismatch)]
+    /// Any host-owned account of the game mint (liveness: the recorded one may
+    /// have been closed since create).
+    #[account(
+        mut,
+        constraint = host_token_account.owner == game.host @ CoinflipError::OwnerMismatch,
+        constraint = host_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,
 }
@@ -2166,9 +2176,19 @@ pub struct SettleFallback<'info> {
     /// CHECK: rent receiver, must be the game's host.
     #[account(mut, address = game.host @ CoinflipError::OwnerMismatch)]
     pub host: AccountInfo<'info>,
-    #[account(mut, address = game.host_token_account @ CoinflipError::MintMismatch)]
+    /// Any host-owned account of the game mint (liveness: recorded one may be closed).
+    #[account(
+        mut,
+        constraint = host_token_account.owner == game.host @ CoinflipError::OwnerMismatch,
+        constraint = host_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(mut, address = game.joiner_token_account @ CoinflipError::MintMismatch)]
+    /// Any joiner-owned account of the game mint.
+    #[account(
+        mut,
+        constraint = joiner_token_account.owner == game.joiner @ CoinflipError::OwnerMismatch,
+        constraint = joiner_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
@@ -2590,9 +2610,19 @@ pub struct RefundTimeout<'info> {
     /// CHECK: rent receiver, must be the game's host.
     #[account(mut, address = game.host @ CoinflipError::OwnerMismatch)]
     pub host: AccountInfo<'info>,
-    #[account(mut, address = game.host_token_account @ CoinflipError::MintMismatch)]
+    /// Any host-owned account of the game mint (liveness: recorded one may be closed).
+    #[account(
+        mut,
+        constraint = host_token_account.owner == game.host @ CoinflipError::OwnerMismatch,
+        constraint = host_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(mut, address = game.joiner_token_account @ CoinflipError::MintMismatch)]
+    /// Any joiner-owned account of the game mint.
+    #[account(
+        mut,
+        constraint = joiner_token_account.owner == game.joiner @ CoinflipError::OwnerMismatch,
+        constraint = joiner_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(address = game.token_mint @ CoinflipError::MintMismatch)]
     pub mint: Box<InterfaceAccount<'info, Mint>>,
