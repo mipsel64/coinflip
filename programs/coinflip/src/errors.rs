@@ -1,0 +1,33 @@
+use anchor_lang::prelude::*;
+
+/// Append-only: error codes are ABI.
+#[error_code]
+#[derive(PartialEq)]
+pub enum CoinflipError {
+    #[msg("fee_bps exceeds MAX_FEE_BPS")]
+    FeeTooHigh, // 6000
+    #[msg("game is not in the required state")]
+    InvalidGameState, // 6001
+    #[msg("invalid side value")]
+    InvalidSide, // 6002
+    #[msg("bet amount must be greater than zero")]
+    ZeroAmount, // 6003
+    #[msg("host cannot join their own game")]
+    HostCannotJoin, // 6004
+    #[msg("token account does not match the game")]
+    MintMismatch, // 6005
+    #[msg("mint has an unsupported extension")]
+    UnsupportedMintExtension, // 6006
+    #[msg("randomness request is not fulfilled yet")]
+    RandomnessNotFulfilled, // 6007
+    #[msg("randomness already fulfilled; call settle_fallback instead")]
+    AlreadyFulfilled, // 6008
+    #[msg("callback caller is not the registered VRF client")]
+    UnauthorizedVrfClient, // 6009
+    #[msg("refund timeout has not been reached")]
+    TimeoutNotReached, // 6010
+    #[msg("numerical overflow")]
+    NumericalOverflow, // 6011
+    #[msg("account owner does not match")]
+    OwnerMismatch, // 6012
+}
