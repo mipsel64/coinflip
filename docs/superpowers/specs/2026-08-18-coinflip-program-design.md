@@ -122,7 +122,7 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. State = Open |
 | 4 | `cancel_game` | host | Requires state == Open. Refund host stake, close escrow + game (rent to host) |
 | 5 | `join_game` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; ensure treasury ATA exists (`init_if_needed`, payer = joiner). Transfer the current VRF fee (read from ORAO `NetworkState`) in lamports joiner → Client PDA. CPI ORAO `Request` (seed = game pubkey, `Config` PDA signs, Client PDA pays) with a request-level callback targeting `settle_callback` and carrying: game, escrow, host + joiner token accounts, treasury ATA, mint, token program. Record joiner, joiner token account, `joined_at_slot`. State = AwaitingRandomness |
-| 6 | `settle_callback` | ORAO (Client PDA signs via CPI) | Accounts per ORAO's required order: Client PDA (signer, must equal `config.vrf_client`), `Config` (writable), `NetworkState`, fulfilled request account, then our accounts. Runs core settlement (below) |
+| 6 | `settle_callback` | ORAO (Client PDA signs via CPI) | Accounts per ORAO's required order: Client PDA (signer, validated by seed derivation under the ORAO program), `Config` (writable), `NetworkState`, fulfilled request account, then our accounts. Runs core settlement (below) |
 | 7 | `settle_fallback` | anyone | Backstop for a failed/ignored callback. Requires state == AwaitingRandomness and the request account for seed = game pubkey is **fulfilled**. Runs the same core settlement |
 | 8 | `refund_timeout` | anyone | Requires state == AwaitingRandomness, `current_slot > joined_at_slot + refund_timeout_slots`, and randomness NOT fulfilled. Return each stake to its player, no fee. Close escrow + game, rent to host |
 
@@ -152,13 +152,20 @@ create_game ──▶ Open ──cancel_game──▶ Cancelled (host refunded)
 
 - Seed = game pubkey, unique per game. ORAO's `Request` CPI creates the request
   account for that seed; a pre-existing (precomputed) request makes the join fail.
-- `settle_callback` accepts only the Client PDA recorded in `config.vrf_client` as a
-  signer — only the VRF program can produce that signature, so nobody can invoke the
-  callback with forged randomness.
+- `settle_callback` accepts only the ORAO Client PDA as a signer, validated by seed
+  derivation (`[CB_CLIENT_ACCOUNT_SEED, program_id, config]` under the ORAO program) —
+  only the VRF program can produce that signature, so nobody can invoke the callback
+  with forged randomness.
 - `settle_fallback` and `refund_timeout` verify the passed request account is the
   ORAO PDA derived from seed = game pubkey, owned by the ORAO program.
 - Neither player can influence or withhold the outcome: the request doesn't exist
   until join, the oracle settles autonomously, and both fallbacks are permissionless.
+- The outcome bit is `randomness[0] & 1`. ORAO's fulfilled randomness is the XOR of a
+  ≥2/3 quorum of oracle ed25519 signatures, so the parity is uniform for honest
+  oracles. Residual trust assumption: the *last* oracle to respond sees the others'
+  contributions and controls all 64 bytes of its own equally, so it could in
+  principle grind its nonce to steer the result — hashing the full 64 bytes would not
+  help. This is inherent to ORAO's model, accepted for this project.
 
 ## Crank / dealer bot
 

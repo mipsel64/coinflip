@@ -578,6 +578,15 @@ Expected: PASS (3 tests). Also `cargo check -p coinflip` clean (the `const_asser
 git add -A && git commit -m "feat: Config and Game state with layout asserts"
 ```
 
+> **Post-review amendments (applied after Task 4's code review):** `Game::winner()`
+> was replaced by `winner_is_host(outcome) -> Result<bool>` (callers pick the
+> account/pubkey themselves — no pubkey re-comparison in the payout path);
+> `Side::from_byte(u8) -> Result<Side>` centralizes the InvalidSide mapping;
+> tests now also pin enum discriminant VALUES, the borsh byte layout/offsets
+> (crank memcmp depends on state at offset 9), require_state/state()/host_side()
+> error paths, and validate_fee boundaries. Later tasks' snippets already reflect
+> the new API.
+
 ---
 
 ### Task 5: Events
@@ -1221,7 +1230,7 @@ fn validate_mint(mint_info: &AccountInfo) -> Result<()> {
 
 pub fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
     require!(amount > 0, CoinflipError::ZeroAmount);
-    let side = Side::try_from(side).map_err(|_| error!(CoinflipError::InvalidSide))?;
+    let side = Side::from_byte(side)?;
     validate_mint(&ctx.accounts.mint.to_account_info())?;
 
     token_interface::transfer_checked(
@@ -1966,11 +1975,10 @@ pub(crate) fn execute_settlement<'info>(
     game.require_state(GameState::AwaitingRandomness)?;
 
     let outcome = Side::from_randomness(randomness);
-    let (winner, winner_token_key) = game.winner(outcome)?;
-    let winner_token_account = if winner_token_key == host_token_account.key() {
-        host_token_account
+    let (winner, winner_token_account) = if game.winner_is_host(outcome)? {
+        (game.host, host_token_account)
     } else {
-        joiner_token_account
+        (game.joiner, joiner_token_account)
     };
 
     let pot = escrow.amount;
