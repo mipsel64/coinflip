@@ -39,6 +39,7 @@ pub struct CreateGame<'info> {
     #[account(
         mut,
         constraint = host_token_account.mint == mint.key() @ CoinflipError::MintMismatch,
+        constraint = host_token_account.owner == host.key() @ CoinflipError::OwnerMismatch,
     )]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,

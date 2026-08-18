@@ -7,8 +7,10 @@ use anchor_lang::{
 #[allow(unused_imports)]
 use anchor_spl::associated_token::get_associated_token_address;
 use anchor_spl::token::spl_token;
+use anchor_spl::token_2022::spl_token_2022;
 use coinflip::constants::{CONFIG_SEED, ESCROW_SEED};
 use coinflip::errors::CoinflipError;
+use coinflip::state::Game;
 use litesvm::{
     types::{FailedTransactionMetadata, TransactionMetadata},
     LiteSVM,
@@ -237,6 +239,35 @@ pub fn write_token_account_at(
     owner: Pubkey,
     amount: u64,
 ) {
+    write_token_account_at_for_program(svm, spl_token::ID, address, mint, owner, amount);
+}
+
+/// Like `create_token_account`, but the account is owned by `token_program`
+/// instead of always the classic SPL Token program (e.g. Token-2022 mints
+/// need their token accounts owned by the Token-2022 program).
+pub fn create_token_account_for_program(
+    svm: &mut LiteSVM,
+    token_program: Pubkey,
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+) -> Pubkey {
+    let address = Pubkey::new_unique();
+    write_token_account_at_for_program(svm, token_program, address, mint, owner, amount);
+    address
+}
+
+/// Like `write_token_account_at`, but the account is owned by `token_program`.
+/// A base (no account-level extensions) Token-2022 account has the exact same
+/// 165-byte layout as a classic SPL Token account, so the same packing works.
+pub fn write_token_account_at_for_program(
+    svm: &mut LiteSVM,
+    token_program: Pubkey,
+    address: Pubkey,
+    mint: Pubkey,
+    owner: Pubkey,
+    amount: u64,
+) {
     let mut data = vec![0u8; spl_token::state::Account::LEN];
     spl_token::state::Account {
         mint,
@@ -255,7 +286,7 @@ pub fn write_token_account_at(
         SolanaAccount {
             lamports,
             data,
-            owner: spl_token::ID,
+            owner: token_program,
             executable: false,
             rent_epoch: 0,
         },
@@ -263,11 +294,60 @@ pub fn write_token_account_at(
     .unwrap();
 }
 
+/// Token-2022 mint carrying a TransferFeeConfig extension — used to prove the
+/// deny-list rejects it. Crafted with spl-token-2022's own TLV packing.
+pub fn create_t22_transfer_fee_mint(svm: &mut LiteSVM, decimals: u8) -> Pubkey {
+    use spl_token_2022::extension::{
+        transfer_fee::TransferFeeConfig, BaseStateWithExtensionsMut, ExtensionType,
+        StateWithExtensionsMut,
+    };
+
+    let mint = Pubkey::new_unique();
+    let account_len = ExtensionType::try_calculate_account_len::<spl_token_2022::state::Mint>(&[
+        ExtensionType::TransferFeeConfig,
+    ])
+    .unwrap();
+    let mut data = vec![0u8; account_len];
+    let mut state =
+        StateWithExtensionsMut::<spl_token_2022::state::Mint>::unpack_uninitialized(&mut data)
+            .unwrap();
+    // Zeroed/default fee fields are fine — the deny-list only checks presence.
+    state.init_extension::<TransferFeeConfig>(true).unwrap();
+    state.base = spl_token_2022::state::Mint {
+        mint_authority: COption::None,
+        supply: 1_000_000_000_000,
+        decimals,
+        is_initialized: true,
+        freeze_authority: COption::None,
+    };
+    state.pack_base();
+    state.init_account_type().unwrap();
+
+    let lamports = svm.minimum_balance_for_rent_exemption(data.len());
+    svm.set_account(
+        mint,
+        SolanaAccount {
+            lamports,
+            data,
+            owner: spl_token_2022::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    mint
+}
+
 pub fn token_balance(svm: &LiteSVM, address: &Pubkey) -> u64 {
     let account = svm.get_account(address).expect("token account missing");
     spl_token::state::Account::unpack(&account.data)
         .unwrap()
         .amount
+}
+
+pub fn read_game(svm: &LiteSVM, address: &Pubkey) -> Game {
+    let account = svm.get_account(address).expect("game account missing");
+    Game::try_deserialize(&mut &account.data[..]).expect("failed to deserialize Game")
 }
 
 pub struct OraoEnv {
@@ -438,6 +518,28 @@ pub fn ix_create_game(
     side: u8,
     amount: u64,
 ) -> Instruction {
+    ix_create_game_with_program(
+        host,
+        game,
+        mint,
+        host_token_account,
+        spl_token::ID,
+        side,
+        amount,
+    )
+}
+
+/// Like `ix_create_game`, but lets the caller pick the token program (e.g.
+/// Token-2022 mints must be created with `token_program = spl_token_2022::ID`).
+pub fn ix_create_game_with_program(
+    host: Pubkey,
+    game: Pubkey,
+    mint: Pubkey,
+    host_token_account: Pubkey,
+    token_program: Pubkey,
+    side: u8,
+    amount: u64,
+) -> Instruction {
     Instruction {
         program_id: coinflip::ID,
         accounts: coinflip::accounts::CreateGame {
@@ -447,7 +549,7 @@ pub fn ix_create_game(
             mint,
             escrow: escrow_pda(&game),
             host_token_account,
-            token_program: spl_token::ID,
+            token_program,
             system_program: system_program::ID,
             event_authority: event_authority(),
             program: coinflip::ID,
