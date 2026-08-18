@@ -1,0 +1,31 @@
+[package]
+name = "coinflip"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "coinflip"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "orao-solana-vrf-cb/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true, features = ["event-cpi", "init-if-needed"] }
+anchor-spl = { workspace = true }
+orao-solana-vrf-cb = { workspace = true }
+num_enum = { workspace = true }
+static_assertions = { workspace = true }
+
+[dev-dependencies]
+litesvm = "0.7"
+proptest = "1.6"
+solana-sdk = "2.3"
