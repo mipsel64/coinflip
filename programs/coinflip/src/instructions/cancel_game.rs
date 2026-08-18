@@ -71,6 +71,11 @@ pub(crate) fn handle(ctx: Context<CancelGame>) -> Result<()> {
     ))?;
 
     ctx.accounts.game.state = GameState::Cancelled.into();
-    emit_cpi!(GameCancelled { game: game_key });
+    emit_cpi!(GameCancelled {
+        game: game_key,
+        host: ctx.accounts.game.host,
+        mint: ctx.accounts.game.token_mint,
+        amount: ctx.accounts.game.amount,
+    });
     Ok(())
 }

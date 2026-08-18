@@ -303,12 +303,42 @@ fn create_game_rejects_stake_above_cap() {
 fn cancel_refunds_host_and_closes_accounts() {
     let (mut svm, payer) = setup();
     let (f, _meta) = setup_open_game(&mut svm, &payer, 5_000_000_000);
-    send_ok(&mut svm, &[&f.host], &[ix_cancel_game(&f)]);
-    assert_eq!(token_balance(&svm, &f.host_token_account), 50_000_000_000);
+
+    let host_lamports_before = svm.get_account(&f.host.pubkey()).unwrap().lamports;
+    let escrow_rent = svm.get_account(&f.escrow).unwrap().lamports;
+    let game_rent = svm.get_account(&f.game.pubkey()).unwrap().lamports;
+
+    let ix = ix_cancel_game(&f);
+    let meta = send_ok(&mut svm, &[&f.host], std::slice::from_ref(&ix));
+
+    assert_eq!(
+        token_balance(&svm, &f.host_token_account),
+        f.amount.saturating_mul(10)
+    );
     assert!(svm.get_account(&f.escrow).is_none_or(|a| a.lamports == 0));
     assert!(svm
         .get_account(&f.game.pubkey())
         .is_none_or(|a| a.lamports == 0));
+
+    // Escrow + game rent land in the host's wallet, minus the one-signer tx fee.
+    let host_lamports_after = svm.get_account(&f.host.pubkey()).unwrap().lamports;
+    let tx_fee = 5_000;
+    assert_eq!(
+        host_lamports_after - host_lamports_before,
+        escrow_rent + game_rent - tx_fee
+    );
+
+    let ev = find_cpi_event::<coinflip::events::GameCancelled>(
+        &[ix],
+        &f.host.pubkey(),
+        &coinflip::ID,
+        &meta,
+    )
+    .expect("GameCancelled not emitted");
+    assert_eq!(ev.game, f.game.pubkey());
+    assert_eq!(ev.host, f.host.pubkey());
+    assert_eq!(ev.mint, f.mint);
+    assert_eq!(ev.amount, f.amount);
 }
 
 #[test]
@@ -360,4 +390,19 @@ fn cancel_rejects_non_host_owned_refund_account() {
         &[ix_cancel_game_with_refund_account(&f, mallory_ta)],
     );
     assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+}
+
+#[test]
+fn cancel_rejects_wrong_mint_refund_account() {
+    let (mut svm, payer) = setup();
+    let (f, _meta) = setup_open_game(&mut svm, &payer, 1_000);
+    // Host-owned, but for a different mint than the game's.
+    let other_mint = create_mint(&mut svm, 9);
+    let wrong_mint_ta = create_token_account(&mut svm, other_mint, f.host.pubkey(), 0);
+    let result = send(
+        &mut svm,
+        &[&f.host],
+        &[ix_cancel_game_with_refund_account(&f, wrong_mint_ta)],
+    );
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::MintMismatch);
 }

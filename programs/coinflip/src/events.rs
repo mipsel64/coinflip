@@ -31,9 +31,16 @@ pub struct GameSettled {
 #[event]
 pub struct GameCancelled {
     pub game: Pubkey,
+    pub host: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
 }
 
 #[event]
 pub struct GameRefunded {
     pub game: Pubkey,
+    pub host: Pubkey,
+    pub joiner: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
 }
