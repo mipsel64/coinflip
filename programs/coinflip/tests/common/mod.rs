@@ -430,6 +430,90 @@ pub fn ix_initialize_config(
     }
 }
 
+pub fn ix_create_game(
+    host: Pubkey,
+    game: Pubkey,
+    mint: Pubkey,
+    host_token_account: Pubkey,
+    side: u8,
+    amount: u64,
+) -> Instruction {
+    Instruction {
+        program_id: coinflip::ID,
+        accounts: coinflip::accounts::CreateGame {
+            host,
+            config: config_pda(),
+            game,
+            mint,
+            escrow: escrow_pda(&game),
+            host_token_account,
+            token_program: spl_token::ID,
+            system_program: system_program::ID,
+            event_authority: event_authority(),
+            program: coinflip::ID,
+        }
+        .to_account_metas(None),
+        data: coinflip::instruction::CreateGame { side, amount }.data(),
+    }
+}
+
+/// Everything a test needs for one game.
+pub struct GameFixture {
+    pub host: Keypair,
+    pub game: Keypair,
+    pub mint: Pubkey,
+    pub host_token_account: Pubkey,
+    pub escrow: Pubkey,
+    pub treasury: Pubkey,
+    pub amount: u64,
+}
+
+/// initialize_config + mint + funded host + create_game (host_side = Heads).
+pub fn setup_open_game(svm: &mut LiteSVM, payer: &Keypair, amount: u64) -> GameFixture {
+    let treasury = Pubkey::new_unique();
+    send_ok(
+        svm,
+        &[payer],
+        &[ix_initialize_config(
+            payer.pubkey(),
+            payer.pubkey(),
+            treasury,
+            DEFAULT_FEE_BPS,
+            DEFAULT_TIMEOUT_SLOTS,
+        )],
+    );
+
+    let host = Keypair::new();
+    svm.airdrop(&host.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
+    let mint = create_mint(svm, 9);
+    let host_token_account = create_token_account(svm, mint, host.pubkey(), amount * 10);
+
+    let game = Keypair::new();
+    send_ok(
+        svm,
+        &[&host, &game],
+        &[ix_create_game(
+            host.pubkey(),
+            game.pubkey(),
+            mint,
+            host_token_account,
+            0,
+            amount,
+        )],
+    );
+
+    let escrow = escrow_pda(&game.pubkey());
+    GameFixture {
+        host,
+        game,
+        mint,
+        host_token_account,
+        escrow,
+        treasury,
+        amount,
+    }
+}
+
 pub fn ix_update_config(
     admin: Pubkey,
     new_admin: Option<Pubkey>,

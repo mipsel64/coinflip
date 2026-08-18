@@ -40,4 +40,8 @@ pub mod coinflip {
             new_refund_timeout_slots,
         )
     }
+
+    pub fn create_game(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
+        instructions::create_game::handle(ctx, side, amount)
+    }
 }
