@@ -56,6 +56,8 @@ mod tests {
     fn max_pot_boundary() {
         assert_eq!(fee_amount(u64::MAX, 10_000).unwrap(), u64::MAX); // exactly tight
         assert!(fee_amount(u64::MAX, 10_001).is_err()); // precondition guard fires
+                                                        // small pot: try_from would NOT catch this, only the require! guard does
+        assert!(fee_amount(100, 20_000).is_err());
     }
 
     proptest! {
