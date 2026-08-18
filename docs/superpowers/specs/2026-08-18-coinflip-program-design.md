@@ -197,8 +197,11 @@ gap without any special authority:
     a freezable escrow can strand a game; a frozen payout account also fails the
     callback, leaving `settle_fallback` (with a thawed account) as the recovery
     path. Accepted for a fun project.
-- Both players' payout token accounts are recorded at create/join and must exist
-  then — the callback cannot create accounts (no rent payer in the oracle's tx).
+- Both players' payout token accounts are recorded at create/join, must exist
+  then (the callback cannot create accounts — no rent payer in the oracle's tx),
+  and must be OWNED by the respective player — staking from a delegated third
+  party's account is rejected so winnings always land in the winner's own
+  account.
 - Fees are collected in the bet token, into the treasury's ATA for that mint
   (existence ensured at join).
 
