@@ -137,15 +137,24 @@ pub fn assert_coinflip_error(
     );
     // Coinflip's and ORAO's custom error codes fully overlap (both live in
     // 6000-6013), so a matching code alone doesn't prove *our* program raised
-    // it; only the failing program id in the logs disambiguates.
-    let expected_log = format!("Program {} failed", coinflip::ID);
+    // it. When an error propagates out of a CPI, every program on the stack
+    // logs "Program <id> failed" as it unwinds — innermost first — so the
+    // FIRST such line names the true origin, and it must be coinflip.
+    let origin = failure
+        .meta
+        .logs
+        .iter()
+        .find(|log| log.starts_with("Program ") && log.contains(" failed"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no 'Program <id> failed' log line found; logs:\n{}",
+                failure.meta.pretty_logs()
+            )
+        });
+    let expected_origin = format!("Program {} failed", coinflip::ID);
     assert!(
-        failure
-            .meta
-            .logs
-            .iter()
-            .any(|log| log.contains(&expected_log)),
-        "expected a log line containing {expected_log:?}; got logs:\n{}",
+        origin.starts_with(&expected_origin),
+        "error did not originate in coinflip (first failure: {origin:?}); logs:\n{}",
         failure.meta.pretty_logs()
     );
 }
