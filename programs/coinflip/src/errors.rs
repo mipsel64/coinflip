@@ -14,7 +14,7 @@ pub enum CoinflipError {
     ZeroAmount, // 6003
     #[msg("host cannot join their own game")]
     HostCannotJoin, // 6004
-    #[msg("token account does not match the game")]
+    #[msg("mint or token account does not match the expected value")]
     MintMismatch, // 6005
     #[msg("mint has an unsupported extension")]
     UnsupportedMintExtension, // 6006
@@ -28,6 +28,6 @@ pub enum CoinflipError {
     TimeoutNotReached, // 6010
     #[msg("numerical overflow")]
     NumericalOverflow, // 6011
-    #[msg("account owner does not match")]
+    #[msg("account does not match the expected authority")]
     OwnerMismatch, // 6012
 }

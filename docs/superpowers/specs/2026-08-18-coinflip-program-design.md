@@ -201,8 +201,8 @@ gap without any special authority:
 - Single `#[error_code]` enum, append-only, `#[msg]` and `PartialEq` on every variant.
   Initial set: `FeeTooHigh`, `InvalidGameState`, `InvalidSide`, `ZeroAmount`,
   `HostCannotJoin`, `MintMismatch`, `UnsupportedMintExtension`,
-  `RandomnessNotFulfilled`, `RandomnessAccountMismatch`, `UnauthorizedVrfClient`,
-  `TimeoutNotReached`, `NumericalOverflow`.
+  `RandomnessNotFulfilled`, `AlreadyFulfilled`, `UnauthorizedVrfClient`,
+  `TimeoutNotReached`, `NumericalOverflow`, `OwnerMismatch`.
 - Every Anchor `constraint` carries `@ TypedError`.
 
 ## Events
