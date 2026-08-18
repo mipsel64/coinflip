@@ -262,3 +262,102 @@ fn create_game_rejects_non_owned_token_account() {
     );
     assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
 }
+
+#[test]
+fn create_game_rejects_stake_above_cap() {
+    let (mut svm, payer) = setup();
+    let treasury = solana_sdk::pubkey::Pubkey::new_unique();
+    send_ok(
+        &mut svm,
+        &[&payer],
+        &[ix_initialize_config(
+            payer.pubkey(),
+            payer.pubkey(),
+            treasury,
+            DEFAULT_FEE_BPS,
+            DEFAULT_TIMEOUT_SLOTS,
+        )],
+    );
+    let host = Keypair::new();
+    svm.airdrop(&host.pubkey(), 10_000_000_000).unwrap();
+    let mint = create_mint(&mut svm, 9);
+    // Funding stays small: the cap guard fires before any transfer is attempted.
+    let host_ta = create_token_account(&mut svm, mint, host.pubkey(), 10);
+    let game = Keypair::new();
+    let result = send(
+        &mut svm,
+        &[&host, &game],
+        &[ix_create_game(
+            host.pubkey(),
+            game.pubkey(),
+            mint,
+            host_ta,
+            0,
+            u64::MAX / 2 + 1,
+        )],
+    );
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::NumericalOverflow);
+}
+
+#[test]
+fn cancel_refunds_host_and_closes_accounts() {
+    let (mut svm, payer) = setup();
+    let (f, _meta) = setup_open_game(&mut svm, &payer, 5_000_000_000);
+    send_ok(&mut svm, &[&f.host], &[ix_cancel_game(&f)]);
+    assert_eq!(token_balance(&svm, &f.host_token_account), 50_000_000_000);
+    assert!(svm.get_account(&f.escrow).is_none_or(|a| a.lamports == 0));
+    assert!(svm
+        .get_account(&f.game.pubkey())
+        .is_none_or(|a| a.lamports == 0));
+}
+
+#[test]
+fn cancel_by_non_host_fails() {
+    let (mut svm, payer) = setup();
+    let (f, _meta) = setup_open_game(&mut svm, &payer, 1_000);
+    let mallory = Keypair::new();
+    svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
+    let mut ix = ix_cancel_game(&f);
+    ix.accounts[0].pubkey = mallory.pubkey(); // host slot
+    let result = send(&mut svm, &[&mallory], &[ix]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+}
+
+#[test]
+fn cancel_pays_any_host_owned_account() {
+    let (mut svm, payer) = setup();
+    let (f, _meta) = setup_open_game(&mut svm, &payer, 5_000_000_000);
+    // A second host-owned account for the same mint, distinct from the one
+    // recorded on the game at create time.
+    let second_host_ta = create_token_account(&mut svm, f.mint, f.host.pubkey(), 0);
+    send_ok(
+        &mut svm,
+        &[&f.host],
+        &[ix_cancel_game_with_refund_account(&f, second_host_ta)],
+    );
+    assert_eq!(token_balance(&svm, &second_host_ta), f.amount);
+    // The recorded account is untouched: the refund went to the account we
+    // actually passed in, not the one stored on the game.
+    assert_eq!(
+        token_balance(&svm, &f.host_token_account),
+        f.amount.saturating_mul(9)
+    );
+    assert!(svm.get_account(&f.escrow).is_none_or(|a| a.lamports == 0));
+    assert!(svm
+        .get_account(&f.game.pubkey())
+        .is_none_or(|a| a.lamports == 0));
+}
+
+#[test]
+fn cancel_rejects_non_host_owned_refund_account() {
+    let (mut svm, payer) = setup();
+    let (f, _meta) = setup_open_game(&mut svm, &payer, 1_000);
+    let mallory = solana_sdk::pubkey::Pubkey::new_unique();
+    let mallory_ta = create_token_account(&mut svm, f.mint, mallory, 0);
+    let result = send(
+        &mut svm,
+        &[&f.host],
+        &[ix_cancel_game_with_refund_account(&f, mallory_ta)],
+    );
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+}

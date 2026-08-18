@@ -44,4 +44,8 @@ pub mod coinflip {
     pub fn create_game(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
         instructions::create_game::handle(ctx, side, amount)
     }
+
+    pub fn cancel_game(ctx: Context<CancelGame>) -> Result<()> {
+        instructions::cancel_game::handle(ctx)
+    }
 }

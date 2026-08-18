@@ -694,6 +694,34 @@ pub fn setup_open_game(
     )
 }
 
+pub fn ix_cancel_game(f: &GameFixture) -> Instruction {
+    ix_cancel_game_with_refund_account(f, f.host_token_account)
+}
+
+/// Like `ix_cancel_game`, but lets the caller pick which host-owned token
+/// account receives the refund (liveness: any host-owned account of the
+/// game's mint is accepted, not just the one recorded on the game).
+pub fn ix_cancel_game_with_refund_account(
+    f: &GameFixture,
+    host_token_account: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: coinflip::ID,
+        accounts: coinflip::accounts::CancelGame {
+            host: f.host.pubkey(),
+            game: f.game.pubkey(),
+            mint: f.mint,
+            escrow: f.escrow,
+            host_token_account,
+            token_program: spl_token::ID,
+            event_authority: event_authority(),
+            program: coinflip::ID,
+        }
+        .to_account_metas(None),
+        data: coinflip::instruction::CancelGame {}.data(),
+    }
+}
+
 pub fn ix_update_config(
     admin: Pubkey,
     new_admin: Option<Pubkey>,
