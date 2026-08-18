@@ -620,6 +620,7 @@ pub struct GameJoined {
 pub struct GameSettled {
     pub game: Pubkey,
     pub winner: Pubkey,
+    pub mint: Pubkey,
     pub outcome: u8,
     pub pot: u64,
     pub fee: u64,
@@ -2118,6 +2119,7 @@ pub fn handle(ctx: Context<SettleFallback>) -> Result<()> {
     emit_cpi!(GameSettled {
         game: ctx.accounts.game.key(),
         winner: outcome.winner,
+        mint: ctx.accounts.game.token_mint,
         outcome: outcome.outcome,
         pot: outcome.pot,
         fee: outcome.fee,
@@ -2341,6 +2343,7 @@ pub fn handle(ctx: Context<SettleCallback>) -> Result<()> {
     emit_cpi!(GameSettled {
         game: ctx.accounts.game.key(),
         winner: outcome.winner,
+        mint: ctx.accounts.game.token_mint,
         outcome: outcome.outcome,
         pot: outcome.pot,
         fee: outcome.fee,

@@ -215,7 +215,7 @@ gap without any special authority:
 ## Events
 
 `#[event_cpi]` + `emit_cpi!` (playbook Phase 7), one `events.rs`:
-`GameCreated`, `GameJoined`, `GameSettled { game, winner, side, pot, fee }`,
+`GameCreated`, `GameJoined`, `GameSettled { game, winner, mint, outcome, pot, fee }`,
 `GameCancelled`, `GameRefunded`. Game + escrow accounts are closed on terminal
 states, so events are the durable history for any indexer/frontend.
 

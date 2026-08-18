@@ -20,6 +20,7 @@ pub struct GameJoined {
 pub struct GameSettled {
     pub game: Pubkey,
     pub winner: Pubkey,
+    pub mint: Pubkey,
     pub outcome: u8,
     pub pot: u64,
     pub fee: u64,
