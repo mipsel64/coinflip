@@ -1,12 +1,18 @@
 #![allow(dead_code)]
 
-use anchor_lang::{AnchorSerialize, Discriminator, InstructionData, ToAccountMetas};
+use anchor_lang::{
+    AccountDeserialize, AnchorSerialize, Discriminator, InstructionData, ToAccountMetas,
+};
 // Not yet called from this module; later tasks' helpers (e.g. treasury/joiner ATAs) use it.
 #[allow(unused_imports)]
 use anchor_spl::associated_token::get_associated_token_address;
 use anchor_spl::token::spl_token;
+use coinflip::constants::{CONFIG_SEED, ESCROW_SEED};
 use coinflip::errors::CoinflipError;
-use litesvm::{types::FailedTransactionMetadata, LiteSVM};
+use litesvm::{
+    types::{FailedTransactionMetadata, TransactionMetadata},
+    LiteSVM,
+};
 use orao_solana_vrf_cb::state::{
     client::Client,
     network_state::{NetworkConfiguration, NetworkState},
@@ -32,23 +38,38 @@ pub const DEFAULT_FEE_BPS: u16 = 100;
 pub const DEFAULT_TIMEOUT_SLOTS: u64 = 1_000;
 
 pub fn config_pda() -> Pubkey {
-    Pubkey::find_program_address(&[b"config"], &coinflip::ID).0
+    Pubkey::find_program_address(&[CONFIG_SEED], &coinflip::ID).0
 }
 
 pub fn escrow_pda(game: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"escrow", game.as_ref()], &coinflip::ID).0
+    Pubkey::find_program_address(&[ESCROW_SEED, game.as_ref()], &coinflip::ID).0
 }
 
 pub fn event_authority() -> Pubkey {
     Pubkey::find_program_address(&[b"__event_authority"], &coinflip::ID).0
 }
 
+/// Path to the built coinflip.so, honoring `CARGO_TARGET_DIR` if the caller
+/// set one (otherwise the workspace's default `target/deploy`).
+fn coinflip_so_path() -> String {
+    match std::env::var("CARGO_TARGET_DIR") {
+        Ok(target_dir) => format!("{target_dir}/deploy/coinflip.so"),
+        Err(_) => format!(
+            "{}/../../target/deploy/coinflip.so",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+    }
+}
+
 pub fn setup() -> (LiteSVM, Keypair) {
     let mut svm = LiteSVM::new();
-    svm.add_program_from_file(coinflip::ID, "../../target/deploy/coinflip.so")
+    svm.add_program_from_file(coinflip::ID, coinflip_so_path())
         .expect("run `anchor build` first");
-    svm.add_program_from_file(orao_solana_vrf_cb::ID, "tests/fixtures/orao_vrf_cb.so")
-        .expect("missing tests/fixtures/orao_vrf_cb.so");
+    svm.add_program_from_file(
+        orao_solana_vrf_cb::ID,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/orao_vrf_cb.so"),
+    )
+    .expect("missing tests/fixtures/orao_vrf_cb.so");
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000 * LAMPORTS_PER_SOL)
         .unwrap();
@@ -63,6 +84,11 @@ pub fn send(
     signers: &[&Keypair],
     ixs: &[Instruction],
 ) -> Result<(), FailedTransactionMetadata> {
+    // LiteSVM never advances its blockhash on its own: without this, two sends
+    // of an identical instruction set produce an identical signature and get
+    // rejected as `AlreadyProcessed` before the program even runs, which would
+    // make "do X twice, expect the second to fail" tests pass vacuously.
+    svm.expire_blockhash();
     let tx = Transaction::new_signed_with_payer(
         ixs,
         Some(&signers[0].pubkey()),
@@ -72,28 +98,83 @@ pub fn send(
     svm.send_transaction(tx).map(|_| ())
 }
 
+/// Like `send`, but for the positive path: panics with pretty-printed logs
+/// (instead of a bare `Result::unwrap` panic) if the transaction fails, so a
+/// broken "should succeed" test points straight at the on-chain error.
+pub fn send_ok(
+    svm: &mut LiteSVM,
+    signers: &[&Keypair],
+    ixs: &[Instruction],
+) -> TransactionMetadata {
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        ixs,
+        Some(&signers[0].pubkey()),
+        signers,
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .unwrap_or_else(|failure| panic!("transaction failed:\n{}", failure.meta.pretty_logs()))
+}
+
 pub fn assert_coinflip_error(
     result: Result<(), FailedTransactionMetadata>,
     expected: CoinflipError,
 ) {
-    match result.unwrap_err().err {
-        TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
-            assert_eq!(code, 6000 + expected as u32, "wrong custom error");
-        }
-        other => panic!("expected custom error, got {other:?}"),
-    }
+    let failure = result.unwrap_err();
+    let code = match &failure.err {
+        TransactionError::InstructionError(_, InstructionError::Custom(code)) => *code,
+        other => panic!(
+            "expected custom error, got {other:?}; logs:\n{}",
+            failure.meta.pretty_logs()
+        ),
+    };
+    assert_eq!(
+        code,
+        u32::from(expected),
+        "wrong custom error; logs:\n{}",
+        failure.meta.pretty_logs()
+    );
+    // Coinflip's and ORAO's custom error codes fully overlap (both live in
+    // 6000-6013), so a matching code alone doesn't prove *our* program raised
+    // it; only the failing program id in the logs disambiguates.
+    let expected_log = format!("Program {} failed", coinflip::ID);
+    assert!(
+        failure
+            .meta
+            .logs
+            .iter()
+            .any(|log| log.contains(&expected_log)),
+        "expected a log line containing {expected_log:?}; got logs:\n{}",
+        failure.meta.pretty_logs()
+    );
 }
 
 /// Serialize an Anchor account (discriminator + borsh) into the SVM.
+///
+/// `alloc_len` is the total account data length to allocate (discriminator +
+/// fields + optional padding); `None` allocates exactly the serialized
+/// length. Trailing padding is harmless: Anchor's borsh-based
+/// `try_deserialize` reads fields off a cursor and never requires the buffer
+/// to be fully consumed.
 pub fn write_anchor_account<T: AnchorSerialize + Discriminator>(
     svm: &mut LiteSVM,
     address: Pubkey,
     owner: Pubkey,
     value: &T,
     extra_lamports: u64,
+    alloc_len: Option<usize>,
 ) {
     let mut data = T::DISCRIMINATOR.to_vec();
     value.serialize(&mut data).unwrap();
+    if let Some(len) = alloc_len {
+        assert!(
+            len >= data.len(),
+            "alloc_len {len} smaller than serialized data ({})",
+            data.len()
+        );
+        data.resize(len, 0);
+    }
     let lamports = svm.minimum_balance_for_rent_exemption(data.len()) + extra_lamports;
     svm.set_account(
         address,
@@ -193,11 +274,21 @@ pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
     svm.airdrop(&orao_treasury, LAMPORTS_PER_SOL).unwrap();
 
     let (ns_addr, ns_bump) = NetworkState::find_address(&orao_solana_vrf_cb::ID);
-    let network_state = NetworkState::new(
+    let mut network_state = NetworkState::new(
         ns_bump,
         NetworkConfiguration::new(Pubkey::new_unique(), orao_treasury, REQUEST_FEE),
     );
-    write_anchor_account(svm, ns_addr, orao_solana_vrf_cb::ID, &network_state, 0);
+    // Mainnet's NetworkState always has at least one fulfill authority; match
+    // that account shape instead of the degenerate empty-vec case.
+    network_state.config.fulfill_authorities = vec![Pubkey::new_unique()];
+    write_anchor_account(
+        svm,
+        ns_addr,
+        orao_solana_vrf_cb::ID,
+        &network_state,
+        0,
+        Some(8 + network_state.size()),
+    );
 
     let (client_addr, client_bump) =
         Client::find_address(&coinflip::ID, &config_pda(), &orao_solana_vrf_cb::ID);
@@ -209,13 +300,16 @@ pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
         0,
         None,
     );
-    // 10 SOL of client balance to pay request fees + rent.
+    // 10 SOL of client balance to pay request fees + rent. `Client::STATIC_SIZE`
+    // is sized as if a callback were present; ours is `None`, so this over-
+    // allocates slightly to match a real, callback-capable client's account size.
     write_anchor_account(
         svm,
         client_addr,
         orao_solana_vrf_cb::ID,
         &client,
         10 * LAMPORTS_PER_SOL,
+        Some(8 + Client::STATIC_SIZE),
     );
 
     OraoEnv {
@@ -230,7 +324,37 @@ pub fn request_pda(client: &Pubkey, game: &Pubkey) -> Pubkey {
 }
 
 /// Overwrite a request account with a fulfilled state carrying `randomness`.
+///
+/// Models the post-callback frozen shape (`responses: None`); a request that
+/// was fulfilled but whose callback hasn't run yet would carry
+/// `Some(responses)` instead — harmless here because only `randomness` is
+/// ever read back out of a fulfilled request in these tests.
+///
+/// Panics if `client`+`game` doesn't already have a (real, pending) request
+/// account in the SVM: this helper is meant to settle a request that a real
+/// `request` CPI created, not to conjure one out of nothing. For a standalone
+/// write with no pre-existing request, use `write_fulfilled_request_unchecked`.
 pub fn write_fulfilled_request(
+    svm: &mut LiteSVM,
+    client: Pubkey,
+    game: Pubkey,
+    randomness: [u8; 64],
+) -> Pubkey {
+    let (addr, _) =
+        RequestAccount::find_address(&client, &game.to_bytes(), &orao_solana_vrf_cb::ID);
+    assert!(
+        svm.get_account(&addr).is_some(),
+        "request account {addr} does not exist yet; join the game (or otherwise \
+         trigger a real `request` CPI) before fulfilling it, or use \
+         write_fulfilled_request_unchecked for a standalone write"
+    );
+    write_fulfilled_request_unchecked(svm, client, game, randomness)
+}
+
+/// Like `write_fulfilled_request`, but doesn't require a pre-existing request
+/// account. Intended for tests that only exercise the crafted ORAO account
+/// shapes in isolation (see the `orao_accounts_round_trip` smoke test).
+pub fn write_fulfilled_request_unchecked(
     svm: &mut LiteSVM,
     client: Pubkey,
     game: Pubkey,
@@ -245,8 +369,29 @@ pub fn write_fulfilled_request(
         game.to_bytes(),
         RequestState::Fulfilled(Fulfilled::new(randomness, None)),
     );
-    write_anchor_account(svm, addr, orao_solana_vrf_cb::ID, &request, 0);
+    write_anchor_account(svm, addr, orao_solana_vrf_cb::ID, &request, 0, None);
     addr
+}
+
+/// Deserializes a (real, pending) request account and returns the pubkeys of
+/// its callback's remaining accounts, in order. Task 10 uses this to pin
+/// callback account ordering against the real ORAO callback CPI.
+pub fn request_callback_accounts(svm: &LiteSVM, request: &Pubkey) -> Vec<Pubkey> {
+    let acct = svm.get_account(request).expect("request account missing");
+    let request_account = RequestAccount::try_deserialize(&mut &acct.data[..])
+        .expect("failed to deserialize RequestAccount");
+    let pending = request_account
+        .pending()
+        .expect("request is not pending (already fulfilled?)");
+    let callback = pending
+        .callback
+        .as_ref()
+        .expect("request has no callback configured");
+    callback
+        .remaining_accounts()
+        .iter()
+        .map(|ra| *ra.pubkey())
+        .collect()
 }
 
 // ---------- instruction builders ----------
