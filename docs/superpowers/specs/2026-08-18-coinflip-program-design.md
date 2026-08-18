@@ -56,9 +56,9 @@ Anchor workspace (`anchor init` layout), single program `coinflip`.
 After deploy, the upgrade authority runs a script that sends ORAO's `Register`
 instruction: client program = `coinflip`, state PDA = our `Config` PDA (it signs
 `Request` CPIs). This allocates the **Client PDA** (owned by the VRF program), which
-is then funded with SOL for fees/rent. The Client PDA address is stored into `Config`
-by `initialize_config` (or an admin update) so the program can verify callbacks and
-route fee reimbursements.
+is then funded with SOL for fees/rent. The Client PDA address is not stored anywhere:
+the program derives and validates it from seeds wherever it verifies callbacks or
+routes fee reimbursements (see the Config section below).
 
 ## State
 
@@ -117,8 +117,8 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 
 | # | Instruction | Signer | Behavior |
 |---|---|---|---|
-| 1 | `initialize_config(fee_bps, refund_timeout_slots)` | deployer | One-time. `fee_bps <= MAX_FEE_BPS`. Admin/treasury/`vrf_client` = provided keys |
-| 2 | `update_config(...)` | `admin` | Rotate admin/treasury/`vrf_client`, change `fee_bps` (re-checked against cap) and timeout |
+| 1 | `initialize_config(fee_bps, refund_timeout_slots)` | deployer | One-time. `fee_bps <= MAX_FEE_BPS`. Admin/treasury = provided keys |
+| 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout |
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. State = Open |
 | 4 | `cancel_game` | host | Requires state == Open. Refund host stake, close escrow + game (rent to host) |
 | 5 | `join_game` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; ensure treasury ATA exists (`init_if_needed`, payer = joiner). Transfer the current VRF fee (read from ORAO `NetworkState`) in lamports joiner → Client PDA. CPI ORAO `Request` (seed = game pubkey, `Config` PDA signs, Client PDA pays) with a request-level callback targeting `settle_callback` and carrying: game, escrow, host + joiner token accounts, treasury ATA, mint, token program. Record joiner, joiner token account, `joined_at_slot`. State = AwaitingRandomness |
