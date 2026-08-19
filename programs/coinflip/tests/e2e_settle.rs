@@ -61,9 +61,10 @@ fn settle_pays_host_when_host_side_wins() {
     assert_eq!(token_balance(&svm, &j.treasury_token_account), FEE);
     assert!(is_gone(&svm, &j.fixture.escrow), "escrow must be closed");
     assert!(is_gone(&svm, &game_key), "game must be closed");
-    // The losing joiner is out their stake and NOTHING else: every lamport the
-    // join cost them comes back from the winning host's bond. They are not a
-    // signer here, so there is no tx fee to net out either.
+    // Across THIS transaction the joiner is paid back exactly what the program
+    // recorded as sunk. That the sum of all their transactions nets out to only
+    // the tx fee is a stronger claim, measured end to end in
+    // `losing_joiner_pays_stake_and_tx_fees_only`.
     assert_eq!(
         svm.get_account(&j.joiner.pubkey()).unwrap().lamports - joiner_lamports_before,
         sunk,
@@ -76,10 +77,12 @@ fn settle_pays_host_when_host_side_wins() {
     );
 
     // Budget guard: the request PDA derivation + two transfers + a close + the
-    // reimbursement + the event CPI (measured ~41k with both payout accounts
-    // recorded; the ATA-fallback path derives two more).
+    // reimbursement + the event CPI. Every PDA here is derived from a stored
+    // bump (escrow's and, since the request bump joined the game account, the
+    // request's), so there is no bump search left and the number is the same on
+    // every run: measured 41_389, guarded at +15%.
     assert!(
-        meta.compute_units_consumed < 60_000,
+        meta.compute_units_consumed < 47_500,
         "settle used {} CU",
         meta.compute_units_consumed
     );
@@ -153,6 +156,106 @@ fn settle_pays_joiner_when_host_side_loses() {
     assert_eq!(ev.winner, j.joiner.pubkey());
     assert_eq!(ev.outcome, u8::from(coinflip::state::Side::Tails));
     assert_eq!(ev.joiner_reimbursed, 0);
+}
+
+/// THE invariant this whole mechanism exists for, measured end to end: from
+/// before the join to after the settlement, a losing joiner's wallet is down
+/// exactly the transaction fee they paid to join — their stake is gone (that is
+/// the bet), and every lamport of incidental cost has come back, half from
+/// ORAO's own fulfillment refund and half from the winning host's bond.
+///
+/// The join is sent inline rather than through `setup_joined_game` so the
+/// pre-join balance is observable.
+#[test]
+fn losing_joiner_pays_stake_and_tx_fees_only() {
+    let (mut svm, payer) = setup();
+    let (f, _create_meta) = setup_open_game(&mut svm, &payer, STAKE);
+    let orao = setup_orao(&mut svm);
+    let joiner = Keypair::new();
+    svm.airdrop(&joiner.pubkey(), 10 * 1_000_000_000).unwrap();
+    let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), STAKE * 10);
+
+    let joiner_lamports_before_join = svm.get_account(&joiner.pubkey()).unwrap().lamports;
+    let join_tx_fee = 5_000; // one signature: the joiner's
+    send_ok(
+        &mut svm,
+        &[&joiner],
+        &[ix_join_game(&f, &orao, joiner.pubkey(), joiner_ta)],
+    );
+
+    // Mid-flight the joiner really is out of pocket: fee + the FULL pending
+    // rent + the tx fee. This is the number a UI shows while waiting.
+    let request_rent = svm.minimum_balance_for_rent_exemption(PENDING_REQUEST_LEN);
+    assert_eq!(
+        joiner_lamports_before_join - svm.get_account(&joiner.pubkey()).unwrap().lamports,
+        REQUEST_FEE + request_rent + join_tx_fee
+    );
+
+    // ORAO fulfills: the account shrinks to its fulfilled size and the freed
+    // rent goes back to the request's client, i.e. the joiner (modelled by the
+    // harness after ORAO's `FulfillV2`, which takes `client` as a mut account).
+    let vrf_seed = vrf_seed_for(&f.game.pubkey(), &joiner.pubkey(), 0);
+    // randomness[0] even => Heads => the host (who picked Heads) wins.
+    write_fulfilled_request(&mut svm, vrf_seed, randomness_with_first_byte(2));
+    let fulfilled_rent = fulfilled_request_rent(&svm);
+    assert_eq!(
+        joiner_lamports_before_join - svm.get_account(&joiner.pubkey()).unwrap().lamports,
+        REQUEST_FEE + fulfilled_rent + join_tx_fee,
+        "ORAO's refund leaves exactly the fee plus the fulfilled-size rent"
+    );
+
+    let treasury_token_account = get_associated_token_address(&treasury(), &f.mint);
+    let j = JoinedGame {
+        fixture: f,
+        joiner,
+        joiner_token_account: joiner_ta,
+        treasury_token_account,
+        orao,
+        request: request_pda(&vrf_seed),
+        vrf_seed,
+    };
+    // A third party cranks it, so no further fee touches the joiner.
+    send_ok(&mut svm, &[&payer], &[ix_settle(&j, payer.pubkey())]);
+
+    assert_eq!(
+        svm.get_account(&j.joiner.pubkey()).unwrap().lamports,
+        joiner_lamports_before_join - join_tx_fee,
+        "a losing joiner ends the game down exactly their join transaction fee"
+    );
+    // ...and their stake, which is the whole of what losing costs.
+    assert_eq!(token_balance(&svm, &j.joiner_token_account), REMAINING);
+}
+
+/// The reimbursement may only ever land on the game's own joiner: a cranker
+/// choosing this account cannot point it at themselves.
+#[test]
+fn settle_rejects_wrong_joiner() {
+    let (mut svm, payer) = setup();
+    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
+    // randomness[0] even => Heads => the host (who picked Heads) wins, so a
+    // reimbursement really is about to be paid.
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(2));
+
+    let mut ix = ix_settle(&j, payer.pubkey());
+    let joiner_slot = ix
+        .accounts
+        .iter()
+        .position(|meta| meta.pubkey == j.joiner.pubkey())
+        .expect("joiner slot");
+    ix.accounts[joiner_slot].pubkey = payer.pubkey(); // the cranker's own wallet
+
+    let result = send(&mut svm, &[&payer], &[ix]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+    assert_eq!(
+        token_balance(&svm, &j.fixture.escrow),
+        POT,
+        "escrow must be untouched"
+    );
+    assert_eq!(
+        read_game(&svm, &j.fixture.game.pubkey()).state,
+        u8::from(coinflip::state::GameState::AwaitingRandomness),
+        "the game must still be settleable"
+    );
 }
 
 /// The bond is sized from ORAO's fee at CREATE time. If that fee is raised

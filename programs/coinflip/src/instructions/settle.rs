@@ -17,10 +17,12 @@ pub struct Settle<'info> {
     pub cranker: Signer<'info>,
     /// Seed binding: this must be THE request for this game. The seed lives in
     /// ORAO's global request namespace, so `game.vrf_seed` is the whole binding.
+    /// The bump comes from the game (recorded at join), so this is one hash
+    /// rather than a search whose cost depends on the seed.
     #[account(
         seeds = [RANDOMNESS_ACCOUNT_SEED, game.vrf_seed.as_ref()],
         seeds::program = orao_solana_vrf::ID,
-        bump,
+        bump = game.request_bump,
     )]
     pub request: Box<Account<'info, RandomnessV2>>,
     #[account(mut, close = host)]
@@ -50,9 +52,8 @@ pub struct Settle<'info> {
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     /// The constant treasury's canonical ATA for this mint — the one
     /// `create_game` guaranteed exists. Pinned by derivation, not merely by
-    /// owner: a cranker
-    /// picks this account, and scattering fees across other treasury-owned
-    /// accounts would make collection a manual hunt.
+    /// owner: a cranker picks this account, and scattering fees across other
+    /// treasury-owned accounts would make collection a manual hunt.
     #[account(
         mut,
         constraint = treasury_token_account.key()
@@ -110,7 +111,7 @@ pub(crate) fn handle(ctx: Context<Settle>) -> Result<()> {
     // it must happen here, in the handler, because `close = host` sweeps
     // whatever is left after this instruction returns.
     let mut joiner_reimbursed = 0u64;
-    if outcome.winner == ctx.accounts.game.host {
+    if outcome.host_won {
         let game = &ctx.accounts.game;
         joiner_reimbursed = game.joiner_sunk_lamports.min(game.bond_lamports);
         if joiner_reimbursed > 0 {

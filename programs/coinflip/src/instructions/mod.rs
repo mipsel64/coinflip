@@ -18,9 +18,9 @@ pub use refund_timeout::*;
 pub use settle::*;
 pub use update_config::*;
 
-/// Rent for an ORAO request account at its FULFILLED size — Anchor's 8-byte
-/// discriminator plus `RandomnessV2::FULFILLED_SIZE` (129; 137 with the 8-byte discriminator), which
-/// is how ORAO itself sizes the account it shrinks to at fulfillment.
+/// Rent for an ORAO request account at its FULFILLED size: the 8-byte
+/// discriminator plus `RandomnessV2::FULFILLED_SIZE` (129), so 137 bytes — the
+/// size ORAO itself shrinks the account to at fulfillment.
 ///
 /// ORAO allocates the larger pending size at request time and returns the
 /// freed rent to the request's client (our joiner) when it fulfills, so this

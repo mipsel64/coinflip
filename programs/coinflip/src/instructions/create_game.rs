@@ -115,7 +115,11 @@ fn validate_mint(mint_info: &AccountInfo) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
+/// * `max_bond` — the largest bond, in lamports, the host accepts locking up
+///   for the life of the game. The bond is sized from ORAO's live `request_fee`
+///   (see below), which ORAO's authority can raise at any time, so the host
+///   states their own ceiling — the mirror image of the joiner's `max_vrf_fee`.
+pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64, max_bond: u64) -> Result<()> {
     require!(amount > 0, CoinflipError::ZeroAmount);
     require!(amount <= u64::MAX / 2, CoinflipError::NumericalOverflow);
     let side = Side::from_byte(side)?;
@@ -154,6 +158,7 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
         .ok_or(CoinflipError::NumericalOverflow)?
         .checked_add(super::fulfilled_request_rent()?)
         .ok_or(CoinflipError::NumericalOverflow)?;
+    require!(bond <= max_bond, CoinflipError::BondTooHigh);
     // Safe to fund now, not before: `init` runs pre-handler, so the game
     // account exists and is already rent-exempt for its own data.
     system_program::transfer(
@@ -185,9 +190,10 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
     // commits, under whatever timeout was configured then.
     game.refund_timeout_slots = 0;
     game.bond_lamports = bond;
-    // Recorded at join, once there is a joiner with costs to reimburse.
+    // Both recorded at join: there is no request and no joiner yet.
+    game.request_bump = 0;
     game.joiner_sunk_lamports = 0;
-    game._reserved = [0; 22];
+    game._reserved = [0; 21];
 
     emit_cpi!(GameCreated {
         game: game.key(),
@@ -196,6 +202,7 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
         amount,
         host_side: game.host_side,
         fee_bps: game.fee_bps,
+        bond_lamports: bond,
     });
     Ok(())
 }

@@ -97,14 +97,28 @@ All notable changes to this project are documented in this file, in the
   - `GameSettled` gains a trailing `joiner_reimbursed: u64`.
   - **The treasury ATA moved from `join_game` to `create_game`**, payer joiner
     → host: `join_game` drops `treasury`, `treasury_token_account`, and
-    `associated_token_program` (three accounts, ~76k → ~48k CU); `create_game`
-    gains those three plus `network_state` (~73.5k CU, mostly the one-per-mint
-    ATA init). `settle` is ~41.3k CU.
-  - `Game` grows two `u64`s: `INIT_SPACE` 244 → 260 bytes, `_reserved` still
-    `[u8; 22]`.
+    `associated_token_program` (three accounts); `create_game` gains those
+    three plus `network_state`, and pays for the one-per-mint ATA init.
+    Measured compute: `create_game` 70_621, `join_game` 48_376 (was ~76k),
+    `settle` 41_389.
+  - `Game` grows two `u64`s (plus `request_bump` below): `INIT_SPACE` 244 →
+    260 bytes, `_reserved` 22 → 21.
   - Under-bonded edge (ORAO raises its fee between create and join): the
     reimbursement caps at the bond, no join is rejected, and both figures are
-    public on the open game so a frontend can show the guaranteed amount.
+    public on the open game so a frontend can show the guaranteed amount. A
+    client that wants the risk gone joins with
+    `max_vrf_fee = game.bond_lamports - rent(8 + FULFILLED_SIZE)`, the exact
+    ceiling at which `sunk <= bond` holds.
+  - `create_game` gained a third argument, `max_bond: u64` — the host's ceiling
+    on their own lockup, symmetric with the joiner's `max_vrf_fee`. New error
+    `BondTooHigh` (6017).
+  - `GameCreated` gains a trailing `bond_lamports: u64`, so an indexer knows
+    what was promised without having seen the (now closed) game account.
+  - `Game` also gained `request_bump: u8` (after `vrf_seed`): the canonical bump
+    of the ORAO request PDA, recorded at join so `settle`/`refund_timeout`
+    derive that address with one hash instead of a bump search. `_reserved`
+    shrank 22 → 21 to keep `INIT_SPACE` at 260. Settlement compute is now
+    constant (41_389 CU) instead of varying by thousands with the seed.
 
 ### Notes for integrators
 
@@ -130,5 +144,11 @@ All notable changes to this project are documented in this file, in the
 - Crank authors: `settle` now needs the joiner's **wallet** (`game.joiner`)
   alongside their token account — it is where the bond reimbursement lands.
   `refund_timeout` is unchanged.
+- Deployers: `scripts/smoke.ts` prints a **GO/NO-GO** line — a losing joiner's
+  end-to-end lamport net, which must be exactly `-5000` (their join
+  transaction fee). It is the only check that empirically confirms ORAO refunds
+  the pending→fulfilled rent to the request payer, which is the assumption the
+  bond's size rests on and the one link LiteSVM models rather than executes.
+  See the README's deployment runbook.
 - Error codes (`errors.rs`) and event layouts (`events.rs`) are append-only
   ABI from this point forward.

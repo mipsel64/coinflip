@@ -47,8 +47,13 @@ pub mod coinflip {
         instructions::update_config::handle(ctx, new_admin, new_fee_bps, new_refund_timeout_slots)
     }
 
-    pub fn create_game(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
-        instructions::create_game::handle(ctx, side, amount)
+    pub fn create_game(
+        ctx: Context<CreateGame>,
+        side: u8,
+        amount: u64,
+        max_bond: u64,
+    ) -> Result<()> {
+        instructions::create_game::handle(ctx, side, amount, max_bond)
     }
 
     pub fn cancel_game(ctx: Context<CancelGame>) -> Result<()> {

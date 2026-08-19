@@ -35,6 +35,13 @@ import { IDL_ADDRESS, IDL_RAW, idlConstantPubkey } from "./idl.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * `8 + RandomnessV2::FULFILLED_SIZE` — what ORAO shrinks a request account to
+ * when it fulfills. Its rent is the part of the joiner's outlay that only the
+ * host's bond can return, so it sets both the bond's size and the joiner's fee
+ * ceiling (see `maxVrfFee` below).
+ */
+const FULFILLED_REQUEST_LEN = 137;
 const POLL_INTERVAL_MS = 2_000;
 const POLL_TIMEOUT_MS = 3 * 60_000;
 const STAKE_AMOUNT = new anchor.BN(1_000_000); // 0.001 token (9 decimals)
@@ -258,9 +265,21 @@ async function main() {
   // IDL pins them (to the program's constant, that constant's ATA, and ORAO's
   // config PDA), so anchor-ts resolves them itself.
   console.log();
+  // The host bounds their own lockup, the mirror of the joiner's max_vrf_fee:
+  // ORAO's authority can raise the fee between this read and the transaction
+  // landing, and the bond is sized from it. 2x the bond we expect tolerates a
+  // fee doubling; anything beyond that, the host would rather not create.
+  const [preCreateNetworkState, fulfilledRentLamports] = await Promise.all([
+    vrf.getNetworkState(),
+    connection.getMinimumBalanceForRentExemption(FULFILLED_REQUEST_LEN),
+  ]);
+  const expectedBond = preCreateNetworkState.config.requestFee
+    .muln(2)
+    .addn(fulfilledRentLamports);
+  const maxBond = expectedBond.muln(2);
   const hostLamportsBefore = await connection.getBalance(host.publicKey);
   const createTx = await program.methods
-    .createGame(0, STAKE_AMOUNT) // side = Heads
+    .createGame(0, STAKE_AMOUNT, maxBond) // side = Heads
     .accounts({
       host: host.publicKey,
       game: game.publicKey,
@@ -288,10 +307,23 @@ async function main() {
   const NONCE = new anchor.BN(0);
   const networkStateAccount = await vrf.getNetworkState();
   const oraoTreasury = networkStateAccount.config.treasury;
-  // Bound what ORAO may charge: the fee is live config and the joiner pays it
-  // from their own wallet. 2x the fee we just read tolerates a raise between
-  // now and the transaction landing without accepting an unbounded one.
-  const maxVrfFee = networkStateAccount.config.requestFee.muln(2);
+  // Bound what ORAO may charge, at exactly the ceiling that keeps the
+  // reimbursement whole: the joiner sinks `request_fee + fulfilled rent`, and
+  // the host's bond caps what comes back, so
+  //     request_fee <= bond_lamports - fulfilled_rent  <=>  sunk <= bond.
+  // Joining under this cap makes under-reimbursement unreachable — and the bond
+  // is read off the game account the joiner is about to join, which is exactly
+  // what a real client already fetches before deciding to join.
+  let maxVrfFee = bondLamports.subn(fulfilledRentLamports);
+  if (maxVrfFee.lt(networkStateAccount.config.requestFee)) {
+    console.warn(
+      `WARNING: ORAO's fee (${networkStateAccount.config.requestFee}) exceeds what this game's ` +
+        `bond covers (${maxVrfFee}) — ORAO raised it since create. A real client should skip ` +
+        "this game instead of joining under-reimbursed; this smoke joins anyway, and the " +
+        "go/no-go number below will show the shortfall."
+    );
+    maxVrfFee = networkStateAccount.config.requestFee;
+  }
   const vrfSeed = vrfSeedFor(game.publicKey, joiner.publicKey, NONCE);
   const request = randomnessAccountAddress(vrfSeed);
   // Pass the mint's owning program: a Token-2022 game's treasury ATA sits at a
@@ -421,6 +453,39 @@ async function main() {
       "Joiner's lamport delta across settle:",
       (await connection.getBalance(joiner.publicKey)) - joinerLamportsBeforeSettle
     );
+
+    // ---- GO / NO-GO ----
+    // The joiner's whole round trip: before the join, after the settlement.
+    // If the host won, this must be exactly -(their join tx fee) — every other
+    // lamport came back, half from ORAO's fulfillment refund and half from the
+    // host's bond. That first half is the ONE link LiteSVM cannot verify (the
+    // Rust suite models ORAO's refund rather than executing it), and the bond's
+    // size is derived from it, so this number is what turns the model into a
+    // measurement. Anything more negative than a transaction fee means ORAO's
+    // refund behavior is not what the bond assumes: do not ship.
+    const joinerRoundTrip =
+      (await connection.getBalance(joiner.publicKey)) - joinerLamportsBefore;
+    const hostWon = event.winner.equals(host.publicKey);
+    console.log(
+      `\nGO/NO-GO — joiner's end-to-end lamport net (pre-join -> post-settle): ${joinerRoundTrip}`
+    );
+    if (hostWon) {
+      console.log(
+        "  Host won, so this must be exactly -5000 (the joiner's single join transaction fee)."
+      );
+      if (joinerRoundTrip !== -5_000) {
+        console.log("  NO-GO: the losing joiner paid more than their transaction fee.");
+        process.exitCode = 1;
+      } else {
+        console.log("  GO: the losing joiner paid their stake and their tx fee, nothing else.");
+      }
+    } else {
+      // A winning joiner is not reimbursed by design; they took the pot.
+      console.log(
+        "  Joiner won, so they correctly bore their own ORAO costs — re-run until the host " +
+          "wins to exercise the reimbursement leg (it is a coin flip)."
+      );
+    }
   } else {
     console.log("Could not decode a GameSettled event from the settle transaction.");
     // The event is the verifiable proof this smoke test exists to produce —

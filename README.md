@@ -9,7 +9,9 @@ two transactions — create and join — and never the settlement. The winner
 receives the pot minus a configurable protocol fee (default 1%, snapshotted
 onto the game at creation so a later fee change never affects games already in
 flight). **The loser pays their stake and nothing else** — every join-time
-incidental lands on the winner, via a bond the host posts at create (see
+incidental lands on the winner, via a bond the host posts at create (a losing
+host additionally bears their own transaction fees and, for the first game of a
+mint, the treasury ATA's rent; see
 [Economics](#economics--accepted-limitations)).
 
 **Worked example:** each player bets 5 SOL (as wSOL). Pot = 10 SOL. Fee = 1%
@@ -29,7 +31,7 @@ trade-offs), see
 |---|---|---|---|
 | 1 | `initialize_config(admin, fee_bps, refund_timeout_slots)` | the program's **upgrade authority** (verified against ProgramData) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to `[MIN, MAX]_REFUND_TIMEOUT_SLOTS`; admin must be a non-default key |
 | 2 | `update_config(...)` | `admin` | Rotate admin, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). The treasury is **not** config state — see [Treasury](#treasury) |
-| 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates the mint. Inits `Game` + escrow, transfers the host stake into escrow, records the host's payout token account. Also ensures the treasury ATA for the mint exists (**host-paid**, once per mint) and parks the reimbursement **bond** in the game account, sized from ORAO's live request fee. State → `Open` |
+| 3 | `create_game(side, amount, max_bond)` | host + game keypair | `amount > 0`, and the bond ORAO's live fee implies must be `<= max_bond` (the host's own ceiling on the lockup, mirroring the joiner's `max_vrf_fee`). Validates the mint. Inits `Game` + escrow, transfers the host stake into escrow, records the host's payout token account. Also ensures the treasury ATA for the mint exists (**host-paid**, once per mint) and parks the reimbursement **bond** in the game account, sized from ORAO's live request fee. State → `Open` |
 | 4 | `cancel_game` | host | Requires state `Open`. Refunds the host stake, closes escrow + game (rent **and the whole bond** to host) |
 | 5 | `join_game(nonce, max_vrf_fee)` | joiner | Requires state `Open`, `joiner != host`. Transfers the matching stake into escrow; rejects an ORAO fee above `max_vrf_fee`; CPIs ORAO's `request_v2` with the joiner as ORAO's payer (they pay the VRF fee and the request account's rent directly — the program holds no VRF float). `nonce` salts the VRF seed so a blocked request address can be retried at a fresh one. Records the joiner, `joined_at_slot`, the refund-timeout snapshot, and `joiner_sunk_lamports` (what a losing host will owe them). Touches no treasury account. State → `AwaitingRandomness` |
 | 6 | `settle` | anyone (the crank, in practice) | Requires state `AwaitingRandomness` and a **fulfilled** request. Runs the core settlement, including the bond reimbursement — so it also takes the joiner's **wallet** |
@@ -119,8 +121,8 @@ an unneeded local validator; every test here runs against LiteSVM in-process,
 including the real, checked-in ORAO VRF program binary (see
 [Fixture provenance](#fixture-provenance)).
 
-73 tests should pass: 18 unit (fee math + enum round-trips) + 10 config + 14
-create/cancel + 10 join + 11 refund + 10 settle.
+80 tests should pass: 18 unit (fee math + enum round-trips) + 10 config + 18
+create/cancel + 10 join + 11 refund + 13 settle.
 
 ## Treasury
 
@@ -131,6 +133,11 @@ land in that key's **canonical ATA** for the bet mint, and `settle` pins that
 exact derivation — so nobody can scatter fees across other treasury-owned
 accounts.
 
+- **Sweep fees with `transfer`, never `close_account`.** Closing a treasury ATA
+  to reclaim its rent bricks every in-flight settlement for that mint: `settle`
+  pins the fee destination to that exact address and does not create it (the
+  host does, at create), so until someone re-creates it, every affected game
+  fails to settle. Move the balance out and leave the account open.
 - **Back up `keys/treasury-keypair.json` off-machine**, alongside the program
   keypair (both are gitignored): it is the only key that can move collected
   fees out of the treasury's ATAs. Losing it does *not* stop fee collection —
@@ -200,7 +207,18 @@ Then, order matters:
    ephemeral wallets, polls the ORAO request until it is fulfilled, sends
    `settle` (the crank's transaction), and decodes the `GameSettled` event —
    the full production path end to end. See [Indexer note](#indexer-note).
-8. Point the crank at the deployment (separate repo). Until it runs, games
+8. **GO / NO-GO: read the smoke's `GO/NO-GO` line.** When the host wins, the
+   joiner's end-to-end lamport net (pre-join → post-settle) **must be exactly
+   `-5000`**, their single join transaction fee. That number empirically
+   verifies the one link the Rust suite cannot execute: that ORAO's
+   fulfillment really does refund the pending→fulfilled rent difference to the
+   request's payer. LiteSVM *models* that refund; the bond is sized on the
+   assumption, so a mainnet-bound deploy should not proceed on the model alone.
+   Anything more negative means the joiner is eating costs the design says the
+   winner pays — stop and re-derive the bond. (A joiner win exercises the other
+   branch and prints no verdict; re-run until the host wins — it is a coin
+   flip.)
+9. Point the crank at the deployment (separate repo). Until it runs, games
    settle only when someone sends `settle` by hand:
    `npx tsx scripts/ops.ts -k <keypair> settle --game <pubkey>`.
 
@@ -244,8 +262,11 @@ when this was written — `scripts/ops.ts check-orao` reprints it live).
 - **A fee raise between create and join caps the reimbursement.** The bond is
   sized from ORAO's fee at create time; the 2x multiplier absorbs a doubling.
   Beyond that, the reimbursement caps at `bond_lamports` and the joiner absorbs
-  the rest — no join is rejected for it. Both numbers are on the open game
-  account, so a frontend can show the guaranteed amount before anyone joins.
+  the rest — the program rejects no join for it, but a client need never take
+  that risk: joining with `max_vrf_fee = bond_lamports - 0.00184 SOL` makes
+  under-reimbursement unreachable (see the downstream contract). Both numbers
+  are on the open game account, so a frontend can show the guaranteed amount
+  before anyone joins, and the host bounds their own side with `max_bond`.
 - **A refunded game is the joiner's worst case:** nobody won, so nobody
   reimburses; the joiner's sunk costs stay sunk, and if ORAO never fulfills at
   all, the full 0.0061 SOL rent stays locked in the pending request (recovered
@@ -272,12 +293,18 @@ when this was written — `scripts/ops.ts check-orao` reprints it live).
   frozen dead end: if every candidate winner account is frozen once the
   request is already fulfilled, funds are stuck until a thaw — `refund_timeout`
   is blocked by `AlreadyFulfilled` at that point. Accepted for a fun project.
+- **`create_game` now depends on ORAO's `NetworkState` too.** Sizing the bond
+  means reading ORAO's live fee, so a change to that account's layout — or a
+  fee spike past the host's `max_bond` — halts game *creation*, not just
+  joining. That is a wider blast radius than before (the dependency used to
+  start at join), accepted deliberately: the alternative is a hardcoded bond
+  that silently under-covers the joiner the moment ORAO's fee moves.
 - **Token-2022 test coverage:** the e2e suite exercises T22 end-to-end on
   `create_game`, `cancel_game`, and `join_game` (see `t22_game_full_join`,
-  including the T22-derived treasury ATA `create_game` makes). Settlement e2e coverage is classic
-  SPL only; the settlement code is token-program-agnostic (`TokenInterface` +
-  `transfer_checked` throughout), so this is a coverage gap, not a behavioral
-  one.
+  including the T22-derived treasury ATA `create_game` makes). Settlement e2e
+  coverage is classic SPL only; the settlement code is token-program-agnostic
+  (`TokenInterface` + `transfer_checked` throughout), so this is a coverage
+  gap, not a behavioral one.
 
 ## Randomness & trust
 
@@ -377,7 +404,12 @@ elsewhere:
   `create_game` itself.
 - **`settle` takes the joiner's wallet** (`joiner`, `mut`, pinned to
   `game.joiner`) in addition to `joiner_token_account`: it is where the bond
-  reimbursement lands when the host wins.
+  reimbursement lands when the host wins. Passing anything else is
+  `OwnerMismatch` (6012).
+- **`Game` gained three fields** — `request_bump: u8` (after `vrf_seed`),
+  `bond_lamports: u64`, `joiner_sunk_lamports: u64` — and `_reserved` shrank to
+  `[u8; 21]`, keeping the account at 260 bytes + 8. A decoder with hardcoded
+  offsets past `vrf_seed` must be updated; anchor-ts clients just regenerate.
 - **Do not pass `networkState` to `join_game`.** The IDL pins it to ORAO's
   config PDA, so anchor-ts resolves it. You **must** pass `oraoTreasury` (read
   it from ORAO's `NetworkState`) and `request`
@@ -386,9 +418,20 @@ elsewhere:
   program — the SAME nonce you pass as the instruction argument).
 - **`join_game` takes two arguments now:** `nonce: u64` (start at 0; on a
   `Custom(0)` failure retry with the next value — see Randomness & trust) and
-  `max_vrf_fee: u64` (the largest ORAO request fee the joiner accepts; read the
-  live fee from ORAO's `NetworkState` and allow some headroom, or the join
-  fails with `VrfFeeTooHigh` (6016) after ORAO raises it).
+  `max_vrf_fee: u64` (the largest ORAO request fee the joiner accepts, or the
+  join fails closed with `VrfFeeTooHigh` (6016)). **Set it to
+  `game.bond_lamports - rent(8 + RandomnessV2::FULFILLED_SIZE)`** — i.e. the
+  bond on the game you are about to join, minus the rent of a 137-byte account
+  (0.00184 SOL at current rent). That is exactly the ceiling at which the
+  reimbursement still covers everything you sink:
+  `sunk = fee + rent <= bond  ⟺  fee <= bond - rent`. Join under it and
+  under-reimbursement is unreachable; if ORAO's live fee is already above it,
+  that game's bond is stale — skip it rather than join under-covered. A client
+  already fetches the game account before joining, so the number is free.
+- **`create_game` takes `max_bond: u64`** (third argument): the largest bond
+  the host accepts locking up for the life of the game, `BondTooHigh` (6017)
+  above it. Read ORAO's fee, compute `2 * fee + rent(137)`, and allow headroom
+  for a raise between building and landing — `scripts/smoke.ts` passes 2x.
 - **`join_game` no longer takes `host` or `hostTokenAccount`.** They were only
   ever there to authorize the callback's frozen account list.
 - **`settle` and `refund_timeout` no longer take `config`.** Neither reads it;

@@ -440,8 +440,26 @@ pub fn write_anchor_account<T: AnchorSerialize + Discriminator>(
     .unwrap();
 }
 
+/// A keypair with the same address on every run. PDA derivation
+/// (`find_program_address`) costs ~1.5k CU per bump miss, and how many it
+/// misses depends on the key it derives from — so a test that pins a compute
+/// number must pin the keys behind every PDA in the instruction, or the
+/// measurement wanders by thousands of CU between runs.
+pub fn fixed_keypair(seed: u8) -> Keypair {
+    solana_sdk::signer::keypair::keypair_from_seed(&[seed; 32]).expect("valid seed")
+}
+
+/// Same idea for an address that never signs (a mint, say).
+pub fn fixed_pubkey(seed: u8) -> Pubkey {
+    Pubkey::new_from_array([seed; 32])
+}
+
 pub fn create_mint(svm: &mut LiteSVM, decimals: u8) -> Pubkey {
-    let mint = Pubkey::new_unique();
+    create_mint_at(svm, Pubkey::new_unique(), decimals)
+}
+
+/// Like `create_mint`, but at a caller-chosen address (see `fixed_pubkey`).
+pub fn create_mint_at(svm: &mut LiteSVM, mint: Pubkey, decimals: u8) -> Pubkey {
     let mut data = vec![0u8; spl_token::state::Mint::LEN];
     spl_token::state::Mint {
         mint_authority: COption::None,
@@ -784,7 +802,12 @@ pub fn read_request(svm: &LiteSVM, address: &Pubkey) -> RandomnessV2 {
         .expect("failed to deserialize RandomnessV2")
 }
 
-/// Overwrite a request account with a fulfilled state carrying `randomness`.
+/// Overwrite a request account with a fulfilled state carrying `randomness`,
+/// **and pay the freed rent back to the request's client** — ORAO's
+/// `fulfill_v2` shrinks the account from its pending size to its fulfilled size
+/// and refunds the difference to `client` (which its `FulfillV2` accounts
+/// struct carries `mut` for exactly that reason). Modelling that here is what
+/// lets a test measure a joiner's true end-to-end lamport cost.
 ///
 /// LiteSVM cannot produce the oracle quorum's ed25519 signatures, so this
 /// stands in for a real `fulfill_v2`. The `client` is carried over from the
@@ -816,6 +839,7 @@ pub fn write_fulfilled_request_unchecked(
     randomness: [u8; 64],
 ) -> Pubkey {
     let addr = request_pda(&seed);
+    let lamports_before = svm.get_account(&addr).map_or(0, |a| a.lamports);
     let request = RandomnessV2 {
         request: RequestAccount::Fulfilled(FulfilledRequest {
             client,
@@ -824,6 +848,16 @@ pub fn write_fulfilled_request_unchecked(
         }),
     };
     write_anchor_account(svm, addr, orao_solana_vrf::ID, &request, 0, None);
+
+    // The pending→fulfilled shrink frees rent, and ORAO hands it to the client.
+    // (Zero when the caller conjured a fulfilled request out of nothing: there
+    // was no bigger account to shrink.)
+    let freed = lamports_before.saturating_sub(svm.get_account(&addr).unwrap().lamports);
+    if freed > 0 {
+        let mut client_account = svm.get_account(&client).unwrap_or_default();
+        client_account.lamports += freed;
+        svm.set_account(client, client_account).unwrap();
+    }
     addr
 }
 
@@ -854,6 +888,7 @@ pub fn ix_initialize_config(
     }
 }
 
+/// The common case: classic SPL and no ceiling on the host's bond.
 pub fn ix_create_game(
     host: Pubkey,
     game: Pubkey,
@@ -884,6 +919,31 @@ pub fn ix_create_game_with_program(
     side: u8,
     amount: u64,
 ) -> Instruction {
+    ix_create_game_full(
+        host,
+        game,
+        mint,
+        host_token_account,
+        token_program,
+        side,
+        amount,
+        u64::MAX,
+    )
+}
+
+/// The full builder: every `create_game` argument spelled out, including the
+/// host's `max_bond` ceiling.
+#[allow(clippy::too_many_arguments)]
+pub fn ix_create_game_full(
+    host: Pubkey,
+    game: Pubkey,
+    mint: Pubkey,
+    host_token_account: Pubkey,
+    token_program: Pubkey,
+    side: u8,
+    amount: u64,
+    max_bond: u64,
+) -> Instruction {
     Instruction {
         program_id: coinflip::ID,
         accounts: coinflip::accounts::CreateGame {
@@ -910,7 +970,12 @@ pub fn ix_create_game_with_program(
             program: coinflip::ID,
         }
         .to_account_metas(None),
-        data: coinflip::instruction::CreateGame { side, amount }.data(),
+        data: coinflip::instruction::CreateGame {
+            side,
+            amount,
+            max_bond,
+        }
+        .data(),
     }
 }
 

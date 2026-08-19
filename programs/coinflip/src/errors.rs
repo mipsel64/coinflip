@@ -43,4 +43,6 @@ pub enum CoinflipError {
     InvalidPayoutAccount, // 6015
     #[msg("ORAO request fee exceeds the caller's maximum")]
     VrfFeeTooHigh, // 6016
+    #[msg("required bond exceeds the host's maximum")]
+    BondTooHigh, // 6017
 }

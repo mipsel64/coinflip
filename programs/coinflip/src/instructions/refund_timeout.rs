@@ -19,10 +19,12 @@ pub struct RefundTimeout<'info> {
     pub cranker: Signer<'info>,
     /// Seed binding: this must be THE request for this game. The seed lives in
     /// ORAO's global request namespace, so `game.vrf_seed` is the whole binding.
+    /// The bump comes from the game (recorded at join), so this is one hash
+    /// rather than a search whose cost depends on the seed.
     #[account(
         seeds = [RANDOMNESS_ACCOUNT_SEED, game.vrf_seed.as_ref()],
         seeds::program = orao_solana_vrf::ID,
-        bump,
+        bump = game.request_bump,
     )]
     pub request: Box<Account<'info, RandomnessV2>>,
     #[account(mut, close = host)]

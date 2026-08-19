@@ -12,6 +12,9 @@ use crate::{
 
 pub(crate) struct SettlementOutcome {
     pub winner: Pubkey,
+    /// Which side of the game won, decided once here — callers must not
+    /// re-derive it by comparing `winner` against a recorded pubkey.
+    pub host_won: bool,
     pub outcome: u8,
     pub pot: u64,
     pub fee: u64,
@@ -104,7 +107,8 @@ pub(crate) fn execute_settlement(
     )?;
 
     let outcome = Side::from_randomness(randomness);
-    let (winner, winner_token_account) = if game.winner_is_host(outcome)? {
+    let host_won = game.winner_is_host(outcome)?;
+    let (winner, winner_token_account) = if host_won {
         (game.host, host_token_account)
     } else {
         (game.joiner, joiner_token_account)
@@ -167,6 +171,7 @@ pub(crate) fn execute_settlement(
 
     Ok(SettlementOutcome {
         winner,
+        host_won,
         outcome: outcome.into(),
         pot,
         fee,

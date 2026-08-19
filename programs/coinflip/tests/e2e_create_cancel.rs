@@ -65,6 +65,10 @@ fn create_game_escrows_the_stake() {
     assert_eq!(event.amount, fixture.amount);
     assert_eq!(event.host_side, u8::from(Side::Heads));
     assert_eq!(event.fee_bps, DEFAULT_FEE_BPS);
+    // The bond is in the event too, so an indexer never has to have seen the
+    // (now closed) game account to know what was promised to a losing joiner.
+    assert_eq!(event.bond_lamports, expected_bond(&svm));
+    assert_eq!(game.bond_lamports, event.bond_lamports);
 }
 
 /// The host funds everything the game needs before anyone can join: the game
@@ -86,9 +90,14 @@ fn create_posts_the_bond_and_creates_the_treasury_ata() {
     let host = Keypair::new();
     svm.airdrop(&host.pubkey(), 10_000_000_000).unwrap();
     let stake = 1_000;
-    let mint = create_mint(&mut svm, 9);
+    // Fixed keys, because this test pins a compute number: the escrow PDA and
+    // the treasury ATA are both `find_program_address` searches whose cost
+    // depends on how many bumps they miss, and that depends on the game key and
+    // the mint. Random keys made the same instruction measure anywhere from
+    // ~73.5k to ~100.5k CU; pinned keys make it one number.
+    let mint = create_mint_at(&mut svm, fixed_pubkey(0xC1), 9);
     let host_ta = create_token_account(&mut svm, mint, host.pubkey(), stake * 10);
-    let game = Keypair::new();
+    let game = fixed_keypair(0xC2);
 
     let host_before = svm.get_account(&host.pubkey()).unwrap().lamports;
     let ix = ix_create_game(host.pubkey(), game.pubkey(), mint, host_ta, 0, stake);
@@ -133,12 +142,11 @@ fn create_posts_the_bond_and_creates_the_treasury_ata() {
     );
 
     // Budget guard: token transfer + escrow init + treasury-ATA init + the bond
-    // transfer + the event CPI (measured ~73.5k — the ATA init is most of it,
-    // and it is a no-op for every game after the first of a mint).
-    // PDA bump misses add ~1.5k CU each (escrow + ATA depend on random
-    // keypairs); sampled max ~100.5k, so 110k keeps the guard non-flaky.
+    // transfer + the event CPI. Deterministic thanks to the pinned keys above
+    // (measured 70_621 every run), so this is measured + ~10%, not a wide
+    // margin hiding a regression.
     assert!(
-        meta.compute_units_consumed < 110_000,
+        meta.compute_units_consumed < 78_000,
         "create used {} CU",
         meta.compute_units_consumed
     );
@@ -187,6 +195,75 @@ fn second_game_on_the_same_mint_pays_no_ata_rent() {
         game_b_account.lamports + escrow_rent + tx_fee,
         "the second host pays rents + bond, and nothing for the ATA"
     );
+}
+
+/// The bond is sized from ORAO's live fee, which ORAO's authority can raise at
+/// any time — so the host states the largest lockup they accept and the create
+/// fails closed above it, exactly like the joiner's `max_vrf_fee`.
+#[test]
+fn create_rejects_bond_above_the_hosts_maximum() {
+    let (mut svm, payer) = setup();
+    send_ok(
+        &mut svm,
+        &[&payer],
+        &[ix_initialize_config(
+            payer.pubkey(),
+            payer.pubkey(),
+            DEFAULT_FEE_BPS,
+            DEFAULT_TIMEOUT_SLOTS,
+        )],
+    );
+    let host = Keypair::new();
+    svm.airdrop(&host.pubkey(), 10_000_000_000).unwrap();
+    let stake = 1_000;
+    let mint = create_mint(&mut svm, 9);
+    let host_ta = create_token_account(&mut svm, mint, host.pubkey(), stake * 10);
+    let bond = expected_bond(&svm);
+
+    // One lamport under what the bond actually costs: rejected, nothing created.
+    let game = Keypair::new();
+    let result = send(
+        &mut svm,
+        &[&host, &game],
+        &[ix_create_game_full(
+            host.pubkey(),
+            game.pubkey(),
+            mint,
+            host_ta,
+            anchor_spl::token::ID,
+            0,
+            stake,
+            bond - 1,
+        )],
+    );
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::BondTooHigh);
+    assert!(
+        svm.get_account(&game.pubkey()).is_none(),
+        "a rejected create must not leave a game account behind"
+    );
+    assert_eq!(
+        token_balance(&svm, &host_ta),
+        stake * 10,
+        "no stake escrowed"
+    );
+
+    // Exactly at the ceiling it goes through.
+    let game = Keypair::new();
+    send_ok(
+        &mut svm,
+        &[&host, &game],
+        &[ix_create_game_full(
+            host.pubkey(),
+            game.pubkey(),
+            mint,
+            host_ta,
+            anchor_spl::token::ID,
+            0,
+            stake,
+            bond,
+        )],
+    );
+    assert_eq!(read_game(&svm, &game.pubkey()).bond_lamports, bond);
 }
 
 /// The fee destination must be the treasury's canonical ATA — the address

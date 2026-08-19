@@ -106,11 +106,17 @@ fn join_escrows_stake_and_creates_vrf_request() {
         REQUEST_FEE + request_rent + tx_fee
     );
 
-    // Budget guard: token transfer + the ORAO CPI must stay well inside one
-    // transaction's compute budget (measured ~48k, down from ~76k when the
-    // join still created the treasury ATA).
+    // Budget guard: token transfer + the ORAO CPI (measured 48_376 with no bump
+    // misses, down from ~76k when the join still created the treasury ATA).
+    //
+    // Unlike create and settle, this one cannot be pinned to a single number:
+    // the request PDA is searched twice per join (ORAO's `init` and our own
+    // derivation of the bump to store), over a seed that hashes the joiner's
+    // key — so the cost carries a geometric tail of ~3k CU per bump miss across
+    // the pair. 80k leaves room for ~10 misses, i.e. a ~1-in-1000 tail, and the
+    // real budget is 200k.
     assert!(
-        meta.compute_units_consumed < 70_000,
+        meta.compute_units_consumed < 80_000,
         "join used {} CU",
         meta.compute_units_consumed
     );

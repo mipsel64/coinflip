@@ -116,10 +116,11 @@ program has no PDA authority in the VRF flow at all.
 | `joiner_token_account` | `Pubkey` | Payout target, recorded at join |
 | `joined_at_slot` | `u64` | Set at join; drives the refund timeout |
 | `vrf_seed` | `[u8; 32]` | `sha256("coinflip-vrf-seed", game, joiner, nonce_le)`, computed and stored at join; the ORAO request PDA derives from it. Stored, so `settle`/`refund_timeout` never need the nonce |
+| `request_bump` | `u8` | Canonical bump of the ORAO request PDA for `vrf_seed`, recorded at join so `settle`/`refund_timeout` derive that address with one hash instead of a bump search — cheaper, and constant-cost regardless of which seed the game drew |
 | `refund_timeout_slots` | `u64` | Snapshot of `config.refund_timeout_slots` at join — this game's refund window is fixed the moment the joiner commits, immune to later config changes |
 | `bond_lamports` | `u64` | The winner-pays bond the host parked in this account at create, above its rent: `2 * ORAO request_fee + rent(fulfilled request)`. Public before anyone joins, so a frontend can show the reimbursement a joiner is guaranteed. Caps any reimbursement; the remainder sweeps back to the host when the account closes |
 | `joiner_sunk_lamports` | `u64` | What the join cost the joiner in lamports and never comes back on its own (`request_fee + rent(fulfilled request)`), recorded at join. 0 until joined |
-| `_reserved` | `[u8; 22]` | |
+| `_reserved` | `[u8; 21]` | Padding for POST-deployment fields. Nothing is deployed, so pre-deployment additions may still grow the struct; they keep `INIT_SPACE` at 260 by shrinking this tail instead (as `request_bump` did, 22 → 21) |
 
 The **VRF seed is `sha256("coinflip-vrf-seed", game_pubkey, joiner_pubkey,
 nonce_le)`**, computed at join from the joiner's `nonce` argument and stored in
@@ -158,7 +159,7 @@ delegating call (playbook Phase 4). One file per instruction. `settle` and
 |---|---|---|---|
 | 1 | `initialize_config(admin, fee_bps, refund_timeout_slots)` | the program's **upgrade authority** (verified against ProgramData) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to [MIN, MAX]_REFUND_TIMEOUT_SLOTS; admin must be a non-default key |
 | 2 | `update_config(...)` | `admin` | Rotate admin, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). The treasury is a compile-time constant — rotating it is a program upgrade, not a config change |
-| 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. Ensures the treasury ATA for this mint exists (`init_if_needed`, **payer = host** — the host chose the mint) and system-transfers the **bond** into the game account, sized from ORAO's live `request_fee` (read-only `network_state`). State = Open |
+| 3 | `create_game(side, amount, max_bond)` | host + game keypair | `amount > 0`; `bond <= max_bond` (`BondTooHigh`) — the host's own ceiling on the lockup, the mirror of the joiner's `max_vrf_fee`, since ORAO's fee can rise between building the transaction and landing it. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. Ensures the treasury ATA for this mint exists (`init_if_needed`, **payer = host** — the host chose the mint) and system-transfers the **bond** into the game account, sized from ORAO's live `request_fee` (read-only `network_state`). State = Open |
 | 4 | `cancel_game` | host | Requires state == Open. Refund host stake, close escrow + game (rent **and the whole bond** to host) |
 | 5 | `join_game(nonce, max_vrf_fee)` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; require ORAO's live `request_fee <= max_vrf_fee`. CPI ORAO `request_v2` with seed = the hashed `vrf_seed` (salted by `nonce`), **joiner as ORAO's payer** — they fund the request fee and the request account's rent straight from their wallet, so this program never holds VRF float. Record joiner, joiner token account, `joined_at_slot`, a snapshot of `refund_timeout_slots`, and `joiner_sunk_lamports`. Touches no treasury account at all. State = AwaitingRandomness |
 | 6 | `settle` | anyone (the crank, in practice) | Requires state == AwaitingRandomness and that the `RandomnessV2` account for the stored `vrf_seed` is **fulfilled**. Runs core settlement (below), including the joiner reimbursement — so it carries the joiner's **wallet** (`address = game.joiner`) alongside their token account. Takes no `Config`: nothing in settlement reads it |
@@ -315,7 +316,7 @@ sends are permissionless — so it is an availability component, not a trust one
   `HostCannotJoin`, `MintMismatch`, `UnsupportedMintExtension`,
   `RandomnessNotFulfilled`, `AlreadyFulfilled`, `UnauthorizedVrfClient`,
   `TimeoutNotReached`, `NumericalOverflow`, `OwnerMismatch`, `InvalidAuthority`,
-  `InvalidTimeout`, `InvalidPayoutAccount`, `VrfFeeTooHigh`.
+  `InvalidTimeout`, `InvalidPayoutAccount`, `VrfFeeTooHigh`, `BondTooHigh`.
   `UnauthorizedVrfClient` (6009) is
   **retired** with the callback it guarded — nothing raises it any more, and its
   slot stays reserved because codes are ABI.
@@ -324,7 +325,8 @@ sends are permissionless — so it is an availability component, not a trust one
 ## Events
 
 `#[event_cpi]` + `emit_cpi!` (playbook Phase 7), one `events.rs`:
-`GameCreated`, `GameJoined`,
+`GameCreated { game, host, mint, amount, host_side, fee_bps, bond_lamports }`,
+`GameJoined`,
 `GameSettled { game, winner, mint, outcome, pot, fee, joiner_reimbursed }`
 (`joiner_reimbursed` is the lamports paid out of the host's bond to a losing
 joiner; 0 when the joiner won),
@@ -364,17 +366,29 @@ tests/                  # LiteSVM e2e (Rust)
   VRF. `join_game` runs the genuine `request_v2` CPI against that binary;
   fulfillment is written directly into the request account (LiteSVM cannot
   produce the oracle quorum's ed25519 signatures), and every settlement path
-  then runs for real. There is no devnet-only code path.
+  then runs for real. There is no devnet-only code path. The fulfillment write
+  also **models ORAO's rent refund** — shrinking the request account to its
+  fulfilled size and crediting the freed lamports to the request's client,
+  which is what `FulfillV2`'s `mut client` account does on-chain — so joiner
+  economics can be measured end to end. That one link is modelled, not
+  executed; the devnet smoke's go/no-go number (see the README runbook) is what
+  verifies it against the real oracle.
   Scenarios:
   - happy path: create (host's outlay pinned exactly: both rents + treasury ATA
     rent + bond + tx fee) → join (joiner's outlay pinned exactly: ORAO fee +
     request rent + tx fee) → crafted fulfillment → `settle` pays out, balances
     and fee exact
-  - the bond, end to end: a losing joiner's wallet delta across `settle` equals
+  - **the invariant** (`losing_joiner_pays_stake_and_tx_fees_only`): tracking a
+    losing joiner's wallet from before the join to after the settlement, the
+    net is exactly `-(their join transaction fee)` — the mechanism's whole
+    reason to exist, in one number
+  - the bond, leg by leg: a losing joiner's wallet delta across `settle` equals
     `joiner_sunk_lamports` exactly and the host sweeps the remainder; a winning
     joiner's delta is 0 and the host recovers the whole bond; an under-bonded
     game (ORAO's fee raised between create and join) reimburses exactly
-    `bond_lamports`; cancel and refund both return the full bond to the host
+    `bond_lamports`; cancel and refund both return the full bond to the host;
+    a cranker cannot redirect the reimbursement (the `joiner` account is pinned
+    to `game.joiner`), and a host can refuse a bond above `max_bond`
   - `settle` fails when the request is unfulfilled, when the game is already
     settled, and when a foreign game's request is substituted
   - a request front-run for the same seed blocks the join; a stray lamport at
@@ -440,11 +454,17 @@ the full bond back to the host; the joiner's ORAO costs stay sunk (and if ORAO
 never fulfills, the whole 6_103_920 stays locked in the pending request). Same
 for `cancel_game`, where no joiner ever existed.
 
-Compute: `create_game` ~73.5k CU (stake transfer + escrow init + treasury-ATA
-init + the bond transfer + event — the ATA init is most of it and is a no-op
-after the first game of a mint), `join_game` ~48.3k CU (stake transfer + the
-ORAO CPI), `settle` ~41.3k CU (request PDA derivation + two transfers + close +
-reimbursement + event).
+Compute (LiteSVM, `--features local`): `create_game` **70_621** (stake
+transfer + escrow init + treasury-ATA init + the bond transfer + event — the
+ATA init is most of it, and it is a no-op after the first game of a mint),
+`join_game` **48_376** (stake transfer + the ORAO CPI), `settle` **41_389**
+(request PDA derivation + two transfers + close + reimbursement + event).
+create and settle are exact, not approximate: every PDA they touch is derived
+from a stored bump or a pinned key, so the numbers repeat run to run and the
+test guards sit ~10-15% above them. `join_game` cannot be pinned the same way —
+the request PDA is searched twice (ORAO's `init` plus our own derivation of the
+bump to store) over a seed that hashes the joiner's key, adding ~3k CU per bump
+miss — so its guard (80k) is sized for that geometric tail.
 
 ## Out of scope (v1)
 

@@ -1,6 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
-use orao_solana_vrf::{cpi as orao_cpi, program::OraoVrf, state::NetworkState};
+use orao_solana_vrf::{
+    cpi as orao_cpi, program::OraoVrf, state::NetworkState, RANDOMNESS_ACCOUNT_SEED,
+};
 
 use crate::{
     constants::{CONFIG_SEED, ESCROW_SEED},
@@ -131,11 +133,23 @@ pub(crate) fn handle(ctx: Context<JoinGame>, nonce: u64, max_vrf_fee: u64) -> Re
         vrf_seed,
     )?;
 
+    // ORAO created the request with `init` over
+    // `[RANDOMNESS_ACCOUNT_SEED, vrf_seed]` at the canonical bump, and it
+    // validated the address we just passed against exactly that — so the bump
+    // found here is the one that account lives at, and the CPI above would have
+    // failed otherwise. Storing it lets settlement re-derive the address with a
+    // single hash instead of a bump search.
+    let (_, request_bump) = Pubkey::find_program_address(
+        &[RANDOMNESS_ACCOUNT_SEED, vrf_seed.as_ref()],
+        &orao_solana_vrf::ID,
+    );
+
     let game = &mut ctx.accounts.game;
     game.joiner = ctx.accounts.joiner.key();
     game.joiner_token_account = ctx.accounts.joiner_token_account.key();
     game.joined_at_slot = Clock::get()?.slot;
     game.vrf_seed = vrf_seed;
+    game.request_bump = request_bump;
     // Snapshotted, not read live at refund time: a later config change must not
     // retro-shrink this game's settle window.
     game.refund_timeout_slots = ctx.accounts.config.refund_timeout_slots;

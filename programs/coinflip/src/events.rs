@@ -9,6 +9,9 @@ pub struct GameCreated {
     pub host_side: u8,
     /// Fee snapshot the game was created under.
     pub fee_bps: u16,
+    /// Lamports the host bonded for a losing host's reimbursement of the
+    /// joiner — the cap on what a joiner can be paid back (see `settle`).
+    pub bond_lamports: u64,
 }
 
 #[event]

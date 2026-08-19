@@ -66,6 +66,11 @@ pub struct Game {
     /// settlement never needs the nonce (see `join_game` for what the hash and
     /// the nonce each defend against).
     pub vrf_seed: [u8; 32],
+    /// Canonical bump of the ORAO request PDA for `vrf_seed`, computed at join.
+    /// Stored so `settle`/`refund_timeout` derive that address with one hash
+    /// instead of searching for the bump — cheaper, and constant-cost, so their
+    /// compute usage does not depend on which seed the game happened to draw.
+    pub request_bump: u8,
     /// Snapshot of config.refund_timeout_slots at join — this game's refund
     /// window is fixed when the joiner commits, immune to later config changes.
     pub refund_timeout_slots: u64,
@@ -81,13 +86,19 @@ pub struct Game {
     /// fulfillment). A winning joiner bore it themselves; a losing joiner is
     /// reimbursed out of the bond. 0 until the game is joined.
     pub joiner_sunk_lamports: u64,
-    pub _reserved: [u8; 22],
+    /// Padding for POST-deployment additions: once this program is live, a new
+    /// field must come out of here so `INIT_SPACE` (and every existing account's
+    /// size) stays put. Nothing is deployed yet, so pre-deployment changes are
+    /// still free to grow the struct — they just keep the total round by
+    /// shrinking this tail, as `request_bump` did (22 → 21).
+    pub _reserved: [u8; 21],
 }
 
 const_assert_eq!(
     Game::INIT_SPACE,
-    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 2 + 32 + 32 + 8 + 32 + 8 + 8 + 8 + 22
+    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 2 + 32 + 32 + 8 + 32 + 1 + 8 + 8 + 8 + 21
 );
+const_assert_eq!(Game::INIT_SPACE, 260);
 
 impl Game {
     pub const LAYOUT_VERSION: u8 = 1;
@@ -173,10 +184,11 @@ mod tests {
             joiner_token_account: Pubkey::new_unique(),
             joined_at_slot: 0,
             vrf_seed: [0; 32],
+            request_bump: 255,
             refund_timeout_slots: 18_000,
             bond_lamports: 3_844_400,
             joiner_sunk_lamports: 2_844_400,
-            _reserved: [0; 22],
+            _reserved: [0; 21],
         }
     }
 
@@ -209,10 +221,11 @@ mod tests {
             joiner_token_account: Pubkey::new_unique(),
             joined_at_slot: 123,
             vrf_seed: [9; 32],
+            request_bump: 254,
             refund_timeout_slots: 20_000,
             bond_lamports: 3_844_400,
             joiner_sunk_lamports: 2_844_400,
-            _reserved: [7; 22],
+            _reserved: [7; 21],
         };
         let bytes = game.try_to_vec().unwrap();
         assert_eq!(bytes.len(), Game::INIT_SPACE); // borsh runtime == InitSpace
@@ -220,15 +233,14 @@ mod tests {
         assert_eq!(bytes[2], game.host_side);
         // fee_bps sits after 4 u8s + 3 pubkeys + amount: the money path reads it
         assert_eq!(&bytes[108..110], &game.fee_bps.to_le_bytes());
-        // ...and the refund deadline's own snapshot trails joined_at_slot + vrf_seed
-        assert_eq!(
-            &bytes[214..222],
-            &game.refund_timeout_slots.to_le_bytes(),
-            "refund_timeout_slots moved; the reserved tail must absorb layout changes"
-        );
-        // The two lamport ledgers settlement pays out of, in order.
-        assert_eq!(&bytes[222..230], &game.bond_lamports.to_le_bytes());
-        assert_eq!(&bytes[230..238], &game.joiner_sunk_lamports.to_le_bytes());
+        // Every field the settlement path reads, in order, from the end of
+        // vrf_seed. Pinned because an off-chain decoder (or a memcmp filter)
+        // that disagrees with these offsets reads the wrong money.
+        assert_eq!(bytes[214], game.request_bump);
+        assert_eq!(&bytes[215..223], &game.refund_timeout_slots.to_le_bytes());
+        assert_eq!(&bytes[223..231], &game.bond_lamports.to_le_bytes());
+        assert_eq!(&bytes[231..239], &game.joiner_sunk_lamports.to_le_bytes());
+        assert_eq!(&bytes[239..260], &game._reserved);
     }
 
     #[test]
