@@ -73,6 +73,14 @@ function provider(cluster: string, keyPath: string): anchor.AnchorProvider {
 
 function coinflipProgram(p: anchor.AnchorProvider): anchor.Program<Coinflip> {
   const idl = require("../target/idl/coinflip.json") as Coinflip;
+  const idlAddress = new web3.PublicKey(idl.address);
+  if (!idlAddress.equals(PROGRAM_ID)) {
+    throw new Error(
+      `program id mismatch: target/idl/coinflip.json's address (${idlAddress.toBase58()}) ` +
+        `does not match the keypair's pubkey (${PROGRAM_ID.toBase58()}) — rebuild the IDL ` +
+        "(`anchor build`) after redeploying under a new program id"
+    );
+  }
   return new anchor.Program<Coinflip>(idl, p);
 }
 
@@ -112,7 +120,8 @@ cli
         web3.SystemProgram.transfer({
           fromPubkey: p.publicKey,
           toPubkey: client,
-          lamports: Number(opts.lamports),
+          // bigint, not Number(): avoids silent precision loss above 2^53 lamports.
+          lamports: BigInt(opts.lamports),
         })
       )
     );
@@ -190,4 +199,7 @@ cli
     }
   });
 
-cli.parseAsync();
+await cli.parseAsync().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});

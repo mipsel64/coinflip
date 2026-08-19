@@ -3,11 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "register": "tsx register.ts register",
-    "deposit": "tsx register.ts deposit",
-    "init-config": "tsx register.ts init-config",
-    "check-orao": "tsx register.ts check-orao",
-    "smoke": "tsx smoke.ts"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",

@@ -12,6 +12,7 @@ import { web3 } from "@coral-xyz/anchor";
 import { OraoCb, clientAddress, requestAccountAddress } from "@orao-network/solana-vrf-cb";
 import {
   createMint,
+  getAssociatedTokenAddressSync,
   getOrCreateAssociatedTokenAccount,
   mintTo,
   TOKEN_PROGRAM_ID,
@@ -225,9 +226,10 @@ async function main() {
   } else {
     console.log(
       "Timed out waiting for the callback. If ORAO has fulfilled the request but the " +
-        "callback didn't run (check with `npx tsx register.ts check-orao`), a permissionless " +
-        "settle_fallback crank can finish it:"
+        "callback didn't run (check with `npx tsx register.ts -k <keypair> check-orao`), a " +
+        "permissionless settle_fallback crank can finish it:"
     );
+    const treasuryTokenAccount = getAssociatedTokenAddressSync(mint, config.treasury, true);
     console.log(
       JSON.stringify(
         {
@@ -240,7 +242,7 @@ async function main() {
           host: host.publicKey.toBase58(),
           hostTokenAccount: hostTokenAccount.address.toBase58(),
           joinerTokenAccount: joinerTokenAccount.address.toBase58(),
-          treasuryTokenAccount: "<treasury's ATA for this mint>",
+          treasuryTokenAccount: treasuryTokenAccount.toBase58(),
           mint: mint.toBase58(),
           tokenProgram: TOKEN_PROGRAM_ID.toBase58(),
         },

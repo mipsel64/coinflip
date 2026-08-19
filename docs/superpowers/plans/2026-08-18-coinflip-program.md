@@ -3034,7 +3034,7 @@ npx tsx register.ts -k ~/.config/solana/id.json register
 npx tsx register.ts -k ~/.config/solana/id.json deposit --lamports 100000000  # 0.1 SOL
 npx tsx register.ts -k ~/.config/solana/id.json init-config   # one-shot; payer must be the upgrade authority
 npx tsx register.ts -k ~/.config/solana/id.json check-orao    # confirms callback_deadline + margin < refund_timeout_slots
-# create + join a wSOL game with two ephemeral wallets, then watch it settle WITHOUT any settle tx:
+# create + join a throwaway SPL-mint game with two ephemeral wallets, then watch it settle WITHOUT any settle tx:
 npx tsx smoke.ts
 solana logs <PROGRAM_ID> -u devnet     # expect the SettleCallback + GameSettled event CPI
 ```
