@@ -83,7 +83,7 @@ routes fee reimbursements (see the Config section below).
 | `_reserved` | `[u8; 64]` | Zeroed tail for future fields |
 
 The **treasury is a compile-time constant** (DLMM's `fee_owner` pattern): a
-`pub mod treasury { declare_id!(..) }` whose real id is baked into non-local
+`pub mod treasury` exposing a `const ID: Pubkey` whose real id is baked into non-local
 builds and swapped for a committed test key under the `local` feature — per the
 playbook rule that a feature flag may change **constants and IDs only**, never
 logic. Fees flow to the constant treasury's ATA per mint; both settle paths
@@ -260,9 +260,10 @@ gap without any special authority:
   freeze authority and every candidate winner account is frozen while the
   request is already fulfilled, the pot and rents are stuck — `refund_timeout`
   is blocked by `AlreadyFulfilled` and no transfer can succeed until a thaw.
-- Fees are collected in the bet token, into the **constant treasury's ATA** for
-  that mint (existence ensured at join; validated by derivation in both settle
-  paths).
+- Fees are collected in the bet token, into the **constant treasury's canonical
+  ATA** for that mint (existence ensured at join; both settle paths pin the ATA
+  derivation itself, so a permissionless cranker cannot scatter fees across
+  other treasury-owned accounts).
 
 ## Math & errors
 

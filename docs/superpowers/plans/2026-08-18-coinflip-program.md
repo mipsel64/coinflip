@@ -2472,11 +2472,11 @@ pub struct SettleCallback<'info> {
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, address = game.joiner_token_account @ CoinflipError::MintMismatch)]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// [SUPERSEDED BY TASK 16: treasury is now a compile-time constant and the
+    /// fee account is ATA-pinned — do not copy this comment or the owner
+    /// constraint below; see the Task 16 section and the implementing commits.]
     /// LIVE-treasury policy (unified with settle_fallback): the fee RATE is the
     /// player guarantee (snapshotted); the destination is protocol-internal.
-    /// After a rotation, in-flight callbacks fail until the new treasury's
-    /// token account exists (runbook: create it BEFORE rotating), then ORAO
-    /// retries / degrades to fulfill-without-callback and fallback settles.
     #[account(
         mut,
         constraint = treasury_token_account.owner == config.treasury
