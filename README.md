@@ -109,23 +109,43 @@ create/cancel + 12 join + 11 refund + 13 settle.
 
 The fee destination is a **compile-time constant**
 (`coinflip::treasury::ID`, exported to the IDL as the `TREASURY` constant),
-not a config field: `BUs86uMPdNMJ9SiFijb4TABpFduhaEqqESs96pTGadsN`. Both settle
-paths validate the fee account's owner against it, so the account list frozen
-into a VRF request at join time and a later fallback crank can never disagree
-about where the fee goes.
+not a config field: `BUs86uMPdNMJ9SiFijb4TABpFduhaEqqESs96pTGadsN`. Fees always
+land in that key's **canonical ATA** for the bet mint, and both settle paths pin
+that exact derivation — so the account list frozen into a VRF request at join
+time and a later fallback crank can never disagree about where the fee goes,
+and nobody can scatter fees across other treasury-owned accounts.
 
-- **Rotating it is a program upgrade** (~0.003 SOL in transaction fees, plus a
-  refundable ~3.7 SOL buffer float while the upgrade buffer exists; run
-  `solana program extend` first if the binary outgrew its allocation). There is
-  no admin instruction for it and no rotation runbook.
 - **Back up `keys/treasury-keypair.json` off-machine**, alongside the program
   keypair (both are gitignored): it is the only key that can move collected
-  fees out of the treasury's token accounts.
+  fees out of the treasury's ATAs. Losing it does *not* stop fee collection —
+  that is the trap. Fees keep accruing into an ATA nobody can spend from;
+  recovery means changing the constant and upgrading the program, and whatever
+  already sits in the old ATA is unspendable forever.
 - Under `--features local` the constant becomes the committed test keypair
   `programs/coinflip/tests/fixtures/treasury-local.json`
   (`9wR75bCR1bo68BygzHkgJ3N735u5TmGsVhzjRrFzNUtJ`). That file is a test fixture
   with no value; it exists so the e2e suite has a stable, non-random fee
-  destination to derive ATAs against.
+  destination to derive ATAs against. `scripts/verify-artifact.ts` exists to
+  make sure such a build never ships.
+
+### Rotating the treasury = a program upgrade
+
+There is no admin instruction for it. The cost is small (~0.003 SOL in
+transaction fees, plus a refundable ~3.7 SOL buffer float while the upgrade
+buffer exists; run `solana program extend` first if the binary outgrew its
+allocation), but two consequences are not:
+
+1. **Games already in flight break their callback.** A joined game's callback
+   account list was frozen at join time and names the *old* treasury ATA, which
+   the upgraded program no longer accepts — so those callbacks fail, ORAO
+   retries, then degrades to fulfilling without the callback. Settle each of
+   them with `npx tsx scripts/register.ts -k <keypair> settle-fallback --game
+   <pubkey>`, which derives the *new* ATA. No funds are at risk; the games just
+   need a crank (and `refund_timeout` cannot steal the outcome: it requires an
+   unfulfilled request).
+2. **Drain the old ATAs first, with the old key.** After the upgrade the old
+   treasury is just some wallet — nothing in the program refers to it, and its
+   collected fees are only reachable by whoever still holds that keypair.
 
 ## Deployment runbook
 
@@ -137,38 +157,53 @@ anchor build --no-idl -- --tools-version v1.56
 anchor idl build -o target/idl/coinflip.json -t target/types/coinflip.ts
 ```
 
-The IDL matters as much as the binary: `scripts/*.ts` read the treasury out of
-the IDL's `TREASURY` constant, so an IDL generated with `--features local`
-would point the ops CLI at the test key. CI builds both **with** the feature
-(it runs the tests; it never deploys).
+The IDL matters as much as the binary: `scripts/*.ts` (and any downstream
+client) read the treasury out of the IDL's `TREASURY` constant, so an IDL
+generated with `--features local` would point them at the test key — and
+`anchor deploy` **publishes the IDL on-chain by default**, so a local IDL also
+poisons every client that calls `Program.fetchIdl`. CI builds both **with** the
+feature (it runs the tests; it never deploys).
 
 Then, order matters:
 
-1. `anchor deploy`
-2. **Back up the program keypair off-machine before doing anything else** —
+1. `npx tsx scripts/verify-artifact.ts` — reads `target/deploy/coinflip.so` and
+   `target/idl/coinflip.json` and refuses (exit 1) if either carries the test
+   treasury. Needs no keypair. Do this before every deploy: `local` and plain
+   builds are otherwise indistinguishable.
+2. `anchor deploy`
+3. `npx tsx scripts/verify-artifact.ts --url <rpc>` — the same probes against
+   the bytes actually on-chain (fetched from the program's ProgramData), which
+   also catches deploying a stale `.so` from a dev tree.
+4. **Back up the program keypair off-machine before doing anything else** —
    and `keys/treasury-keypair.json` with it (see [Treasury](#treasury)).
    `keys/coinflip-keypair.json` (gitignored) is not just a deploy credential —
-   registering with ORAO (step 4) funds the ORAO **Client PDA**, which is
+   registering with ORAO (step 6) funds the ORAO **Client PDA**, which is
    derived from this exact program id. Losing the keypair after registration
    doesn't just lose upgrade authority, it strands the funded Client PDA.
-3. `npx tsx scripts/register.ts -k <upgrade-authority-keypair> init-config`
+5. `npx tsx scripts/register.ts -k <upgrade-authority-keypair> init-config`
    — calls `initialize_config`. Must be signed by the program's **upgrade
    authority** (checked against `ProgramData`).
-4. `npx tsx scripts/register.ts -k <upgrade-authority-keypair> register`
+6. `npx tsx scripts/register.ts -k <upgrade-authority-keypair> register`
    — one-time ORAO client registration (client program = this program, state
    PDA = our `Config`). This allocates the ORAO Client PDA and sets its
    `owner` to whatever wallet you pass as `-k` — use a durable,
    team-controlled key, not a throwaway one.
-5. `npx tsx scripts/register.ts -k <keypair> deposit --lamports <n>`
+7. `npx tsx scripts/register.ts -k <keypair> deposit --lamports <n>`
    — funds the Client PDA's SOL balance (pays VRF request fees + request
    rent; kept roughly self-funding by joiner reimbursement thereafter).
-6. `npx tsx scripts/register.ts -k <keypair> check-orao` — confirms
+8. `npx tsx scripts/register.ts -k <keypair> check-orao` — confirms
    `callback_deadline + MIN_SETTLE_MARGIN_SLOTS < refund_timeout_slots`
    before anyone joins a game.
-7. `npx tsx scripts/smoke.ts` — creates + joins a throwaway game between two
+9. `npx tsx scripts/smoke.ts` — creates + joins a throwaway game between two
    ephemeral wallets and watches it settle **without** a third transaction
    (polls for the game account closing, then decodes the `GameSettled` event
    — see [Indexer note](#indexer-note)).
+
+**Pre-mainnet TODO:** add a tag-triggered CI release workflow (plain build →
+`verify-artifact` → upload the `.so` and IDL as release assets) so mainnet
+artifacts always come from a clean checkout instead of whatever a developer's
+tree happened to contain. Until that exists, steps 1–3 above are the only thing
+standing between a `--features local` build and mainnet.
 
 **Never burn the program's upgrade authority** without first running ORAO's
 `Transfer` instruction to move the Client PDA's `owner` to a surviving,
@@ -274,6 +309,27 @@ elsewhere:
   worst case (anyone can send the same instructions from an explorer).
 - **Frontend** — wraps native SOL to wSOL for players, builds transactions,
   and consumes the events above for game history/leaderboards.
+
+### Downstream contract (read this before wiring a client)
+
+- **`config.treasury` is gone.** `Config` holds `admin`, `fee_bps`,
+  `refund_timeout_slots` only; a client that fetches it looking for a treasury
+  gets a decode/undefined error. Read the IDL's `TREASURY` constant instead.
+- **Do not pass `treasury` to `join_game`.** The IDL pins that account by
+  address, so anchor-ts (>= 0.30) resolves both it and `treasury_token_account`
+  itself — passing it explicitly is now a type error.
+- **Token-2022 games must pass `tokenProgram` explicitly.** anchor-ts cannot
+  infer a mint's owning program, and the treasury ATA derivation depends on it:
+  omit it and the client derives the classic-SPL address, which the program
+  rejects. (Same for `settle_fallback`'s `treasury_token_account`, which
+  non-anchor clients derive themselves.)
+- **Non-anchor clients must read the constant, never hardcode it** — the IDL is
+  the single source, and `scripts/verify-artifact.ts` is what guarantees the
+  published IDL matches the deployed binary.
+- **Mismatches fail closed**, never silently: a client built against the wrong
+  IDL hits `OwnerMismatch` on `join_game` (the address-pinned treasury account)
+  or `InvalidPayoutAccount` on either settle path (the ATA pin). No fee ever
+  goes anywhere else.
 
 ## Further reading
 

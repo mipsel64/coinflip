@@ -35,7 +35,8 @@ pub enum CoinflipError {
     #[msg("refund timeout is out of bounds")]
     InvalidTimeout, // 6014
     #[msg(
-        "payout account must be the player's recorded account or their associated token account"
+        "payout account must be the player's recorded account or their associated token account, \
+         and the fee account must be the treasury's associated token account"
     )]
     InvalidPayoutAccount, // 6015
 }

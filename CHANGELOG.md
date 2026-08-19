@@ -13,11 +13,13 @@ All notable changes to this project are documented in this file, in the
     bounded `refund_timeout_slots`.
   - Treasury as a compile-time constant (`coinflip::treasury::ID`, exported to
     the IDL as `TREASURY`) rather than admin-rotatable config state: both
-    settle paths pin the fee account to it, so a frozen callback account list
-    and a later fallback crank can never disagree. Rotating it is a program
-    upgrade. The `local` cargo feature swaps it for a committed test keypair
-    (constants and IDs only, never logic) — e2e builds use it, deployments
-    must not.
+    settle paths pin the fee account to the treasury's **canonical ATA** by
+    derivation, so a frozen callback account list and a later fallback crank
+    can never disagree, and a permissionless cranker cannot scatter fees across
+    other treasury-owned accounts. Rotating the treasury is a program upgrade.
+    The `local` cargo feature swaps it for a committed test keypair (constants
+    and IDs only, never logic) — e2e builds use it, deployments must not, and
+    a build script warns loudly whenever it is on.
   - `create_game` / `cancel_game`: host opens a game against any accepted
     SPL/Token-2022 mint, escrowing the stake; cancellable before a joiner
     arrives.
@@ -40,6 +42,11 @@ All notable changes to this project are documented in this file, in the
   - Ops CLI (`scripts/register.ts`, `scripts/smoke.ts`) for one-time ORAO
     client registration/deposit, config init, a live devnet smoke test, and a
     manual `settle_fallback` crank invocation.
+  - `scripts/verify-artifact.ts`: proves a build is deployable before (and,
+    with `--url`, after) it ships — byte-probes `target/deploy/coinflip.so` or
+    the on-chain ProgramData for the treasury constant it actually carries, and
+    rejects a `--features local` binary or IDL. Needs no keypair; exits 1 on
+    any failure. Shared IDL access lives in `scripts/idl.ts`.
 
 ### Notes for integrators
 
@@ -51,7 +58,10 @@ All notable changes to this project are documented in this file, in the
   `findGameSettledEvent` for a working reference).
 - There is no `config.treasury` field: read the fee destination from the IDL's
   `TREASURY` constant (or let anchor-ts resolve the `treasury` account for
-  `join_game`, which the IDL pins by address).
+  `join_game`, which the IDL pins by address). Fees only ever go to that key's
+  canonical ATA for the bet mint — Token-2022 games must pass `tokenProgram`
+  explicitly so the client derives the same address the program does. See the
+  README's "Downstream contract".
 - Both players' payout token accounts must exist at join time — the
   callback's account list is fixed when the VRF request is made, before the
   winner is known, and the callback itself cannot create accounts.

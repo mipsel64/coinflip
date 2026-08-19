@@ -30,6 +30,17 @@ pub(crate) struct SettlementAccounts<'a, 'info> {
     pub host: &'a AccountInfo<'info>,
 }
 
+/// The one account fees may ever land in for a given mint: the constant
+/// treasury's canonical ATA, which `join_game` created before the request went
+/// out. Both settle paths pin it by this derivation.
+pub(crate) fn treasury_ata(mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
+    anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &crate::treasury::ID,
+        mint,
+        token_program,
+    )
+}
+
 /// A permissionless cranker may only route funds to the account the player
 /// recorded, or to the player's canonical ATA (permissionlessly re-creatable,
 /// so a closed recorded account can never strand funds) — never to some other

@@ -30,13 +30,12 @@ import {
 } from "@solana/spl-token";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Coinflip } from "../target/types/coinflip.js";
+import { IDL_ADDRESS, IDL_RAW, idlConstantPubkey } from "./idl.js";
 
-const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const POLL_INTERVAL_MS = 2_000;
@@ -85,38 +84,14 @@ if (!PROGRAM_KEYPAIR_PATH) {
 }
 const PROGRAM_ID = loadKeypair(PROGRAM_KEYPAIR_PATH).publicKey;
 
-interface RawIdlConstant {
-  name: string;
-  type: string;
-  value: string;
-}
-interface RawIdl {
-  address: string;
-  constants?: RawIdlConstant[];
-}
-
-const IDL_RAW = require("../target/idl/coinflip.json") as RawIdl;
-
-/** Reads a `#[constant]` pubkey straight out of the IDL instead of hardcoding it. */
-function idlConstantPubkey(name: string): web3.PublicKey {
-  const found = IDL_RAW.constants?.find((c) => c.name === name);
-  if (!found) {
-    throw new Error(
-      `IDL constant "${name}" not found in target/idl/coinflip.json — rebuild the IDL ` +
-        "(`anchor build`), or this #[constant] was renamed/removed in the program source"
-    );
-  }
-  return new web3.PublicKey(found.value);
-}
-
 // Compile-time fee destination: an IDL built with `--features local` carries
-// the test key, so the IDL must come from the same build as the deployment.
+// the test key, so the IDL must come from the same build as the deployment
+// (scripts/verify-artifact.ts checks exactly that).
 const TREASURY = idlConstantPubkey("TREASURY");
 
-const idlAddress = new web3.PublicKey(IDL_RAW.address);
-if (!idlAddress.equals(PROGRAM_ID)) {
+if (!IDL_ADDRESS.equals(PROGRAM_ID)) {
   throw new Error(
-    `program id mismatch: target/idl/coinflip.json's address (${idlAddress.toBase58()}) ` +
+    `program id mismatch: target/idl/coinflip.json's address (${IDL_ADDRESS.toBase58()}) ` +
       `does not match the keypair's pubkey (${PROGRAM_ID.toBase58()}) — rebuild the IDL ` +
       "(`anchor build`) after redeploying under a new program id"
   );

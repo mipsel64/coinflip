@@ -373,9 +373,9 @@ fn settle_fallback_rejects_non_ata_payout_account() {
     assert_eq!(token_balance(&svm, &j.fixture.escrow), POT);
 }
 
-/// The fee destination is pinned to the compile-time treasury: a cranker
-/// cannot route the fee to an account somebody else owns, however well-formed
-/// that account is.
+/// The fee destination is pinned to the constant treasury's canonical ATA, by
+/// derivation: neither someone else's account nor another account the treasury
+/// itself owns is an acceptable place for a cranker to route fees.
 #[test]
 fn settle_rejects_non_treasury_fee_account() {
     let (mut svm, payer) = setup();
@@ -386,27 +386,36 @@ fn settle_rejects_non_treasury_fee_account() {
         j.vrf_seed,
         randomness_with_first_byte(2),
     );
-    // Right mint, real token account — but owned by a random key.
+    // Right mint, real token accounts — one owned by a random key, one owned by
+    // the treasury itself but sitting at a non-ATA address.
     let mallory_ta = create_token_account(&mut svm, j.fixture.mint, Pubkey::new_unique(), 0);
+    let treasury_side_account = create_token_account(&mut svm, j.fixture.mint, treasury(), 0);
 
-    let result = send(
-        &mut svm,
-        &[&payer],
-        &[ix_settle_fallback_full(
-            &j,
-            payer.pubkey(),
-            j.fixture.host_token_account,
-            j.joiner_token_account,
-            mallory_ta,
-        )],
-    );
-    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+    for fee_account in [mallory_ta, treasury_side_account] {
+        let result = send(
+            &mut svm,
+            &[&payer],
+            &[ix_settle_fallback_full(
+                &j,
+                payer.pubkey(),
+                j.fixture.host_token_account,
+                j.joiner_token_account,
+                fee_account,
+            )],
+        );
+        // The ATA derivation is checked before the mint, so both cases land on
+        // the same error.
+        assert_coinflip_error(
+            result,
+            coinflip::errors::CoinflipError::InvalidPayoutAccount,
+        );
+        assert_eq!(token_balance(&svm, &fee_account), 0);
+    }
     assert_eq!(
         token_balance(&svm, &j.fixture.escrow),
         POT,
         "escrow must be untouched"
     );
-    assert_eq!(token_balance(&svm, &mallory_ta), 0);
 }
 
 /// The pot is the escrow's ACTUAL balance: tokens anyone donated straight into

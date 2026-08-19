@@ -9,7 +9,7 @@ use crate::{
     constants::{CONFIG_SEED, ESCROW_SEED},
     errors::CoinflipError,
     events::GameSettled,
-    instructions::settlement::{execute_settlement, SettlementAccounts},
+    instructions::settlement::{execute_settlement, treasury_ata, SettlementAccounts},
     state::{Config, Game},
 };
 
@@ -60,14 +60,16 @@ pub struct SettleCallback<'info> {
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, address = game.joiner_token_account @ CoinflipError::InvalidPayoutAccount)]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// Owner-constrained against the compile-time treasury, exactly like
-    /// settle_fallback: the destination is fixed for the program's lifetime, so
-    /// the frozen callback list and a fallback crank can never disagree about
+    /// ATA-pinned against the compile-time treasury, exactly like
+    /// settle_fallback: the destination is fixed for the program's lifetime and
+    /// derived the same way on both paths, so the account list frozen into the
+    /// request at join time and a later fallback crank can never disagree about
     /// where the fee goes.
     #[account(
         mut,
-        constraint = treasury_token_account.owner == crate::treasury::ID
-            @ CoinflipError::OwnerMismatch,
+        constraint = treasury_token_account.key()
+            == treasury_ata(&game.token_mint, &token_program.key())
+            @ CoinflipError::InvalidPayoutAccount,
         constraint = treasury_token_account.mint == game.token_mint
             @ CoinflipError::MintMismatch,
     )]

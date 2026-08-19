@@ -14,12 +14,11 @@ import { OraoCb, RegisterBuilder, clientAddress } from "@orao-network/solana-vrf
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { Command } from "commander";
 import { existsSync, readFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Coinflip } from "../target/types/coinflip.js";
+import { IDL_ADDRESS, IDL_RAW, idlConstant, idlConstantPubkey } from "./idl.js";
 
-const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function loadKeypair(path: string): web3.Keypair {
@@ -61,52 +60,12 @@ function programDataAddress(programId: web3.PublicKey): web3.PublicKey {
   )[0];
 }
 
-// Raw (snake_case) IDL, loaded once. `anchor.Program` camelCases it internally
-// when building method/account namespaces, but we also read it here directly
-// (its `address` and `constants` fields) before any of that conversion.
-interface RawIdlConstant {
-  name: string;
-  type: string;
-  value: string;
-}
-interface RawIdl {
-  address: string;
-  constants?: RawIdlConstant[];
-}
-
-const IDL_RAW = require("../target/idl/coinflip.json") as RawIdl;
-
-const idlAddress = new web3.PublicKey(IDL_RAW.address);
-if (!idlAddress.equals(PROGRAM_ID)) {
+if (!IDL_ADDRESS.equals(PROGRAM_ID)) {
   throw new Error(
-    `program id mismatch: target/idl/coinflip.json's address (${idlAddress.toBase58()}) ` +
+    `program id mismatch: target/idl/coinflip.json's address (${IDL_ADDRESS.toBase58()}) ` +
       `does not match the keypair's pubkey (${PROGRAM_ID.toBase58()}) — rebuild the IDL ` +
       "(`anchor build`) after redeploying under a new program id"
   );
-}
-
-/** Reads a `#[constant]` value straight out of the IDL instead of hardcoding it. */
-function idlConstant(name: string): anchor.BN {
-  const found = IDL_RAW.constants?.find((c) => c.name === name);
-  if (!found) {
-    throw new Error(
-      `IDL constant "${name}" not found in target/idl/coinflip.json — rebuild the IDL ` +
-        "(`anchor build`), or this #[constant] was renamed/removed in the program source"
-    );
-  }
-  return new anchor.BN(found.value);
-}
-
-/** Same, for a `Pubkey` constant (the IDL stores it as a base58 string). */
-function idlConstantPubkey(name: string): web3.PublicKey {
-  const found = IDL_RAW.constants?.find((c) => c.name === name);
-  if (!found) {
-    throw new Error(
-      `IDL constant "${name}" not found in target/idl/coinflip.json — rebuild the IDL ` +
-        "(`anchor build`), or this #[constant] was renamed/removed in the program source"
-    );
-  }
-  return new web3.PublicKey(found.value);
 }
 
 const MIN_SETTLE_MARGIN_SLOTS = idlConstant("MIN_SETTLE_MARGIN_SLOTS");

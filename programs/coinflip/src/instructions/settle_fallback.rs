@@ -9,7 +9,7 @@ use crate::{
     constants::{CONFIG_SEED, ESCROW_SEED},
     errors::CoinflipError,
     events::GameSettled,
-    instructions::settlement::{execute_settlement, SettlementAccounts},
+    instructions::settlement::{execute_settlement, treasury_ata, SettlementAccounts},
     state::{Config, Game},
 };
 
@@ -54,10 +54,15 @@ pub struct SettleFallback<'info> {
         constraint = joiner_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
     )]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// The constant treasury's canonical ATA for this mint — the one `join_game`
+    /// guaranteed exists. Pinned by derivation, not merely by owner: a cranker
+    /// picks this account, and scattering fees across other treasury-owned
+    /// accounts would make collection a manual hunt.
     #[account(
         mut,
-        constraint = treasury_token_account.owner == crate::treasury::ID
-            @ CoinflipError::OwnerMismatch,
+        constraint = treasury_token_account.key()
+            == treasury_ata(&game.token_mint, &token_program.key())
+            @ CoinflipError::InvalidPayoutAccount,
         constraint = treasury_token_account.mint == game.token_mint
             @ CoinflipError::MintMismatch,
     )]

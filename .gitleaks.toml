@@ -1,0 +1,12 @@
+# Secret-scanner config. The one "secret" committed here is deliberate: a
+# throwaway keypair that is the treasury under `--features local`, so the e2e
+# suite has the same fee destination on every machine. It holds no funds and is
+# never the deployed treasury — see programs/coinflip/tests/fixtures/README.md.
+title = "coinflip"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "committed test-only treasury keypair (no funds, never deployed)"
+paths = ['''programs/coinflip/tests/fixtures/treasury-local\.json''']
