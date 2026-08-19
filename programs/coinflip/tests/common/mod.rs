@@ -42,7 +42,7 @@ pub const REQUEST_FEE: u64 = 1_000_000; // what our crafted NetworkState charges
 /// deltas against it.
 pub const ORAO_TREASURY_START_LAMPORTS: u64 = LAMPORTS_PER_SOL;
 pub const DEFAULT_FEE_BPS: u16 = 100;
-pub const DEFAULT_TIMEOUT_SLOTS: u64 = 1_000;
+pub const DEFAULT_TIMEOUT_SLOTS: u64 = 18_000;
 
 pub fn config_pda() -> Pubkey {
     Pubkey::find_program_address(&[CONFIG_SEED], &coinflip::ID).0
@@ -697,6 +697,17 @@ pub fn setup_open_game(
     payer: &Keypair,
     amount: u64,
 ) -> (GameFixture, TransactionMetadata) {
+    setup_open_game_with_fee(svm, payer, amount, DEFAULT_FEE_BPS)
+}
+
+/// Like `setup_open_game`, but with an explicit protocol fee (the game snapshots
+/// it at create, so this is what settlement will charge).
+pub fn setup_open_game_with_fee(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    amount: u64,
+    fee_bps: u16,
+) -> (GameFixture, TransactionMetadata) {
     let treasury = Pubkey::new_unique();
     send_ok(
         svm,
@@ -705,7 +716,7 @@ pub fn setup_open_game(
             payer.pubkey(),
             payer.pubkey(),
             treasury,
-            DEFAULT_FEE_BPS,
+            fee_bps,
             DEFAULT_TIMEOUT_SLOTS,
         )],
     );
@@ -858,7 +869,17 @@ pub fn setup_joined_game(
     payer: &Keypair,
     amount: u64,
 ) -> (JoinedGame, TransactionMetadata) {
-    let (fixture, _create_meta) = setup_open_game(svm, payer, amount);
+    setup_joined_game_with_fee(svm, payer, amount, DEFAULT_FEE_BPS)
+}
+
+/// Like `setup_joined_game`, but with an explicit protocol fee.
+pub fn setup_joined_game_with_fee(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    amount: u64,
+    fee_bps: u16,
+) -> (JoinedGame, TransactionMetadata) {
+    let (fixture, _create_meta) = setup_open_game_with_fee(svm, payer, amount, fee_bps);
     let orao = setup_orao(svm);
     let joiner = Keypair::new();
     svm.airdrop(&joiner.pubkey(), 10 * LAMPORTS_PER_SOL)
@@ -896,10 +917,10 @@ pub fn setup_joined_game(
     )
 }
 
-pub fn ix_settle_fallback(j: &JoinedGame, payer: Pubkey) -> Instruction {
+pub fn ix_settle_fallback(j: &JoinedGame, cranker: Pubkey) -> Instruction {
     ix_settle_fallback_full(
         j,
-        payer,
+        cranker,
         j.fixture.host_token_account,
         j.joiner_token_account,
         j.treasury_token_account,
@@ -911,7 +932,27 @@ pub fn ix_settle_fallback(j: &JoinedGame, payer: Pubkey) -> Instruction {
 /// accepted, and the fee must go to the CURRENT treasury's account).
 pub fn ix_settle_fallback_full(
     j: &JoinedGame,
-    payer: Pubkey,
+    cranker: Pubkey,
+    host_token_account: Pubkey,
+    joiner_token_account: Pubkey,
+    treasury_token_account: Pubkey,
+) -> Instruction {
+    ix_settle_fallback_with_request(
+        j,
+        cranker,
+        j.request,
+        host_token_account,
+        joiner_token_account,
+        treasury_token_account,
+    )
+}
+
+/// Like `ix_settle_fallback_full`, but also lets the caller pick the request
+/// account — used to prove a foreign game's request cannot settle this game.
+pub fn ix_settle_fallback_with_request(
+    j: &JoinedGame,
+    cranker: Pubkey,
+    request: Pubkey,
     host_token_account: Pubkey,
     joiner_token_account: Pubkey,
     treasury_token_account: Pubkey,
@@ -919,10 +960,10 @@ pub fn ix_settle_fallback_full(
     Instruction {
         program_id: coinflip::ID,
         accounts: coinflip::accounts::SettleFallback {
-            payer,
+            cranker,
             config: config_pda(),
             client: j.orao.client,
-            request: j.request,
+            request,
             game: j.fixture.game.pubkey(),
             escrow: j.fixture.escrow,
             host: j.fixture.host.pubkey(),

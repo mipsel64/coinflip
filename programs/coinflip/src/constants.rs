@@ -13,9 +13,12 @@ pub const MAX_FEE_BPS: u16 = 1_000;
 #[constant]
 pub const BPS_DENOMINATOR: u16 = 10_000;
 
-/// Lower bound gives the oracle time to respond before refunds unlock (~7 min).
+/// Must exceed ORAO's callback-retry deadline (crate default 9_000 slots ≈ 1h):
+/// otherwise a player could sabotage their recorded payout account, block the
+/// callback, and force a refund before ORAO falls back to fulfilling without
+/// it. ~2 hours at 400ms slots.
 #[constant]
-pub const MIN_REFUND_TIMEOUT_SLOTS: u64 = 1_000;
+pub const MIN_REFUND_TIMEOUT_SLOTS: u64 = 18_000;
 
 /// Upper bound keeps the refund deadline reachable (~46 days).
 #[constant]

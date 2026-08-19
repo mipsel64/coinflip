@@ -17,21 +17,60 @@ pub(crate) struct SettlementOutcome {
     pub fee: u64,
 }
 
+/// Named so the two call sites (callback and fallback) cannot transpose
+/// same-typed token accounts.
+pub(crate) struct SettlementAccounts<'a, 'info> {
+    pub game: &'a mut Account<'info, Game>,
+    pub escrow: &'a InterfaceAccount<'info, TokenAccount>,
+    pub mint: &'a InterfaceAccount<'info, Mint>,
+    pub host_token_account: &'a InterfaceAccount<'info, TokenAccount>,
+    pub joiner_token_account: &'a InterfaceAccount<'info, TokenAccount>,
+    pub treasury_token_account: &'a InterfaceAccount<'info, TokenAccount>,
+    pub token_program: &'a Interface<'info, TokenInterface>,
+    pub host: &'a AccountInfo<'info>,
+}
+
+/// A permissionless cranker may only route funds to the account the player
+/// recorded, or to the player's canonical ATA (permissionlessly re-creatable,
+/// so a closed recorded account can never strand funds) — never to some other
+/// player-owned account that might carry a delegate.
+pub(crate) fn require_payout_account(
+    account: &InterfaceAccount<TokenAccount>,
+    recorded: Pubkey,
+    player: Pubkey,
+    mint: Pubkey,
+    token_program: Pubkey,
+) -> Result<()> {
+    let ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &player,
+        &mint,
+        &token_program,
+    );
+    require!(
+        account.key() == recorded || account.key() == ata,
+        CoinflipError::InvalidPayoutAccount
+    );
+    Ok(())
+}
+
 /// Pays the winner, takes the fee, closes the escrow, marks the game Settled.
 /// The pot is the escrow's actual balance so donated dust can never brick the
 /// close. Callers close the game account (`close = host`) and emit the event.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_settlement<'info>(
-    game: &mut Account<'info, Game>,
-    escrow: &InterfaceAccount<'info, TokenAccount>,
-    mint: &InterfaceAccount<'info, Mint>,
-    host_token_account: &InterfaceAccount<'info, TokenAccount>,
-    joiner_token_account: &InterfaceAccount<'info, TokenAccount>,
-    treasury_token_account: &InterfaceAccount<'info, TokenAccount>,
-    token_program: &Interface<'info, TokenInterface>,
-    host: &AccountInfo<'info>,
+pub(crate) fn execute_settlement(
+    accounts: SettlementAccounts,
     randomness: &[u8; 64],
 ) -> Result<SettlementOutcome> {
+    let SettlementAccounts {
+        game,
+        escrow,
+        mint,
+        host_token_account,
+        joiner_token_account,
+        treasury_token_account,
+        token_program,
+        host,
+    } = accounts;
+
     game.require_state(GameState::AwaitingRandomness)?;
 
     let outcome = Side::from_randomness(randomness);
@@ -41,9 +80,9 @@ pub(crate) fn execute_settlement<'info>(
         (game.joiner, joiner_token_account)
     };
 
+    let pot = escrow.amount;
     // Fee comes from the game's snapshot, never live config: admin fee changes
     // must not retro-apply to already-created games.
-    let pot = escrow.amount;
     let fee = fee_amount(pot, game.fee_bps)?;
     let payout = pot
         .checked_sub(fee)
@@ -51,6 +90,10 @@ pub(crate) fn execute_settlement<'info>(
 
     let game_key = game.key();
     let seeds: &[&[&[u8]]] = &[&[ESCROW_SEED, game_key.as_ref(), &[game.escrow_bump]]];
+
+    // Checks-effects-interactions: the state write precedes the transfers even
+    // though it is unobservable here (callers close the game account anyway).
+    game.state = GameState::Settled.into();
 
     token_interface::transfer_checked(
         CpiContext::new_with_signer(
@@ -92,7 +135,6 @@ pub(crate) fn execute_settlement<'info>(
         seeds,
     ))?;
 
-    game.state = GameState::Settled.into();
     Ok(SettlementOutcome {
         winner,
         outcome: outcome.into(),

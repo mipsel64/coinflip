@@ -1,8 +1,9 @@
 mod common;
 
-use anchor_spl::token::spl_token;
+use anchor_spl::{associated_token::get_associated_token_address, token::spl_token};
 use common::*;
 use solana_sdk::{
+    account::Account as SolanaAccount,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::TransactionError,
@@ -64,9 +65,9 @@ fn settle_pays_host_when_host_side_wins() {
         "both rents must return to the host"
     );
 
-    // Budget guard: two transfers + a close + the event CPI.
+    // Budget guard: two transfers + a close + the event CPI (measured ~42k).
     assert!(
-        meta.compute_units_consumed < 150_000,
+        meta.compute_units_consumed < 60_000,
         "settle used {} CU",
         meta.compute_units_consumed
     );
@@ -181,8 +182,9 @@ fn settle_twice_fails() {
     );
 }
 
-/// Liveness: the winner's payout may go to ANY account they own of the game's
-/// mint, not only the one recorded on the game (which may have been closed).
+/// Liveness: if the winner's recorded account is gone by settlement time, the
+/// payout still lands — but only in their canonical ATA, which anyone can
+/// re-create permissionlessly.
 #[test]
 fn settle_fallback_pays_any_winner_owned_account() {
     let (mut svm, payer) = setup();
@@ -193,7 +195,17 @@ fn settle_fallback_pays_any_winner_owned_account() {
         j.vrf_seed,
         randomness_with_first_byte(2), // host wins
     );
-    let other_host_ta = create_token_account(&mut svm, j.fixture.mint, j.fixture.host.pubkey(), 0);
+    // The recorded account is closed after the join (0 lamports, no data).
+    svm.set_account(j.fixture.host_token_account, SolanaAccount::default())
+        .unwrap();
+    let host_ata = get_associated_token_address(&j.fixture.host.pubkey(), &j.fixture.mint);
+    write_token_account_at(
+        &mut svm,
+        host_ata,
+        j.fixture.mint,
+        j.fixture.host.pubkey(),
+        0,
+    );
 
     send_ok(
         &mut svm,
@@ -201,19 +213,47 @@ fn settle_fallback_pays_any_winner_owned_account() {
         &[ix_settle_fallback_full(
             &j,
             payer.pubkey(),
-            other_host_ta,
+            host_ata,
             j.joiner_token_account,
             j.treasury_token_account,
         )],
     );
 
-    assert_eq!(token_balance(&svm, &other_host_ta), PAYOUT);
-    assert_eq!(
-        token_balance(&svm, &j.fixture.host_token_account),
-        REMAINING,
-        "the recorded account must be untouched"
-    );
+    assert_eq!(token_balance(&svm, &host_ata), PAYOUT);
     assert_eq!(token_balance(&svm, &j.treasury_token_account), FEE);
+}
+
+/// ...and nothing else: a cranker cannot redirect the payout into some other
+/// account the winner happens to own (which could carry a delegate).
+#[test]
+fn settle_fallback_rejects_non_ata_payout_account() {
+    let (mut svm, payer) = setup();
+    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
+    write_fulfilled_request(
+        &mut svm,
+        j.orao.client,
+        j.vrf_seed,
+        randomness_with_first_byte(2), // host wins
+    );
+    // Host-owned, right mint — but neither the recorded account nor the ATA.
+    let side_account = create_token_account(&mut svm, j.fixture.mint, j.fixture.host.pubkey(), 0);
+
+    let result = send(
+        &mut svm,
+        &[&payer],
+        &[ix_settle_fallback_full(
+            &j,
+            payer.pubkey(),
+            side_account,
+            j.joiner_token_account,
+            j.treasury_token_account,
+        )],
+    );
+    assert_coinflip_error(
+        result,
+        coinflip::errors::CoinflipError::InvalidPayoutAccount,
+    );
+    assert_eq!(token_balance(&svm, &j.fixture.escrow), POT);
 }
 
 /// The fallback pays the CURRENT treasury: once the admin rotates it, the old
@@ -356,4 +396,106 @@ fn settlement_drains_donated_dust_to_winner() {
     .expect("GameSettled not emitted");
     assert_eq!(ev.pot, pot);
     assert_eq!(ev.fee, fee);
+}
+
+/// The request is bound to the game by `game.vrf_seed`: another game's
+/// (fulfilled) request cannot be substituted to settle this one early.
+#[test]
+fn settle_rejects_foreign_request() {
+    let (mut svm, payer) = setup();
+    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
+
+    // A second game on the same config/ORAO client, joined and fulfilled.
+    let host_b = Keypair::new();
+    svm.airdrop(&host_b.pubkey(), 10_000_000_000).unwrap();
+    let host_b_ta = create_token_account(&mut svm, j.fixture.mint, host_b.pubkey(), STAKE * 10);
+    let game_b = Keypair::new();
+    let game_b_key = game_b.pubkey();
+    send_ok(
+        &mut svm,
+        &[&host_b, &game_b],
+        &[ix_create_game(
+            host_b.pubkey(),
+            game_b_key,
+            j.fixture.mint,
+            host_b_ta,
+            0,
+            STAKE,
+        )],
+    );
+    let f_b = GameFixture {
+        host: host_b,
+        game: game_b,
+        mint: j.fixture.mint,
+        host_token_account: host_b_ta,
+        escrow: escrow_pda(&game_b_key),
+        treasury: j.fixture.treasury,
+        amount: STAKE,
+    };
+    let joiner_b = Keypair::new();
+    svm.airdrop(&joiner_b.pubkey(), 10_000_000_000).unwrap();
+    let joiner_b_ta = create_token_account(&mut svm, f_b.mint, joiner_b.pubkey(), STAKE * 10);
+    send_ok(
+        &mut svm,
+        &[&joiner_b],
+        &[ix_join_game(&f_b, &j.orao, joiner_b.pubkey(), joiner_b_ta)],
+    );
+    let request_b = write_fulfilled_request(
+        &mut svm,
+        j.orao.client,
+        vrf_seed_for(&game_b_key, &joiner_b.pubkey()),
+        randomness_with_first_byte(2),
+    );
+
+    let result = send(
+        &mut svm,
+        &[&payer],
+        &[ix_settle_fallback_with_request(
+            &j,
+            payer.pubkey(),
+            request_b,
+            j.fixture.host_token_account,
+            j.joiner_token_account,
+            j.treasury_token_account,
+        )],
+    );
+    assert_anchor_error(result, anchor_lang::error::ErrorCode::ConstraintSeeds);
+    assert_eq!(
+        token_balance(&svm, &j.fixture.escrow),
+        POT,
+        "game A's escrow must be untouched"
+    );
+}
+
+/// A zero-fee game pays the whole pot out and never touches the treasury.
+#[test]
+fn zero_fee_game_settles_full_pot() {
+    let (mut svm, payer) = setup();
+    let (j, _join_meta) = setup_joined_game_with_fee(&mut svm, &payer, STAKE, 0);
+    write_fulfilled_request(
+        &mut svm,
+        j.orao.client,
+        j.vrf_seed,
+        randomness_with_first_byte(2), // host wins
+    );
+
+    let ix = ix_settle_fallback(&j, payer.pubkey());
+    let meta = send_ok(&mut svm, &[&payer], std::slice::from_ref(&ix));
+
+    assert_eq!(
+        token_balance(&svm, &j.fixture.host_token_account),
+        REMAINING + POT
+    );
+    assert_eq!(token_balance(&svm, &j.treasury_token_account), 0);
+    assert!(is_gone(&svm, &j.fixture.escrow), "escrow must be closed");
+
+    let ev = find_cpi_event::<coinflip::events::GameSettled>(
+        std::slice::from_ref(&ix),
+        &payer.pubkey(),
+        &coinflip::ID,
+        &meta,
+    )
+    .expect("GameSettled not emitted");
+    assert_eq!(ev.pot, POT);
+    assert_eq!(ev.fee, 0);
 }

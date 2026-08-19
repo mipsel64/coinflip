@@ -9,14 +9,15 @@ use crate::{
     constants::{CONFIG_SEED, ESCROW_SEED},
     errors::CoinflipError,
     events::GameSettled,
-    instructions::settlement::execute_settlement,
+    instructions::settlement::{execute_settlement, require_payout_account, SettlementAccounts},
     state::{Config, Game},
 };
 
 #[event_cpi]
 #[derive(Accounts)]
 pub struct SettleFallback<'info> {
-    pub payer: Signer<'info>,
+    /// Permissionless fee-payer slot; carries no authority.
+    pub cranker: Signer<'info>,
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
     #[account(
@@ -63,6 +64,10 @@ pub struct SettleFallback<'info> {
     pub treasury_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(address = game.token_mint @ CoinflipError::MintMismatch)]
     pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(
+        constraint = token_program.key() == *mint.to_account_info().owner
+            @ CoinflipError::MintMismatch,
+    )]
     pub token_program: Interface<'info, TokenInterface>,
 }
 
@@ -74,15 +79,36 @@ pub(crate) fn handle(ctx: Context<SettleFallback>) -> Result<()> {
         .ok_or(CoinflipError::RandomnessNotFulfilled)?
         .randomness;
 
-    let outcome = execute_settlement(
-        &mut ctx.accounts.game,
-        &ctx.accounts.escrow,
-        &ctx.accounts.mint,
+    // A cranker chooses these accounts, so the struct's owner+mint constraints
+    // are not enough: pin each side to its recorded account or its ATA.
+    let game = &ctx.accounts.game;
+    let token_program = ctx.accounts.token_program.key();
+    require_payout_account(
         &ctx.accounts.host_token_account,
+        game.host_token_account,
+        game.host,
+        game.token_mint,
+        token_program,
+    )?;
+    require_payout_account(
         &ctx.accounts.joiner_token_account,
-        &ctx.accounts.treasury_token_account,
-        &ctx.accounts.token_program,
-        &ctx.accounts.host,
+        game.joiner_token_account,
+        game.joiner,
+        game.token_mint,
+        token_program,
+    )?;
+
+    let outcome = execute_settlement(
+        SettlementAccounts {
+            game: &mut ctx.accounts.game,
+            escrow: &ctx.accounts.escrow,
+            mint: &ctx.accounts.mint,
+            host_token_account: &ctx.accounts.host_token_account,
+            joiner_token_account: &ctx.accounts.joiner_token_account,
+            treasury_token_account: &ctx.accounts.treasury_token_account,
+            token_program: &ctx.accounts.token_program,
+            host: &ctx.accounts.host,
+        },
         &randomness,
     )?;
 
