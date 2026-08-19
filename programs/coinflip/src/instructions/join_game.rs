@@ -97,6 +97,13 @@ pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
         ctx.accounts.joiner.key() != ctx.accounts.game.host,
         CoinflipError::HostCannotJoin
     );
+    // The refund window must never open before ORAO gives up on the callback,
+    // or a player could sabotage their payout account and force a refund.
+    require!(
+        ctx.accounts.config.refund_timeout_slots
+            > ctx.accounts.network_state.config.callback_deadline,
+        CoinflipError::InvalidTimeout
+    );
 
     // Callback account list — order must match SettleCallback's struct.
     let game_key = ctx.accounts.game.key();

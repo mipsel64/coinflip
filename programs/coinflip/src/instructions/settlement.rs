@@ -73,6 +73,24 @@ pub(crate) fn execute_settlement(
 
     game.require_state(GameState::AwaitingRandomness)?;
 
+    // Guarded here, not at the call sites, so no settlement path can forget it
+    // (the callback's address-pinned accounts satisfy it trivially).
+    let token_program_id = token_program.key();
+    require_payout_account(
+        host_token_account,
+        game.host_token_account,
+        game.host,
+        game.token_mint,
+        token_program_id,
+    )?;
+    require_payout_account(
+        joiner_token_account,
+        game.joiner_token_account,
+        game.joiner,
+        game.token_mint,
+        token_program_id,
+    )?;
+
     let outcome = Side::from_randomness(randomness);
     let (winner, winner_token_account) = if game.winner_is_host(outcome)? {
         (game.host, host_token_account)

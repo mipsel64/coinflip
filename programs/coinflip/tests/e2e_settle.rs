@@ -1,9 +1,11 @@
 mod common;
 
+use anchor_lang::{InstructionData, ToAccountMetas};
 use anchor_spl::{associated_token::get_associated_token_address, token::spl_token};
 use common::*;
 use solana_sdk::{
     account::Account as SolanaAccount,
+    instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::TransactionError,
@@ -25,6 +27,120 @@ fn randomness_with_first_byte(byte: u8) -> [u8; 64] {
 
 fn is_gone(svm: &litesvm::LiteSVM, address: &Pubkey) -> bool {
     svm.get_account(address).is_none_or(|a| a.lamports == 0)
+}
+
+/// The callback's account metas, exactly as ORAO would build them (`client` is
+/// a parameter so a test can forge that slot).
+fn settle_callback_metas(j: &JoinedGame, client: Pubkey) -> Vec<AccountMeta> {
+    coinflip::accounts::SettleCallback {
+        client,
+        config: config_pda(),
+        network_state: j.orao.network_state,
+        request: j.request,
+        game: j.fixture.game.pubkey(),
+        escrow: j.fixture.escrow,
+        host: j.fixture.host.pubkey(),
+        host_token_account: j.fixture.host_token_account,
+        joiner_token_account: j.joiner_token_account,
+        treasury_token_account: j.treasury_token_account,
+        mint: j.fixture.mint,
+        token_program: spl_token::ID,
+        event_authority: event_authority(),
+        program: coinflip::ID,
+    }
+    .to_account_metas(None)
+}
+
+fn settle_callback_ix(accounts: Vec<AccountMeta>) -> Instruction {
+    Instruction {
+        program_id: coinflip::ID,
+        accounts,
+        data: coinflip::instruction::SettleCallback {}.data(),
+    }
+}
+
+/// The oracle replays the account list frozen into the request at join time,
+/// prefixed by its own four fixed accounts. `SettleCallback` must therefore
+/// declare exactly that list, in that order, with that writability — a mismatch
+/// would only surface on-chain, at callback time.
+#[test]
+fn settle_callback_shape_matches_frozen_list() {
+    let (mut svm, payer) = setup();
+    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
+
+    let metas = settle_callback_metas(&j, j.orao.client);
+    // ORAO's fixed prefix: client (signer), state (our config), network_state, request.
+    assert_eq!(
+        metas[..4].iter().map(|m| m.pubkey).collect::<Vec<_>>(),
+        vec![j.orao.client, config_pda(), j.orao.network_state, j.request],
+    );
+    assert!(metas[0].is_signer, "ORAO signs as the client PDA");
+    // ...then our accounts, which must match the request's validated callback.
+    assert_eq!(
+        metas[4..]
+            .iter()
+            .map(|m| (m.pubkey, m.is_writable))
+            .collect::<Vec<_>>(),
+        request_callback_account_metas(&svm, &j.request),
+    );
+}
+
+/// Without the ORAO client PDA's signature the callback is inert — anyone could
+/// otherwise settle a game the instant the request is fulfilled.
+#[test]
+fn settle_callback_rejects_unsigned_client() {
+    let (mut svm, payer) = setup();
+    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
+    write_fulfilled_request(
+        &mut svm,
+        j.orao.client,
+        j.vrf_seed,
+        randomness_with_first_byte(2),
+    );
+
+    let mut accounts = settle_callback_metas(&j, j.orao.client);
+    // We cannot sign as the client PDA — flip the meta to non-signer to even
+    // get the tx past sanitization; the program must still reject it.
+    for meta in accounts.iter_mut() {
+        meta.is_signer = false;
+    }
+
+    let result = send(&mut svm, &[&payer], &[settle_callback_ix(accounts)]);
+    assert_anchor_error(result, anchor_lang::error::ErrorCode::ConstraintSigner);
+    assert_eq!(token_balance(&svm, &j.fixture.escrow), POT);
+}
+
+/// ...and the signature must come from THE client PDA: a self-signed keypair in
+/// that slot is not the oracle.
+#[test]
+fn settle_callback_rejects_forged_client_account() {
+    let (mut svm, payer) = setup();
+    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
+    write_fulfilled_request(
+        &mut svm,
+        j.orao.client,
+        j.vrf_seed,
+        randomness_with_first_byte(2),
+    );
+
+    let mallory = Keypair::new();
+    svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
+
+    let result = send(
+        &mut svm,
+        &[&payer, &mallory],
+        &[settle_callback_ix(settle_callback_metas(
+            &j,
+            mallory.pubkey(),
+        ))],
+    );
+    // Mallory's account is not even an ORAO-owned `Client`, so it fails before
+    // the seeds check ever runs.
+    assert_anchor_error(
+        result,
+        anchor_lang::error::ErrorCode::AccountOwnedByWrongProgram,
+    );
+    assert_eq!(token_balance(&svm, &j.fixture.escrow), POT);
 }
 
 #[test]
@@ -65,7 +181,7 @@ fn settle_pays_host_when_host_side_wins() {
         "both rents must return to the host"
     );
 
-    // Budget guard: two transfers + a close + the event CPI (measured ~42k).
+    // Budget guard: two transfers + a close + the event CPI (measured ~47k).
     assert!(
         meta.compute_units_consumed < 60_000,
         "settle used {} CU",
@@ -186,7 +302,7 @@ fn settle_twice_fails() {
 /// payout still lands — but only in their canonical ATA, which anyone can
 /// re-create permissionlessly.
 #[test]
-fn settle_fallback_pays_any_winner_owned_account() {
+fn settle_fallback_pays_ata_when_recorded_account_is_gone() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
     write_fulfilled_request(
