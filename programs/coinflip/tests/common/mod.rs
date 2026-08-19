@@ -896,6 +896,49 @@ pub fn setup_joined_game(
     )
 }
 
+pub fn ix_settle_fallback(j: &JoinedGame, payer: Pubkey) -> Instruction {
+    ix_settle_fallback_full(
+        j,
+        payer,
+        j.fixture.host_token_account,
+        j.joiner_token_account,
+        j.treasury_token_account,
+    )
+}
+
+/// Like `ix_settle_fallback`, but lets the caller pick the payout/fee
+/// destinations (liveness: any winner-owned account of the game mint is
+/// accepted, and the fee must go to the CURRENT treasury's account).
+pub fn ix_settle_fallback_full(
+    j: &JoinedGame,
+    payer: Pubkey,
+    host_token_account: Pubkey,
+    joiner_token_account: Pubkey,
+    treasury_token_account: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: coinflip::ID,
+        accounts: coinflip::accounts::SettleFallback {
+            payer,
+            config: config_pda(),
+            client: j.orao.client,
+            request: j.request,
+            game: j.fixture.game.pubkey(),
+            escrow: j.fixture.escrow,
+            host: j.fixture.host.pubkey(),
+            host_token_account,
+            joiner_token_account,
+            treasury_token_account,
+            mint: j.fixture.mint,
+            token_program: spl_token::ID,
+            event_authority: event_authority(),
+            program: coinflip::ID,
+        }
+        .to_account_metas(None),
+        data: coinflip::instruction::SettleFallback {}.data(),
+    }
+}
+
 pub fn ix_update_config(
     admin: Pubkey,
     new_admin: Option<Pubkey>,

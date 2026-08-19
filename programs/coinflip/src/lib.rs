@@ -56,4 +56,8 @@ pub mod coinflip {
     pub fn settle_callback(ctx: Context<SettleCallback>) -> Result<()> {
         instructions::settle_callback::handle(ctx)
     }
+
+    pub fn settle_fallback(ctx: Context<SettleFallback>) -> Result<()> {
+        instructions::settle_fallback::handle(ctx)
+    }
 }
