@@ -275,6 +275,12 @@ gap without any special authority:
 closed on terminal states, so events are the durable history for any
 indexer/frontend — terminal events carry enough to be interpreted standalone.
 
+Indexer note: events are emitted via `emit_cpi!` (self-CPI instruction data),
+NOT program logs — anchor-ts's `addEventListener`/`EventParser` only scan log
+text and will never fire for them. Decode `meta.innerInstructions`: strip the
+8-byte `EVENT_IX_TAG_LE`, then `program.coder.events.decode(...)` (see
+`scripts/smoke.ts` `findGameSettledEvent` for a working reference).
+
 ## Repo layout
 
 ```
