@@ -106,7 +106,8 @@ than a stored field, with nothing to keep in sync.
 | `joiner_token_account` | `Pubkey` | Payout target, recorded at join |
 | `joined_at_slot` | `u64` | Set at join; drives the refund timeout |
 | `vrf_seed` | `[u8; 32]` | `sha256("coinflip-vrf-seed", game, joiner)`, computed and stored at join; the ORAO request PDA derives from it |
-| `_reserved` | `[u8; 30]` | |
+| `refund_timeout_slots` | `u64` | Snapshot of `config.refund_timeout_slots` at join — the margin invariant verified at join then holds for this game's lifetime, immune to later config or ORAO-deadline changes |
+| `_reserved` | `[u8; 22]` | |
 
 The **VRF seed is `sha256("coinflip-vrf-seed", game_pubkey, joiner_pubkey)`**,
 computed at join and stored in `Game.vrf_seed`. It is unique per game (a game
@@ -136,7 +137,7 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 
 | # | Instruction | Signer | Behavior |
 |---|---|---|---|
-| 1 | `initialize_config(admin, treasury, fee_bps, refund_timeout_slots)` | deployer (first caller — initialize immediately after deploy) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to [MIN, MAX]_REFUND_TIMEOUT_SLOTS; admin/treasury must be non-default keys |
+| 1 | `initialize_config(admin, treasury, fee_bps, refund_timeout_slots)` | the program's **upgrade authority** (verified against ProgramData) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to [MIN, MAX]_REFUND_TIMEOUT_SLOTS; admin/treasury must be non-default keys |
 | 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). Treasury rotation: BOTH settle paths pay the CURRENT `config.treasury` (the fee *rate* is the player guarantee and is snapshotted; the *destination* is protocol-internal). Runbook: create the new treasury's token accounts for every active mint BEFORE rotating — in-flight callbacks fail until then, degrade to ORAO's fulfill-without-callback, and settle via fallback |
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. State = Open |
 | 4 | `cancel_game` | host | Requires state == Open. Refund host stake, close escrow + game (rent to host) |
@@ -270,7 +271,7 @@ gap without any special authority:
 `#[event_cpi]` + `emit_cpi!` (playbook Phase 7), one `events.rs`:
 `GameCreated`, `GameJoined`, `GameSettled { game, winner, mint, outcome, pot, fee }`,
 `GameCancelled { game, host, mint, amount }`,
-`GameRefunded { game, host, joiner, mint, amount }`. Game + escrow accounts are
+`GameRefunded { game, host, joiner, mint, host_refund, joiner_refund }` (joiner refund includes any donated dust). Game + escrow accounts are
 closed on terminal states, so events are the durable history for any
 indexer/frontend — terminal events carry enough to be interpreted standalone.
 
