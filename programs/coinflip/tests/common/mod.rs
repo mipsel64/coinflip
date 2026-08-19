@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use anchor_lang::{
+    solana_program::bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     AccountDeserialize, AnchorDeserialize, AnchorSerialize, Discriminator, InstructionData,
     ToAccountMetas,
 };
@@ -71,52 +72,140 @@ fn coinflip_so_path() -> String {
     }
 }
 
+fn mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// Newest modification time of any `.rs` file under `dir` (recursive).
 fn newest_rs_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
     let mut newest = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
-        let mtime = if path.is_dir() {
+        let newer = if path.is_dir() {
             newest_rs_mtime(&path)
         } else if path.extension().is_some_and(|ext| ext == "rs") {
-            entry.metadata().ok().and_then(|m| m.modified().ok())
+            mtime(&path)
         } else {
             None
         };
-        newest = newest.max(mtime);
+        newest = newest.max(newer);
     }
     newest
+}
+
+/// Newest mtime across everything that changes what the deployed program does:
+/// its sources, its manifest, and the workspace's manifest + lockfile (a bumped
+/// dependency changes the binary without touching a single `.rs` file).
+fn newest_program_input_mtime() -> Option<std::time::SystemTime> {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest_dir.join("../..");
+    [
+        newest_rs_mtime(&manifest_dir.join("src")),
+        mtime(&manifest_dir.join("Cargo.toml")),
+        mtime(&workspace.join("Cargo.toml")),
+        mtime(&workspace.join("Cargo.lock")),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 /// `cargo test` never rebuilds the deployed artifact, so an e2e suite happily
 /// runs green against a `.so` built before the change under test. Compare
 /// mtimes and refuse to run instead.
 fn assert_program_not_stale(so_path: &str) {
-    let so_mtime = std::fs::metadata(so_path)
-        .and_then(|m| m.modified())
-        .expect("cannot stat target/deploy/coinflip.so");
-    let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-    let Some(src_mtime) = newest_rs_mtime(src) else {
+    let so_mtime = mtime(std::path::Path::new(so_path))
+        .unwrap_or_else(|| panic!("cannot stat {so_path} — run `anchor build`"));
+    let Some(input_mtime) = newest_program_input_mtime() else {
         return;
     };
+    // Deliberately cruder than cargo's own fingerprinting: if a manifest's
+    // timestamp moved without its contents changing, `anchor build` is a no-op
+    // and only touching the artifact clears this.
     assert!(
-        so_mtime >= src_mtime,
-        "stale target/deploy/coinflip.so — run `anchor build`"
+        so_mtime >= input_mtime,
+        "stale {so_path} — run `anchor build` \
+         (no-op build? only a manifest timestamp moved: `touch {so_path}`)"
     );
 }
 
+/// Registers the built program the way a real deployment does: an upgradeable
+/// loader program account pointing at a ProgramData account that names
+/// `upgrade_authority`. `add_program_from_file` installs programs under the
+/// non-upgradeable loader instead, where there is no ProgramData at all and
+/// `initialize_config`'s deployer gate could never be satisfied.
+fn add_upgradeable_program(
+    svm: &mut LiteSVM,
+    program_id: Pubkey,
+    so_path: &str,
+    upgrade_authority: Pubkey,
+) {
+    let elf = std::fs::read(so_path).unwrap_or_else(|_| panic!("{so_path}: run `anchor build`"));
+
+    // bincode layout of `UpgradeableLoaderState::ProgramData`, then the ELF —
+    // exactly what the loader (and LiteSVM's program loader) expects to find.
+    let mut programdata = 3u32.to_le_bytes().to_vec();
+    programdata.extend_from_slice(&0u64.to_le_bytes()); // deployed slot
+    programdata.push(1); // Some(upgrade_authority)
+    programdata.extend_from_slice(upgrade_authority.as_ref());
+    assert_eq!(
+        programdata.len(),
+        UpgradeableLoaderState::size_of_programdata_metadata()
+    );
+    programdata.extend_from_slice(&elf);
+    let programdata_address = program_data_address(&program_id);
+    let lamports = svm.minimum_balance_for_rent_exemption(programdata.len());
+    svm.set_account(
+        programdata_address,
+        SolanaAccount {
+            lamports,
+            data: programdata,
+            owner: bpf_loader_upgradeable::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    // `UpgradeableLoaderState::Program { programdata_address }`. Setting an
+    // executable account makes LiteSVM load the ELF through this pointer, so
+    // the ProgramData account must already be in place.
+    let mut program = 2u32.to_le_bytes().to_vec();
+    program.extend_from_slice(programdata_address.as_ref());
+    assert_eq!(program.len(), UpgradeableLoaderState::size_of_program());
+    let lamports = svm.minimum_balance_for_rent_exemption(program.len());
+    svm.set_account(
+        program_id,
+        SolanaAccount {
+            lamports,
+            data: program,
+            owner: bpf_loader_upgradeable::ID,
+            executable: true,
+            rent_epoch: 0,
+        },
+    )
+    .expect("failed to register coinflip under the upgradeable loader");
+}
+
+/// The program's ProgramData account, which holds its upgrade authority.
+pub fn program_data_address(program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[program_id.as_ref()], &bpf_loader_upgradeable::ID).0
+}
+
+/// Boots an SVM with coinflip + ORAO loaded and a funded payer. That payer is
+/// also coinflip's upgrade authority, so `ix_initialize_config(payer, ..)`
+/// clears the deployer gate.
 pub fn setup() -> (LiteSVM, Keypair) {
     let mut svm = LiteSVM::new();
     let so_path = coinflip_so_path();
-    svm.add_program_from_file(coinflip::ID, &so_path)
-        .expect("run `anchor build` first");
     assert_program_not_stale(&so_path);
+    let payer = Keypair::new();
+    add_upgradeable_program(&mut svm, coinflip::ID, &so_path, payer.pubkey());
     svm.add_program_from_file(
         orao_solana_vrf_cb::ID,
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/orao_vrf_cb.so"),
     )
     .expect("missing tests/fixtures/orao_vrf_cb.so");
-    let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000 * LAMPORTS_PER_SOL)
         .unwrap();
     (svm, payer)
@@ -669,6 +758,8 @@ pub fn ix_initialize_config(
         accounts: coinflip::accounts::InitializeConfig {
             payer,
             config: config_pda(),
+            program: coinflip::ID,
+            program_data: program_data_address(&coinflip::ID),
             system_program: system_program::ID,
         }
         .to_account_metas(None),
@@ -1051,13 +1142,31 @@ pub fn ix_refund_timeout_full(
     host_token_account: Pubkey,
     joiner_token_account: Pubkey,
 ) -> Instruction {
+    ix_refund_timeout_with_request(
+        j,
+        cranker,
+        j.request,
+        host_token_account,
+        joiner_token_account,
+    )
+}
+
+/// Like `ix_refund_timeout_full`, but also lets the caller pick the request
+/// account — used to prove a foreign game's request cannot refund this game.
+pub fn ix_refund_timeout_with_request(
+    j: &JoinedGame,
+    cranker: Pubkey,
+    request: Pubkey,
+    host_token_account: Pubkey,
+    joiner_token_account: Pubkey,
+) -> Instruction {
     Instruction {
         program_id: coinflip::ID,
         accounts: coinflip::accounts::RefundTimeout {
             cranker,
             config: config_pda(),
             client: j.orao.client,
-            request: j.request,
+            request,
             game: j.fixture.game.pubkey(),
             escrow: j.fixture.escrow,
             host: j.fixture.host.pubkey(),

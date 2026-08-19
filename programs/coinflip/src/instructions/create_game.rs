@@ -120,7 +120,10 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
     game.joiner_token_account = Pubkey::default();
     game.joined_at_slot = 0;
     game.vrf_seed = [0; 32];
-    game._reserved = [0; 30];
+    // Snapshotted at join, not here: the refund window starts when the joiner
+    // commits, under whatever timeout the margin check validated then.
+    game.refund_timeout_slots = 0;
+    game._reserved = [0; 22];
 
     emit_cpi!(GameCreated {
         game: game.key(),

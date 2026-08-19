@@ -42,5 +42,8 @@ pub struct GameRefunded {
     pub host: Pubkey,
     pub joiner: Pubkey,
     pub mint: Pubkey,
-    pub amount: u64,
+    /// The host's stake, exactly.
+    pub host_refund: u64,
+    /// The joiner's stake plus whatever else the escrow held (donated dust).
+    pub joiner_refund: u64,
 }

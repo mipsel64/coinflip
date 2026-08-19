@@ -215,6 +215,10 @@ pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
     game.joiner_token_account = ctx.accounts.joiner_token_account.key();
     game.joined_at_slot = Clock::get()?.slot;
     game.vrf_seed = vrf_seed;
+    // Snapshotted, not read live at refund time: this join already proved the
+    // timeout clears ORAO's callback deadline by MIN_SETTLE_MARGIN_SLOTS, and a
+    // later config change must not retro-shrink this game's settle window.
+    game.refund_timeout_slots = ctx.accounts.config.refund_timeout_slots;
     game.state = GameState::AwaitingRandomness.into();
 
     emit_cpi!(GameJoined {

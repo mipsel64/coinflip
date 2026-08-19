@@ -47,6 +47,8 @@ fn join_escrows_stake_and_creates_vrf_request() {
     assert_eq!(game.joiner_token_account, joiner_ta);
     assert_eq!(game.joined_at_slot, join_slot);
     assert_eq!(game.vrf_seed, vrf_seed);
+    // The refund deadline is fixed here, from live config, and never re-read.
+    assert_eq!(game.refund_timeout_slots, DEFAULT_TIMEOUT_SLOTS);
 
     // The real ORAO program created the request account, rent-funded, at the
     // address derived from the hashed seed.

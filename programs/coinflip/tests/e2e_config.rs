@@ -33,6 +33,47 @@ fn initialize_and_update_config() {
     );
 }
 
+/// The config PDA is a one-shot singleton whose initializer picks the admin,
+/// the treasury and the fee — so only the program's upgrade authority may
+/// claim it, no matter who wins the race to send the transaction.
+#[test]
+fn initialize_rejects_non_upgrade_authority() {
+    let (mut svm, payer) = setup();
+    let mallory = solana_sdk::signature::Keypair::new();
+    svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
+
+    let result = send(
+        &mut svm,
+        &[&mallory],
+        &[ix_initialize_config(
+            mallory.pubkey(),
+            mallory.pubkey(),
+            Pubkey::new_unique(),
+            DEFAULT_FEE_BPS,
+            DEFAULT_TIMEOUT_SLOTS,
+        )],
+    );
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+    assert!(
+        svm.get_account(&config_pda())
+            .is_none_or(|a| a.lamports == 0),
+        "config must not exist after a rejected initialize"
+    );
+
+    // ...and the real deployer still can.
+    send_ok(
+        &mut svm,
+        &[&payer],
+        &[ix_initialize_config(
+            payer.pubkey(),
+            payer.pubkey(),
+            Pubkey::new_unique(),
+            DEFAULT_FEE_BPS,
+            DEFAULT_TIMEOUT_SLOTS,
+        )],
+    );
+}
+
 #[test]
 fn initialize_rejects_fee_above_cap() {
     let (mut svm, payer) = setup();

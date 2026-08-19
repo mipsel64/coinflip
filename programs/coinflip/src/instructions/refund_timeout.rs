@@ -69,6 +69,24 @@ pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
     ctx.accounts
         .game
         .require_state(GameState::AwaitingRandomness)?;
+    // A fulfilled request must be settled on its outcome, never refunded.
+    require!(
+        ctx.accounts.request.fulfilled().is_none(),
+        CoinflipError::AlreadyFulfilled
+    );
+    // The game's own snapshot, not live config: the margin over ORAO's callback
+    // deadline was verified at join, and an admin lowering the timeout later
+    // must not open an early, informed refund on a game already in flight.
+    let deadline = ctx
+        .accounts
+        .game
+        .joined_at_slot
+        .checked_add(ctx.accounts.game.refund_timeout_slots)
+        .ok_or(CoinflipError::NumericalOverflow)?;
+    require!(
+        Clock::get()?.slot > deadline,
+        CoinflipError::TimeoutNotReached
+    );
     // Permissionless cranker: refunds may only land on recorded-or-ATA
     // destinations (same rule as settle_fallback; see settlement.rs).
     require_payout_account(
@@ -85,21 +103,6 @@ pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
         ctx.accounts.game.token_mint,
         ctx.accounts.token_program.key(),
     )?;
-    // A fulfilled request must be settled on its outcome, never refunded.
-    require!(
-        ctx.accounts.request.fulfilled().is_none(),
-        CoinflipError::AlreadyFulfilled
-    );
-    let deadline = ctx
-        .accounts
-        .game
-        .joined_at_slot
-        .checked_add(ctx.accounts.config.refund_timeout_slots)
-        .ok_or(CoinflipError::NumericalOverflow)?;
-    require!(
-        Clock::get()?.slot > deadline,
-        CoinflipError::TimeoutNotReached
-    );
 
     let game_key = ctx.accounts.game.key();
     let seeds: &[&[&[u8]]] = &[&[
@@ -118,6 +121,10 @@ pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
         .amount
         .checked_sub(host_refund)
         .ok_or(CoinflipError::NumericalOverflow)?;
+
+    // Checks-effects-interactions: the state write precedes the transfers even
+    // though it is unobservable here (the game account is closed anyway).
+    ctx.accounts.game.state = GameState::Refunded.into();
 
     token_interface::transfer_checked(
         CpiContext::new_with_signer(
@@ -157,13 +164,13 @@ pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
         seeds,
     ))?;
 
-    ctx.accounts.game.state = GameState::Refunded.into();
     emit_cpi!(GameRefunded {
         game: game_key,
         host: ctx.accounts.game.host,
         joiner: ctx.accounts.game.joiner,
         mint: ctx.accounts.game.token_mint,
-        amount: ctx.accounts.game.amount,
+        host_refund,
+        joiner_refund,
     });
     Ok(())
 }

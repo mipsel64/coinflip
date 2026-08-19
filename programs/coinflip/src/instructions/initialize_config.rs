@@ -14,6 +14,19 @@ pub struct InitializeConfig<'info> {
         bump,
     )]
     pub config: Account<'info, Config>,
+    /// This program, whose ProgramData names the upgrade authority. The config
+    /// PDA is a one-shot singleton, so whoever wins the race to initialize it
+    /// picks the admin, the treasury and the fee: gate that on the deployer.
+    #[account(
+        constraint = program.programdata_address()? == Some(program_data.key())
+            @ CoinflipError::OwnerMismatch,
+    )]
+    pub program: Program<'info, crate::program::Coinflip>,
+    #[account(
+        constraint = program_data.upgrade_authority_address == Some(payer.key())
+            @ CoinflipError::OwnerMismatch,
+    )]
+    pub program_data: Account<'info, ProgramData>,
     pub system_program: Program<'info, System>,
 }
 
