@@ -108,6 +108,37 @@ fn join_escrows_stake_and_creates_vrf_request() {
     assert_eq!(ev.vrf_request, request_addr);
 }
 
+/// The refund window must open a settle-margin AFTER ORAO stops retrying the
+/// callback. If the oracle widens its deadline past what our config allows for,
+/// joins stop rather than opening a window where a loser could read the
+/// bare-fulfilled randomness and race a refund.
+#[test]
+fn join_rejects_timeout_below_orao_deadline_margin() {
+    let (mut svm, payer) = setup();
+    let stake = 5_000_000_000;
+    let (f, _create_meta) = setup_open_game(&mut svm, &payer, stake);
+    // 17_000 + 1_800 margin > the config's 18_000 refund timeout.
+    let orao = setup_orao_with_deadline(&mut svm, 17_000);
+    let joiner = Keypair::new();
+    svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
+    let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), stake * 10);
+
+    let result = send(
+        &mut svm,
+        &[&joiner],
+        &[ix_join_game(&f, &orao, joiner.pubkey(), joiner_ta)],
+    );
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidTimeout);
+
+    // The join never happened: only the host's stake is escrowed.
+    assert_eq!(token_balance(&svm, &f.escrow), stake);
+    assert_eq!(token_balance(&svm, &joiner_ta), stake * 10);
+    assert_eq!(
+        read_game(&svm, &f.game.pubkey()).state,
+        u8::from(GameState::Open)
+    );
+}
+
 /// The callback account list is frozen into the request at join time; the
 /// `SettleCallback` accounts struct must line up with it position for
 /// position, so pin the exact order here.

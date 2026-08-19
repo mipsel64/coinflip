@@ -41,15 +41,17 @@ pub(crate) fn require_payout_account(
     mint: Pubkey,
     token_program: Pubkey,
 ) -> Result<()> {
+    // The recorded account is the common case; deriving the ATA costs a sha256
+    // per side, so only pay for it when the recorded account was not supplied.
+    if account.key() == recorded {
+        return Ok(());
+    }
     let ata = anchor_spl::associated_token::get_associated_token_address_with_program_id(
         &player,
         &mint,
         &token_program,
     );
-    require!(
-        account.key() == recorded || account.key() == ata,
-        CoinflipError::InvalidPayoutAccount
-    );
+    require!(account.key() == ata, CoinflipError::InvalidPayoutAccount);
     Ok(())
 }
 

@@ -20,6 +20,12 @@ pub const BPS_DENOMINATOR: u16 = 10_000;
 #[constant]
 pub const MIN_REFUND_TIMEOUT_SLOTS: u64 = 18_000;
 
+/// Extra slack between ORAO's callback-retry deadline and the refund window,
+/// so a permissionless fallback crank always has time to settle after ORAO
+/// fulfills-without-callback and randomness becomes public (~12 min).
+#[constant]
+pub const MIN_SETTLE_MARGIN_SLOTS: u64 = 1_800;
+
 /// Upper bound keeps the refund deadline reachable (~46 days).
 #[constant]
 pub const MAX_REFUND_TIMEOUT_SLOTS: u64 = 10_000_000;

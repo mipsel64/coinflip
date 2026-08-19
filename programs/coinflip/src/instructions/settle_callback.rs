@@ -23,6 +23,7 @@ pub struct SettleCallback<'info> {
         seeds = [CB_CLIENT_ACCOUNT_SEED, crate::ID.as_ref(), config.key().as_ref()],
         seeds::program = orao_solana_vrf_cb::ID,
         bump = client.bump,
+        // Belt-and-suspenders: the seeds (which include crate::ID) already pin this.
         constraint = client.program == crate::ID @ CoinflipError::UnauthorizedVrfClient,
     )]
     pub client: Box<Account<'info, Client>>,
@@ -53,9 +54,11 @@ pub struct SettleCallback<'info> {
     /// Address-pinned, not owner-constrained like the fallback's: this account
     /// list was frozen into the request at join time, so anything else here
     /// means the oracle is not replaying our own callback.
-    #[account(mut, address = game.host_token_account @ CoinflipError::MintMismatch)]
+    /// Note: pays the recorded ADDRESS even if the player SetAuthority'd it
+    /// away; the fallback would instead reject it and require the ATA.
+    #[account(mut, address = game.host_token_account @ CoinflipError::InvalidPayoutAccount)]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(mut, address = game.joiner_token_account @ CoinflipError::MintMismatch)]
+    #[account(mut, address = game.joiner_token_account @ CoinflipError::InvalidPayoutAccount)]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     /// LIVE-treasury policy (unified with settle_fallback): the fee RATE is the
     /// player guarantee (snapshotted); the destination is protocol-internal.
@@ -72,6 +75,10 @@ pub struct SettleCallback<'info> {
     pub treasury_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(address = game.token_mint @ CoinflipError::MintMismatch)]
     pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(
+        constraint = token_program.key() == *mint.to_account_info().owner
+            @ CoinflipError::MintMismatch,
+    )]
     pub token_program: Interface<'info, TokenInterface>,
 }
 

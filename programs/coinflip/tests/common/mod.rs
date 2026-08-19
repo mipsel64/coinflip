@@ -43,6 +43,9 @@ pub const REQUEST_FEE: u64 = 1_000_000; // what our crafted NetworkState charges
 pub const ORAO_TREASURY_START_LAMPORTS: u64 = LAMPORTS_PER_SOL;
 pub const DEFAULT_FEE_BPS: u16 = 100;
 pub const DEFAULT_TIMEOUT_SLOTS: u64 = 18_000;
+/// `NetworkConfiguration::DEFAULT_CALLBACK_DEADLINE` (crate-private): ~1 hour
+/// of 400ms slots. `DEFAULT_TIMEOUT_SLOTS` clears it by more than the margin.
+pub const ORAO_DEFAULT_CALLBACK_DEADLINE: u64 = 1000 * 60 * 60 / 400;
 
 pub fn config_pda() -> Pubkey {
     Pubkey::find_program_address(&[CONFIG_SEED], &coinflip::ID).0
@@ -459,8 +462,15 @@ pub struct OraoEnv {
 }
 
 /// Hand-crafts the ORAO NetworkState + Client accounts (registration is an
-/// off-chain deployment step; tests fabricate its result).
+/// off-chain deployment step; tests fabricate its result), keeping the ORAO
+/// crate's own default callback deadline.
 pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
+    setup_orao_with_deadline(svm, ORAO_DEFAULT_CALLBACK_DEADLINE)
+}
+
+/// Like `setup_orao`, but with an explicit `callback_deadline` — `join_game`
+/// requires the configured refund timeout to clear it by `MIN_SETTLE_MARGIN_SLOTS`.
+pub fn setup_orao_with_deadline(svm: &mut LiteSVM, callback_deadline: u64) -> OraoEnv {
     let orao_treasury = Pubkey::new_unique();
     svm.airdrop(&orao_treasury, ORAO_TREASURY_START_LAMPORTS)
         .unwrap();
@@ -470,6 +480,13 @@ pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
         ns_bump,
         NetworkConfiguration::new(Pubkey::new_unique(), orao_treasury, REQUEST_FEE),
     );
+    // `NetworkConfiguration::new` seeds the crate default; the field is public,
+    // so tests can move it to model a different oracle configuration.
+    assert_eq!(
+        network_state.config.callback_deadline, ORAO_DEFAULT_CALLBACK_DEADLINE,
+        "ORAO's default callback deadline changed; revisit MIN_REFUND_TIMEOUT_SLOTS"
+    );
+    network_state.config.callback_deadline = callback_deadline;
     // Mainnet's NetworkState always has at least one fulfill authority; match
     // that account shape instead of the degenerate empty-vec case.
     network_state.config.fulfill_authorities = vec![Pubkey::new_unique()];

@@ -181,7 +181,8 @@ fn settle_pays_host_when_host_side_wins() {
         "both rents must return to the host"
     );
 
-    // Budget guard: two transfers + a close + the event CPI (measured ~47k).
+    // Budget guard: two transfers + a close + the event CPI (measured ~42k with
+    // both payout accounts recorded; the ATA-fallback path derives two more).
     assert!(
         meta.compute_units_consumed < 60_000,
         "settle used {} CU",

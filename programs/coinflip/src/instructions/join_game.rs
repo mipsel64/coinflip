@@ -16,7 +16,7 @@ use orao_solana_vrf_cb::{
 };
 
 use crate::{
-    constants::{CONFIG_SEED, ESCROW_SEED},
+    constants::{CONFIG_SEED, ESCROW_SEED, MIN_SETTLE_MARGIN_SLOTS},
     errors::CoinflipError,
     events::GameJoined,
     state::{Config, Game, GameState},
@@ -98,10 +98,20 @@ pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
         CoinflipError::HostCannotJoin
     );
     // The refund window must never open before ORAO gives up on the callback,
-    // or a player could sabotage their payout account and force a refund.
+    // or a player could sabotage their payout account and force a refund. The
+    // margin covers the sliver where the deadline sits just under the timeout:
+    // there, randomness is already public (ORAO fulfilled without the callback)
+    // but a crank has no time to settle, so a loser could read the outcome and
+    // race a refund to convert a loss into a push.
+    let min_timeout = ctx
+        .accounts
+        .network_state
+        .config
+        .callback_deadline
+        .checked_add(MIN_SETTLE_MARGIN_SLOTS)
+        .ok_or(CoinflipError::NumericalOverflow)?;
     require!(
-        ctx.accounts.config.refund_timeout_slots
-            > ctx.accounts.network_state.config.callback_deadline,
+        ctx.accounts.config.refund_timeout_slots >= min_timeout,
         CoinflipError::InvalidTimeout
     );
 
