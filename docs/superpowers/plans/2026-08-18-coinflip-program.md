@@ -2392,6 +2392,26 @@ Expected: PASS (4 tests). Note the payout numbers implement the spec's worked ex
 **Files:**
 - Modify: `programs/coinflip/src/instructions/settle_callback.rs` (replace the Task 10 shell), `tests/common/mod.rs`, `tests/e2e_settle.rs`
 
+- [ ] **Step 0 (carried from Task 11 review): two small refactors**
+
+Move the two `require_payout_account` calls from `settle_fallback`'s handler
+INSIDE `execute_settlement` (guarding host+joiner there makes the rule
+unforgettable for every settlement call site; the callback's address-pinned
+accounts satisfy it trivially). And in `join_game`, add a dynamic invariant
+check after the network_state account is available:
+```rust
+    // The refund window must never open before ORAO gives up on the callback,
+    // or a player could sabotage their payout account and force a refund.
+    require!(
+        ctx.accounts.config.refund_timeout_slots
+            > ctx.accounts.network_state.config.callback_deadline,
+        CoinflipError::InvalidTimeout
+    );
+```
+Also: bump the stale "measured ~42k" CU comment in e2e_settle.rs (real: ~47k),
+and rename `settle_fallback_pays_any_winner_owned_account` to
+`settle_fallback_pays_ata_when_recorded_account_is_gone`.
+
 - [ ] **Step 1: Replace `instructions/settle_callback.rs`** — ORAO's fixed prefix (client signer, state, network_state, request), then OUR accounts in exactly the order `join_game` declared:
 
 ```rust
@@ -2624,6 +2644,7 @@ use crate::{
     constants::{CONFIG_SEED, ESCROW_SEED},
     errors::CoinflipError,
     events::GameRefunded,
+    instructions::settlement::require_payout_account,
     state::{Config, Game, GameState},
 };
 
@@ -2673,6 +2694,22 @@ pub struct RefundTimeout<'info> {
 
 pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
     ctx.accounts.game.require_state(GameState::AwaitingRandomness)?;
+    // Permissionless cranker: refunds may only land on recorded-or-ATA
+    // destinations (same rule as settle_fallback; see settlement.rs).
+    require_payout_account(
+        &ctx.accounts.host_token_account,
+        ctx.accounts.game.host_token_account,
+        ctx.accounts.game.host,
+        ctx.accounts.game.token_mint,
+        ctx.accounts.token_program.key(),
+    )?;
+    require_payout_account(
+        &ctx.accounts.joiner_token_account,
+        ctx.accounts.game.joiner_token_account,
+        ctx.accounts.game.joiner,
+        ctx.accounts.game.token_mint,
+        ctx.accounts.token_program.key(),
+    )?;
     // A fulfilled request must be settled on its outcome, never refunded.
     require!(
         ctx.accounts.request.fulfilled().is_none(),
@@ -2978,6 +3015,7 @@ npx tsx register.ts -k ~/.config/solana/id.json deposit --lamports 100000000  # 
 # initialize config, create + join a wSOL game with two test wallets (anchor console
 # or a scratch TS script), then watch the game settle WITHOUT any settle tx:
 solana logs <PROGRAM_ID> -u devnet     # expect the SettleCallback + GameSettled event CPI
+# also fetch ORAO's NetworkState and confirm callback_deadline < refund_timeout_slots
 ```
 Expected: after `join_game` confirms, within ~a few slots the ORAO oracle fulfills and the program logs show `settle_callback` executing — the winner's ATA balance changes with no third transaction. Record the tx signatures in the README (Task 15).
 

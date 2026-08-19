@@ -233,7 +233,10 @@ gap without any special authority:
   account or the player's canonical ATA** (owner+mint checked as well) — a
   closed recorded account can never strand funds (the ATA is permissionlessly
   re-creatable), and a third-party cranker cannot route a payout into some
-  other, possibly delegated, player-owned account.
+  other, possibly delegated, player-owned account. Accepted residual: a cranker
+  may still prefer the player's ATA over a healthy recorded account — both are
+  player-chosen destinations, so the blast radius is a delegate the player
+  themselves approved on their own ATA.
 - Both players' accounts are required at settlement even though only the winner
   is paid (the account set is fixed before the outcome is known) — if the loser
   closed every candidate account, anyone can re-create their ATA to unblock.
