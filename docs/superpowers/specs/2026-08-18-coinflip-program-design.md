@@ -23,7 +23,7 @@ treasury. Winner receives 9.9 SOL.
 | Framework | Anchor, playbook-scaled | Production habits without production bloat; user learning Anchor |
 | Randomness | ORAO **Callback** VRF (`orao-solana-vrf-cb`, program `VRFCBePmGTpZ234BhbzNNzmyg39Rgdd6VgdfhHwKypU`) | Provably fair; oracle invokes our settle callback on fulfillment — no third transaction in the normal flow |
 | Assets | Any SPL token via `TokenInterface`; native SOL as wSOL (frontend wraps) | One escrow code path covers legacy SPL + plain Token-2022 |
-| Game identity | Fresh keypair account; the game's pubkey **is** the game id | Simpler than PDA + nonce; the pubkey also serves as the unique VRF seed |
+| Game identity | Fresh keypair account; the game's pubkey **is** the game id | Simpler than PDA + nonce; the VRF seed is `sha256("coinflip-vrf-seed", game, joiner)` stored at join |
 | Account serialization | Plain `#[account]` (Borsh), **not** zero-copy | Deliberate deviation from playbook Phase 1: both account types are small and fixed-size; the rest of the discipline (InitSpace assert, version byte, reserved bytes, u8 enums) is kept |
 | Fee rounding | Floor (rounds down, in the winner's favor) | Explicit choice per playbook Phase 2; documented here so it is never re-litigated |
 
@@ -141,16 +141,16 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 | 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). Treasury rotation: BOTH settle paths pay the CURRENT `config.treasury` (the fee *rate* is the player guarantee and is snapshotted; the *destination* is protocol-internal). Runbook: create the new treasury's token accounts for every active mint BEFORE rotating — in-flight callbacks fail until then, degrade to ORAO's fulfill-without-callback, and settle via fallback |
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. State = Open |
 | 4 | `cancel_game` | host | Requires state == Open. Refund host stake, close escrow + game (rent to host) |
-| 5 | `join_game` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; ensure treasury ATA exists (`init_if_needed`, payer = joiner). Transfer the current VRF fee PLUS the pending request account's rent (sized via ORAO's own `RequestAccount::expected_size`) in lamports joiner → Client PDA, so the shared Client balance is exactly neutral per join and cannot be drained by cheap join spam. CPI ORAO `Request` (seed = game pubkey, `Config` PDA signs, Client PDA pays) with a request-level callback targeting `settle_callback` and carrying: game, escrow, host + joiner token accounts, treasury ATA, mint, token program. Record joiner, joiner token account, `joined_at_slot`. State = AwaitingRandomness |
+| 5 | `join_game` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; ensure treasury ATA exists (`init_if_needed`, payer = joiner). Transfer the current VRF fee PLUS the pending request account's rent (sized via ORAO's own `RequestAccount::expected_size`) in lamports joiner → Client PDA, so the shared Client balance is exactly neutral per join and cannot be drained by cheap join spam. CPI ORAO `Request` (seed = the stored `vrf_seed` hash, `Config` PDA signs, Client PDA pays) with a request-level callback targeting `settle_callback` and carrying: game, escrow, host + joiner token accounts, treasury ATA, mint, token program. Record joiner, joiner token account, `joined_at_slot`. State = AwaitingRandomness |
 | 6 | `settle_callback` | ORAO (Client PDA signs via CPI) | Accounts per ORAO's required order: Client PDA (signer, validated by seed derivation under the ORAO program), `Config` (writable), `NetworkState`, fulfilled request account, then our accounts. Runs core settlement (below) |
-| 7 | `settle_fallback` | anyone | Backstop for a failed/ignored callback. Requires state == AwaitingRandomness and the request account for seed = game pubkey is **fulfilled**. Runs the same core settlement |
+| 7 | `settle_fallback` | anyone | Backstop for a failed/ignored callback. Requires state == AwaitingRandomness and the request account for seed = the stored `vrf_seed` hash is **fulfilled**. Runs the same core settlement |
 | 8 | `refund_timeout` | anyone | Requires state == AwaitingRandomness, `current_slot > joined_at_slot + refund_timeout_slots`, and randomness NOT fulfilled. Return each stake to its player, no fee. Close escrow + game, rent to host |
 
 **Core settlement** (shared by 6 and 7): verify the request account is the ORAO PDA
-for seed = game pubkey under our client; `outcome = fulfilled_randomness[0] & 1`
+for seed = the stored `vrf_seed` hash under our client; `outcome = fulfilled_randomness[0] & 1`
 (0 = Heads, 1 = Tails); winner = host if outcome == host_side else joiner;
 `pot = the escrow's actual balance` (donated dust goes to the winner and can never brick the close); `fee = pot * game.fee_bps / 10_000` (rate snapshotted at create; u128 widening, floor); fee →
-treasury ATA, `pot - fee` → winner's recorded token account. Set state = Settled
+treasury ATA, `pot - fee` → the winner's recorded token account or their canonical ATA (see the liveness rule). Set state = Settled
 before transfers, close escrow + game, rent to host.
 
 ### Game flow
@@ -178,7 +178,7 @@ create_game ──▶ Open ──cancel_game──▶ Cancelled (host refunded)
   only the VRF program can produce that signature, so nobody can invoke the callback
   with forged randomness.
 - `settle_fallback` and `refund_timeout` verify the passed request account is the
-  ORAO PDA derived from seed = game pubkey, owned by the ORAO program.
+  ORAO PDA derived from the stored `vrf_seed`, owned by the ORAO program.
 - Neither player can influence or withhold the outcome: the request doesn't exist
   until join, the oracle settles autonomously, and both fallbacks are permissionless.
 - The outcome bit is `randomness[0] & 1`. ORAO's fulfilled randomness is the XOR of a
@@ -263,7 +263,7 @@ gap without any special authority:
   `HostCannotJoin`, `MintMismatch`, `UnsupportedMintExtension`,
   `RandomnessNotFulfilled`, `AlreadyFulfilled`, `UnauthorizedVrfClient`,
   `TimeoutNotReached`, `NumericalOverflow`, `OwnerMismatch`, `InvalidAuthority`,
-  `InvalidTimeout`.
+  `InvalidTimeout`, `InvalidPayoutAccount`.
 - Every Anchor `constraint` carries `@ TypedError`.
 
 ## Events
@@ -291,7 +291,7 @@ programs/coinflip/src/
   errors.rs  events.rs  math.rs
   state/{mod,config,game}.rs
   instructions/{mod,initialize_config,update_config,create_game,cancel_game,
-                join_game,settle_callback,settle_fallback,refund_timeout}.rs
+                join_game,settlement,settle_callback,settle_fallback,refund_timeout}.rs
 scripts/                # one-time ORAO Register + Client PDA funding
 tests/                  # LiteSVM e2e (Rust)
 .github/workflows/ci.yml
@@ -308,8 +308,10 @@ tests/                  # LiteSVM e2e (Rust)
   the fallback is overriding the request account to fulfilled and testing
   `settle_fallback`; both paths share the core settlement, so coverage holds.
   Scenarios:
-  - happy path: create → join (fee reimbursed to Client PDA) → oracle fulfill →
-    callback settles, balances and fee exact
+  - happy path: create → join (fee+rent reimbursed, Client PDA exactly neutral) →
+    crafted fulfillment → `settle_fallback` settles, balances and fee exact
+    (the live oracle→callback execution is devnet-only; LiteSVM cannot produce
+    the oracle's signature — see the smoke test)
   - `settle_fallback` on a fulfilled request settles identically; fails when
     unfulfilled or already settled
   - callback with a wrong/unregistered client signer rejected
