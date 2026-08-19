@@ -165,13 +165,12 @@ authority first and that surplus is gone forever.
   frozen dead end: if every candidate winner account is frozen once the
   request is already fulfilled, funds are stuck until a thaw — `refund_timeout`
   is blocked by `AlreadyFulfilled` at that point. Accepted for a fun project.
-- **Token-2022 test coverage:** the e2e suite exercises T22 on
-  `create_game`/`cancel_game`. Join and settlement e2e coverage is classic
-  SPL only — a T22 join needs a program-parameterized join builder and
-  `get_associated_token_address_with_program_id` for the treasury ATA. T22
-  settlement is exercised only indirectly, through the shared settlement core
-  logic (both callback and fallback settle call the same function regardless
-  of token program).
+- **Token-2022 test coverage:** the e2e suite exercises T22 end-to-end on
+  `create_game`, `cancel_game`, and `join_game` (see `t22_game_full_join`,
+  including the T22-derived treasury ATA). Settlement e2e coverage is classic
+  SPL only; T22 settlement is exercised indirectly through the shared
+  settlement core (both callback and fallback call the same function
+  regardless of token program).
 
 ## Randomness & trust
 
