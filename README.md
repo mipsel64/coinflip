@@ -239,10 +239,11 @@ when this was written — `scripts/ops.ts check-orao` reprints it live).
   stake. (The host cannot grief a join by closing their own token account —
   `join_game` does not touch host accounts at all.)
 - **Never reuse a game keypair.** Client SDKs must always generate a fresh
-  keypair per game. `Game.vrf_seed` is derived from `sha256(game, joiner)`, and
-  ORAO's request accounts are never closed, so a "resurrected" game reusing an
-  old pubkey re-derives an already-taken request address for any joiner who
-  already played it — that (game, joiner) pair can never join again.
+  keypair per game. `Game.vrf_seed` is derived from `sha256(game, joiner,
+  nonce)`, and ORAO's request accounts are never closed, so a "resurrected"
+  game reusing an old pubkey collides with already-taken request addresses for
+  any returning joiner at their old nonces — recoverable by bumping the nonce,
+  but a needless failure mode; fresh keypairs cost nothing.
 - **wSOL is in scope.** The escrow can be a native (wSOL) token account;
   a permissionless `SyncNative` after a stray lamport transfer only inflates
   the escrow balance, and settlement pays the winner the escrow's *actual*
@@ -352,7 +353,8 @@ elsewhere:
   `treasury_token_account` derived from the former — itself; passing them
   explicitly is a type error. You **must** pass `oraoTreasury` (read it from
   ORAO's `NetworkState`) and `request` (`[b"orao-vrf-randomness-request",
-  sha256("coinflip-vrf-seed", game, joiner)]` under ORAO's program).
+  sha256("coinflip-vrf-seed", game, joiner, nonce_le_u64)]` under ORAO's
+  program — the SAME nonce you pass as the instruction argument).
 - **`join_game` takes two arguments now:** `nonce: u64` (start at 0; on a
   `Custom(0)` failure retry with the next value — see Randomness & trust) and
   `max_vrf_fee: u64` (the largest ORAO request fee the joiner accepts; read the

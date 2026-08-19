@@ -87,6 +87,13 @@ pub(crate) fn handle(ctx: Context<JoinGame>, nonce: u64, max_vrf_fee: u64) -> Re
         ctx.accounts.joiner.key() != ctx.accounts.game.host,
         CoinflipError::HostCannotJoin
     );
+    // Fee cap up front with the other entry guards: reject before any
+    // transfer so the failure path does no work and reads like the rest of
+    // the codebase's checks-effects-interactions ordering.
+    require!(
+        ctx.accounts.network_state.config.request_fee <= max_vrf_fee,
+        CoinflipError::VrfFeeTooHigh
+    );
 
     let game_key = ctx.accounts.game.key();
 
@@ -126,11 +133,6 @@ pub(crate) fn handle(ctx: Context<JoinGame>, nonce: u64, max_vrf_fee: u64) -> Re
     // ORAO's fee is live config, raisable by ORAO's authority between the
     // client building this transaction and it landing. The joiner pays it from
     // their own wallet, so they get to bound it.
-    require!(
-        ctx.accounts.network_state.config.request_fee <= max_vrf_fee,
-        CoinflipError::VrfFeeTooHigh
-    );
-
     // The joiner is ORAO's payer: they fund the request account's rent and the
     // request fee out of their own wallet, so this program holds no VRF float
     // and needs no ORAO client registration.
