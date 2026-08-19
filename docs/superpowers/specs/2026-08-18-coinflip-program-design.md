@@ -104,9 +104,11 @@ computed at join and stored in `Game.vrf_seed`. It is unique per game (a game
 joins at most once) and — unlike the game pubkey alone — unpredictable before a
 joiner commits, so nobody can grief-block a game by pre-funding its
 publicly-derivable request PDA with one lamport (which makes ORAO's account
-creation fail forever). Residual: an adversary who sees the join transaction
-pre-execution (leader/MEV level) could still front-run the derived address —
-accepted as a high-effort, no-profit nuisance. Enums stored as `u8`, defined `#[repr(u8)]` with
+creation fail forever). Residual: the seed is deterministic in
+(game, joiner), so an adversary who knows an intended joiner's wallet can
+precompute and pre-fund that pair's address, blocking that wallet from that
+game (the victim recovers by joining from another wallet; no attacker profit).
+Accepted; a client-chosen nonce folded into the hash would close it fully. Enums stored as `u8`, defined `#[repr(u8)]` with
 `num_enum::TryFromPrimitive`; every read converts with `try_from(..).map_err(..)`.
 Discriminant 0 of each enum is the correct default meaning (`Open`, `Heads`).
 `#[derive(InitSpace)]` plus `const_assert_eq!(T::INIT_SPACE, N)` on both types.

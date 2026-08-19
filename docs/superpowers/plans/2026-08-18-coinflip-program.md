@@ -2962,6 +2962,10 @@ cli.parseAsync();
 
 - [ ] **Step 3: Devnet smoke test (manual, documents the callback happy path the LiteSVM suite can't reach)**
 
+IMPORTANT: the Register call must set the ORAO client `owner` to a
+team-controlled key — owner-signed `Withdraw` is the only way to recover the
+rent surplus that accumulates in the Client PDA (~0.0067 SOL per fulfilled game).
+
 ```bash
 # one-time
 anchor build && anchor deploy --provider.cluster devnet
@@ -3033,7 +3037,7 @@ jobs:
       - run: cargo test
 ```
 
-- [ ] **Step 2: Write `README.md`** — cover (Economics notes to include: first joiner for a given (treasury, mint) pays the treasury ATA rent ~0.002 SOL; on `refund_timeout` the joiner does not recover the VRF fee + request rent ~0.0096 SOL — the cost of the permanent ORAO request account; a host can make their open game unjoinable by closing the recorded host token account — bait-and-burn nuisance, joiners lose only tx fees. Also include a Limitations note: the e2e
+- [ ] **Step 2: Write `README.md`** — cover (Economics notes to include: first joiner for a given (treasury, mint) pays the treasury ATA rent ~0.002 SOL; the joiner pays VRF fee + pending-request rent ~0.0096 SOL per join, never refunded to them: ~0.0019 stays locked in the permanent ORAO request account and ~0.0067 returns to the protocol's ORAO Client PDA on fulfillment (an implicit protocol fee, recoverable via ORAO's owner-signed Withdraw); a host can make their open game unjoinable by closing the recorded host token account — bait-and-burn nuisance, joiners lose only tx fees. Also include a Limitations note: the e2e
   suite exercises Token-2022 only on create/cancel; joins/settlements are tested
   on classic SPL — a T22 join needs a program-parameterized join builder and
   `get_associated_token_address_with_program_id` for the treasury ATA): what the game is (spec summary + the 5 SOL / 9.9 SOL example), the instruction table from the spec, the ORAO callback flow diagram (create → join(request) → oracle callback → settled; fallback + refund backstops), how to build/test (`anchor build && cargo test`), deployment steps (deploy → `initialize_config` → `scripts register` → `deposit`), and the note that the crank/dealer bot lives in the backend repo. Point to `docs/superpowers/specs/2026-08-18-coinflip-program-design.md` for the full design.
