@@ -3162,3 +3162,50 @@ the treasury ATA against the constant; rotation-specific tests replaced by a
 const-derivation test; e2e `.so` must be built `--features local` (CI + README
 + stale-guard notes updated); scripts read the treasury from the IDL constant.
 Full details in the implementing commits and the spec's State section.
+
+
+---
+
+### Task 17 (post-v0.1 redesign): plain ORAO VRF + crank settlement (callback removed)
+
+User decision after reviewing the callback's carrying costs (frozen account
+lists, locally-untestable happy path, ORAO deadline coupling, client
+registration ops). Nothing is deployed anywhere, so this is pure code work.
+
+Scope:
+- Dependency: swap `orao-solana-vrf-cb` for the plain `orao-solana-vrf` crate
+  (same repo/workspace, anchor 0.32; program `VRFzZoJdhFWL8rkvu87LpKM3RbcVezpMEc6X5GVDr7y`;
+  request PDA seeds `[b"orao-vrf-randomness-request", seed]` — no client in the
+  namespace; config PDA `[b"orao-vrf-network-configuration"]`).
+- join_game: CPI `request_v2` (joiner = payer, pays fee + request rent directly;
+  ORAO treasury from network_state constraint). No callback construction, no
+  arbitrary-writable authorization, no Client PDA, no reimbursement machinery.
+  Accounts shrink accordingly (host / host_token_account leave the struct —
+  they were only ever frozen-list authorization). vrf_seed hashing unchanged.
+- settle_callback: DELETED (instruction, tests, shape pins). `settle_fallback`
+  renamed `settle` — THE permissionless settlement path, unchanged semantics
+  (request account = `RandomnessV2`, fulfilled accessor per the crate).
+- refund_timeout: unchanged logic; the request account type changes.
+- constants: MIN_REFUND_TIMEOUT_SLOTS 18_000 → 1_500 (~10 min — the old floor
+  existed only for the callback-retry deadline); MIN_SETTLE_MARGIN_SLOTS and
+  join's deadline-margin invariant REMOVED (no callback deadline exists).
+- Harness: dump the plain VRF `.so` (`VRFzZoJ…`, mainnet, provenance README),
+  craft its NetworkState, write fulfilled/pending `RandomnessV2` accounts,
+  drop the client/registration helpers; the join CPI still runs against the
+  real binary; settlement remains fully locally testable (now the ONLY path —
+  the whole system is LiteSVM-verifiable, no devnet-only feature).
+- scripts: register/deposit commands deleted; check-orao reports the plain
+  NetworkState fee; settle-fallback subcommand renamed settle; smoke.ts
+  settles via the crank path (poll request fulfillment, send settle, decode
+  GameSettled) — the smoke now exercises the REAL end-to-end production flow.
+- Docs: spec sections (decisions row, trade-offs, registration section
+  removed, instruction table -1 row, flow diagram, randomness safety, timeout
+  floor, economics — joiner outlay shrinks to fee + small request rent),
+  README (runbook loses register/deposit; crank promoted to the settlement
+  operator; UI-flow/latency notes), CHANGELOG.
+- Events/errors: append-only rules hold (no deployment yet, but keep the
+  discipline); `UnauthorizedVrfClient` becomes dead — retire in docs, keep the
+  variant slot.
+
+Followed by Task 18: winner-pays bond (Option A) sized to the new, smaller
+joiner outlay.
