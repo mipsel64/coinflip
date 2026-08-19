@@ -646,7 +646,9 @@ pub struct GameRefunded {
     pub host: Pubkey,
     pub joiner: Pubkey,
     pub mint: Pubkey,
-    pub amount: u64,
+    pub host_refund: u64,
+    /// Includes any donated dust.
+    pub joiner_refund: u64,
 }
 ```
 
@@ -2785,7 +2787,8 @@ pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
         host: ctx.accounts.game.host,
         joiner: ctx.accounts.game.joiner,
         mint: ctx.accounts.game.token_mint,
-        amount: ctx.accounts.game.amount,
+        host_refund,
+        joiner_refund,
     });
     Ok(())
 }
