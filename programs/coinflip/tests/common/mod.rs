@@ -71,10 +71,46 @@ fn coinflip_so_path() -> String {
     }
 }
 
+/// Newest modification time of any `.rs` file under `dir` (recursive).
+fn newest_rs_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let mtime = if path.is_dir() {
+            newest_rs_mtime(&path)
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            entry.metadata().ok().and_then(|m| m.modified().ok())
+        } else {
+            None
+        };
+        newest = newest.max(mtime);
+    }
+    newest
+}
+
+/// `cargo test` never rebuilds the deployed artifact, so an e2e suite happily
+/// runs green against a `.so` built before the change under test. Compare
+/// mtimes and refuse to run instead.
+fn assert_program_not_stale(so_path: &str) {
+    let so_mtime = std::fs::metadata(so_path)
+        .and_then(|m| m.modified())
+        .expect("cannot stat target/deploy/coinflip.so");
+    let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+    let Some(src_mtime) = newest_rs_mtime(src) else {
+        return;
+    };
+    assert!(
+        so_mtime >= src_mtime,
+        "stale target/deploy/coinflip.so — run `anchor build`"
+    );
+}
+
 pub fn setup() -> (LiteSVM, Keypair) {
     let mut svm = LiteSVM::new();
-    svm.add_program_from_file(coinflip::ID, coinflip_so_path())
+    let so_path = coinflip_so_path();
+    svm.add_program_from_file(coinflip::ID, &so_path)
         .expect("run `anchor build` first");
+    assert_program_not_stale(&so_path);
     svm.add_program_from_file(
         orao_solana_vrf_cb::ID,
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/orao_vrf_cb.so"),
@@ -994,6 +1030,46 @@ pub fn ix_settle_fallback_with_request(
         }
         .to_account_metas(None),
         data: coinflip::instruction::SettleFallback {}.data(),
+    }
+}
+
+pub fn ix_refund_timeout(j: &JoinedGame, cranker: Pubkey) -> Instruction {
+    ix_refund_timeout_full(
+        j,
+        cranker,
+        j.fixture.host_token_account,
+        j.joiner_token_account,
+    )
+}
+
+/// Like `ix_refund_timeout`, but lets the caller pick where each side's stake
+/// goes (liveness: a recorded account that is gone by refund time must not
+/// strand the funds, so the player's ATA is accepted too).
+pub fn ix_refund_timeout_full(
+    j: &JoinedGame,
+    cranker: Pubkey,
+    host_token_account: Pubkey,
+    joiner_token_account: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: coinflip::ID,
+        accounts: coinflip::accounts::RefundTimeout {
+            cranker,
+            config: config_pda(),
+            client: j.orao.client,
+            request: j.request,
+            game: j.fixture.game.pubkey(),
+            escrow: j.fixture.escrow,
+            host: j.fixture.host.pubkey(),
+            host_token_account,
+            joiner_token_account,
+            mint: j.fixture.mint,
+            token_program: spl_token::ID,
+            event_authority: event_authority(),
+            program: coinflip::ID,
+        }
+        .to_account_metas(None),
+        data: coinflip::instruction::RefundTimeout {}.data(),
     }
 }
 

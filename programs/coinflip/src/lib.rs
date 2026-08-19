@@ -60,4 +60,8 @@ pub mod coinflip {
     pub fn settle_fallback(ctx: Context<SettleFallback>) -> Result<()> {
         instructions::settle_fallback::handle(ctx)
     }
+
+    pub fn refund_timeout(ctx: Context<RefundTimeout>) -> Result<()> {
+        instructions::refund_timeout::handle(ctx)
+    }
 }
