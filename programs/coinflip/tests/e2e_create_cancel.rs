@@ -135,8 +135,10 @@ fn create_posts_the_bond_and_creates_the_treasury_ata() {
     // Budget guard: token transfer + escrow init + treasury-ATA init + the bond
     // transfer + the event CPI (measured ~73.5k — the ATA init is most of it,
     // and it is a no-op for every game after the first of a mint).
+    // PDA bump misses add ~1.5k CU each (escrow + ATA depend on random
+    // keypairs); sampled max ~100.5k, so 110k keeps the guard non-flaky.
     assert!(
-        meta.compute_units_consumed < 90_000,
+        meta.compute_units_consumed < 110_000,
         "create used {} CU",
         meta.compute_units_consumed
     );

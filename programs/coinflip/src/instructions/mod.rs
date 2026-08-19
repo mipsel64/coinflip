@@ -19,7 +19,7 @@ pub use settle::*;
 pub use update_config::*;
 
 /// Rent for an ORAO request account at its FULFILLED size — Anchor's 8-byte
-/// discriminator plus `RandomnessV2::FULFILLED_SIZE` (137 bytes today), which
+/// discriminator plus `RandomnessV2::FULFILLED_SIZE` (129; 137 with the 8-byte discriminator), which
 /// is how ORAO itself sizes the account it shrinks to at fulfillment.
 ///
 /// ORAO allocates the larger pending size at request time and returns the

@@ -302,7 +302,7 @@ sends are permissionless — so it is an availability component, not a trust one
   request is already fulfilled, the pot and rents are stuck — `refund_timeout`
   is blocked by `AlreadyFulfilled` and no transfer can succeed until a thaw.
 - Fees are collected in the bet token, into the **constant treasury's canonical
-  ATA** for that mint (existence ensured at join, so no cranker ever has to pay
+  ATA** for that mint (existence ensured at create, so no cranker ever has to pay
   rent for it; `settle` pins the ATA derivation itself, so a permissionless
   cranker cannot scatter fees across other treasury-owned accounts).
 
