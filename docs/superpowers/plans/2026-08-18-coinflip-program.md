@@ -3144,3 +3144,21 @@ git add -A && git commit -m "chore: CI, README, CHANGELOG"
 - **Known deviation from spec:** spec's `Config.vrf_client` field is NOT stored — the ORAO client PDA is fully determined by seeds `[CB_CLIENT_ACCOUNT_SEED, program_id, config_pda]`, so every instruction validates it by derivation instead (stronger: nothing to keep in sync). The spec should be updated to match.
 - **Version pin:** Anchor 0.32.1 (forced by orao-solana-vrf-cb 0.4), NOT the 1.x line the wiki playbook's reference repo uses. The playbook's patterns still apply.
 - **Test-strategy honesty:** the positive callback path can't run under LiteSVM (ORAO's fulfill logic is closed-source and oracle-signed); it is covered by the shared settlement core + callback negative tests + the Task 14 devnet smoke test.
+
+
+---
+
+### Task 16 (post-v0.1 amendment): compile-time treasury constant
+
+Adopted after user review of the treasury model, following DLMM's `fee_owner`
+pattern. Replaces `Config.treasury` (admin-rotatable) with a `pub mod treasury`
+constant: the real id (`BUs86uMPdNMJ9SiFijb4TABpFduhaEqqESs96pTGadsN`, keypair
+in gitignored `keys/treasury-keypair.json`) in non-local builds, and a
+committed test key (`programs/coinflip/tests/fixtures/treasury-local.json`)
+under a new `local` cargo feature (constants/IDs only — never logic). Config
+shrinks by 32 bytes (reserved unchanged; INIT_SPACE 140 → 108); initialize/
+update_config drop the treasury arg/rotation arm; join/settle paths validate
+the treasury ATA against the constant; rotation-specific tests replaced by a
+const-derivation test; e2e `.so` must be built `--features local` (CI + README
++ stale-guard notes updated); scripts read the treasury from the IDL constant.
+Full details in the implementing commits and the spec's State section.

@@ -78,10 +78,19 @@ routes fee reimbursements (see the Config section below).
 | `version` | `u8` | Layout version, starts at 1 |
 | `bump` | `u8` | |
 | `admin` | `Pubkey` | Can call `update_config` |
-| `treasury` | `Pubkey` | Authority whose ATA receives fees |
 | `fee_bps` | `u16` | Default 100 (1%); hard cap `MAX_FEE_BPS = 1000` (10%) |
 | `refund_timeout_slots` | `u64` | Slots after join before `refund_timeout` is allowed; bounded to [`MIN_REFUND_TIMEOUT_SLOTS`, `MAX_REFUND_TIMEOUT_SLOTS`]. The MIN (18_000 slots ≈ 2h) must exceed ORAO's callback-retry deadline (crate default 9_000): otherwise a player could sabotage their recorded payout account, block the callback, and force a refund before ORAO falls back to fulfilling without it |
 | `_reserved` | `[u8; 64]` | Zeroed tail for future fields |
+
+The **treasury is a compile-time constant** (DLMM's `fee_owner` pattern): a
+`pub mod treasury { declare_id!(..) }` whose real id is baked into non-local
+builds and swapped for a committed test key under the `local` feature — per the
+playbook rule that a feature flag may change **constants and IDs only**, never
+logic. Fees flow to the constant treasury's ATA per mint; both settle paths
+validate the same derivation, so there is no live-vs-frozen distinction and no
+rotation runbook. Rotating the treasury = a program upgrade (~0.003 SOL in
+fees plus a refundable ~3.7 SOL buffer float; `solana program extend` first if
+the binary grew past its allocation).
 
 `Config` doubles as the registered VRF **state PDA**: it signs `Request` CPIs and is
 passed (writable) into every callback by the VRF program. The ORAO Client PDA is not
@@ -137,8 +146,8 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 
 | # | Instruction | Signer | Behavior |
 |---|---|---|---|
-| 1 | `initialize_config(admin, treasury, fee_bps, refund_timeout_slots)` | the program's **upgrade authority** (verified against ProgramData) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to [MIN, MAX]_REFUND_TIMEOUT_SLOTS; admin/treasury must be non-default keys |
-| 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). Treasury rotation: BOTH settle paths pay the CURRENT `config.treasury` (the fee *rate* is the player guarantee and is snapshotted; the *destination* is protocol-internal). Runbook: create the new treasury's token accounts for every active mint BEFORE rotating — in-flight callbacks fail until then, degrade to ORAO's fulfill-without-callback, and settle via fallback |
+| 1 | `initialize_config(admin, fee_bps, refund_timeout_slots)` | the program's **upgrade authority** (verified against ProgramData) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to [MIN, MAX]_REFUND_TIMEOUT_SLOTS; admin must be a non-default key |
+| 2 | `update_config(...)` | `admin` | Rotate admin, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). The treasury is a compile-time constant — rotating it is a program upgrade, not a config change |
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. State = Open |
 | 4 | `cancel_game` | host | Requires state == Open. Refund host stake, close escrow + game (rent to host) |
 | 5 | `join_game` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; ensure treasury ATA exists (`init_if_needed`, payer = joiner). Transfer the current VRF fee PLUS the pending request account's rent (sized via ORAO's own `RequestAccount::expected_size`) in lamports joiner → Client PDA, so the shared Client balance is exactly neutral per join and cannot be drained by cheap join spam. CPI ORAO `Request` (seed = the stored `vrf_seed` hash, `Config` PDA signs, Client PDA pays) with a request-level callback targeting `settle_callback` and carrying: game, escrow, host + joiner token accounts, treasury ATA, mint, token program. Record joiner, joiner token account, `joined_at_slot`. State = AwaitingRandomness |
@@ -251,8 +260,9 @@ gap without any special authority:
   freeze authority and every candidate winner account is frozen while the
   request is already fulfilled, the pot and rents are stuck — `refund_timeout`
   is blocked by `AlreadyFulfilled` and no transfer can succeed until a thaw.
-- Fees are collected in the bet token, into the treasury's ATA for that mint
-  (existence ensured at join).
+- Fees are collected in the bet token, into the **constant treasury's ATA** for
+  that mint (existence ensured at join; validated by derivation in both settle
+  paths).
 
 ## Math & errors
 
