@@ -2885,9 +2885,23 @@ Expected: all unit + e2e suites PASS.
 ### Task 14: Deployment scripts + devnet smoke test
 
 **Files:**
-- Create: `scripts/package.json`, `scripts/tsconfig.json`, `scripts/register.ts`
+- Create: `scripts/package.json`, `scripts/tsconfig.json`, `scripts/register.ts`, `scripts/smoke.ts`
 
-- [ ] **Step 1: Write `scripts/package.json`**
+**Implementation note (post-hoc):** the scope grew during implementation beyond
+what's drafted below — `register.ts` gained two more subcommands
+(`init-config`, wrapping `initialize_config`; `check-orao`, which fetches
+ORAO's `NetworkState` + our `Config` and warns if `refund_timeout_slots`
+doesn't clear ORAO's `callback_deadline` by the required margin) — and a
+standalone `scripts/smoke.ts` was added for the devnet e2e walkthrough
+described in Step 3 (create_game + join_game against the real deployed ORAO
+program, then poll for the callback to settle it). Also: the `PROGRAM_ID`
+snippet in Step 2 below is broken pseudo-code (a `readFileSync` used as a
+truthiness check inside a ternary, which can't compile) — the actual
+`register.ts` instead tries `target/deploy/coinflip-keypair.json` then falls
+back to `keys/coinflip-keypair.json`, reading only the pubkey out of whichever
+exists. All four steps below are done; see `scripts/` for the real code.
+
+- [x] **Step 1: Write `scripts/package.json`**
 
 ```json
 {
@@ -2923,7 +2937,7 @@ Expected: all unit + e2e suites PASS.
 }
 ```
 
-- [ ] **Step 2: Write `scripts/register.ts`** — modeled on ORAO's example `cli.ts` (`RegisterBuilder` + a system transfer to the client PDA). The wallet must be the **program's upgrade authority**:
+- [x] **Step 2: Write `scripts/register.ts`** — modeled on ORAO's example `cli.ts` (`RegisterBuilder` + a system transfer to the client PDA). The wallet must be the **program's upgrade authority**:
 
 ```ts
 import * as anchor from "@coral-xyz/anchor";
@@ -3003,7 +3017,7 @@ cli.parseAsync();
 ```
 (If the `RegisterBuilder` constructor signature differs on the published 0.4.x package, mirror the exact call in ORAO's `callback/rust/examples/cpi/cli.ts` — it is the canonical usage.)
 
-- [ ] **Step 3: Devnet smoke test (manual, documents the callback happy path the LiteSVM suite can't reach)**
+- [x] **Step 3: Devnet smoke test (manual, documents the callback happy path the LiteSVM suite can't reach)**
 
 IMPORTANT runbook items: (1) NEVER burn the program upgrade authority without
 first running ORAO's `Transfer` to move the client `owner` to a surviving key —
@@ -3018,17 +3032,18 @@ anchor build && anchor deploy --provider.cluster devnet
 cd scripts && npm install
 npx tsx register.ts -k ~/.config/solana/id.json register
 npx tsx register.ts -k ~/.config/solana/id.json deposit --lamports 100000000  # 0.1 SOL
-# initialize config, create + join a wSOL game with two test wallets (anchor console
-# or a scratch TS script), then watch the game settle WITHOUT any settle tx:
+npx tsx register.ts -k ~/.config/solana/id.json init-config   # one-shot; payer must be the upgrade authority
+npx tsx register.ts -k ~/.config/solana/id.json check-orao    # confirms callback_deadline + margin < refund_timeout_slots
+# create + join a wSOL game with two ephemeral wallets, then watch it settle WITHOUT any settle tx:
+npx tsx smoke.ts
 solana logs <PROGRAM_ID> -u devnet     # expect the SettleCallback + GameSettled event CPI
-# also fetch ORAO's NetworkState and confirm callback_deadline < refund_timeout_slots
 ```
-Expected: after `join_game` confirms, within ~a few slots the ORAO oracle fulfills and the program logs show `settle_callback` executing — the winner's ATA balance changes with no third transaction. Record the tx signatures in the README (Task 15).
+Expected: after `join_game` confirms, within ~a few slots the ORAO oracle fulfills and the program logs show `settle_callback` executing — the winner's ATA balance changes with no third transaction. `smoke.ts` polls for exactly this (the game account closing) and prints both players' final balances plus an explorer link to the fulfill tx. Record the tx signatures in the README (Task 15).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
-git add -A && git commit -m "chore: ORAO register/deposit scripts"
+git add -A && git commit -m "chore: ORAO register/deposit/init/smoke scripts"
 ```
 
 ---

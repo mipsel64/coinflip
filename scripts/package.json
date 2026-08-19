@@ -1,0 +1,23 @@
+{
+  "name": "coinflip-scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "register": "tsx register.ts register",
+    "deposit": "tsx register.ts deposit",
+    "init-config": "tsx register.ts init-config",
+    "check-orao": "tsx register.ts check-orao",
+    "smoke": "tsx smoke.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@orao-network/solana-vrf-cb": "^0.4.0",
+    "@solana/spl-token": "^0.4.9",
+    "commander": "^12.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
