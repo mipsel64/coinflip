@@ -1766,14 +1766,10 @@ pub struct JoinGame<'info> {
     /// CHECK: asserted by the CPI.
     #[account(mut, address = network_state.config.treasury)]
     pub orao_treasury: AccountInfo<'info>,
-    /// CHECK: created by the CPI; seed = game pubkey, so it's unique per game
-    /// and a pre-existing (precomputed) request makes the join fail.
-    #[account(
-        mut,
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.key().as_ref()],
-        seeds::program = orao_solana_vrf_cb::ID,
-        bump,
-    )]
+    /// CHECK: created (and PDA-validated against the seed we pass) by the ORAO
+    /// CPI itself. The seed is sha256("coinflip-vrf-seed", game, joiner) —
+    /// unpredictable pre-join, so the address cannot be grief-pre-funded.
+    #[account(mut)]
     pub request: AccountInfo<'info>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub token_program: Interface<'info, TokenInterface>,
@@ -2051,7 +2047,18 @@ fn join_with_wrong_mint_token_account_fails() {
 anchor build && cargo test -p coinflip --test e2e_join
 git add -A && git commit -m "feat: join_game with ORAO callback VRF request"
 ```
-Expected: PASS (4 tests). This is the task where the real dumped ORAO binary runs — if the `request` CPI fails with an unexpected ORAO error, print the tx logs (`FailedTransactionMetadata.meta.logs`) and compare against the crate's `error.rs`; the usual suspects are the client balance being too small (raise the funding in `setup_orao`) or a stale fixture (re-dump the `.so`).
+Expected: PASS (4 tests).
+
+> **Post-review amendments (applied after Task 10's code review):** the VRF seed
+> is now `sha256("coinflip-vrf-seed", game, joiner)` stored in `Game.vrf_seed`
+> (reserved shrunk to 30) — the request account in JoinGame is a CHECK'd
+> AccountInfo whose PDA the ORAO CPI itself enforces; the joiner reimburses
+> `request_fee + rent(pending request)` sized via `RequestAccount::expected_size`
+> so the Client PDA is exactly neutral per join (asserted in tests);
+> `orao_treasury` carries a typed error; `token_program` is constrained to the
+> mint's owner; the join suite gained lamport-delta, CU-budget, T22-join, and
+> three negative constraint tests. Tasks 11-13 derive the request PDA from
+> `game.vrf_seed` (snippets already updated). This is the task where the real dumped ORAO binary runs — if the `request` CPI fails with an unexpected ORAO error, print the tx logs (`FailedTransactionMetadata.meta.logs`) and compare against the crate's `error.rs`; the usual suspects are the client balance being too small (raise the funding in `setup_orao`) or a stale fixture (re-dump the `.so`).
 
 ---
 
@@ -2194,7 +2201,7 @@ pub struct SettleFallback<'info> {
     pub client: Box<Account<'info, Client>>,
     /// Seed binding: this must be THE request for this game.
     #[account(
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.key().as_ref()],
+        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.vrf_seed.as_ref()],
         seeds::program = orao_solana_vrf_cb::ID,
         bump = request.bump,
     )]
@@ -2426,7 +2433,7 @@ pub struct SettleCallback<'info> {
     )]
     pub network_state: Box<Account<'info, NetworkState>>,
     #[account(
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.key().as_ref()],
+        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.vrf_seed.as_ref()],
         seeds::program = orao_solana_vrf_cb::ID,
         bump = request.bump,
     )]
@@ -2443,10 +2450,12 @@ pub struct SettleCallback<'info> {
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, address = game.joiner_token_account @ CoinflipError::MintMismatch)]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// Frozen at request time by the ORAO-validated callback list — do NOT
+    /// re-check against live config.treasury: rotating the treasury must not
+    /// brick in-flight games (their fees go to the treasury they were joined
+    /// under, matching the fee-snapshot philosophy).
     #[account(
         mut,
-        constraint = treasury_token_account.owner == config.treasury
-            @ CoinflipError::OwnerMismatch,
         constraint = treasury_token_account.mint == game.token_mint
             @ CoinflipError::MintMismatch,
     )]
@@ -2628,7 +2637,7 @@ pub struct RefundTimeout<'info> {
     )]
     pub client: Box<Account<'info, Client>>,
     #[account(
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.key().as_ref()],
+        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.vrf_seed.as_ref()],
         seeds::program = orao_solana_vrf_cb::ID,
         bump = request.bump,
     )]
@@ -3024,7 +3033,7 @@ jobs:
       - run: cargo test
 ```
 
-- [ ] **Step 2: Write `README.md`** — cover (include a Limitations note: the e2e
+- [ ] **Step 2: Write `README.md`** — cover (Economics notes to include: first joiner for a given (treasury, mint) pays the treasury ATA rent ~0.002 SOL; on `refund_timeout` the joiner does not recover the VRF fee + request rent ~0.0096 SOL — the cost of the permanent ORAO request account; a host can make their open game unjoinable by closing the recorded host token account — bait-and-burn nuisance, joiners lose only tx fees. Also include a Limitations note: the e2e
   suite exercises Token-2022 only on create/cancel; joins/settlements are tested
   on classic SPL — a T22 join needs a program-parameterized join builder and
   `get_associated_token_address_with_program_id` for the treasury ATA): what the game is (spec summary + the 5 SOL / 9.9 SOL example), the instruction table from the spec, the ORAO callback flow diagram (create → join(request) → oracle callback → settled; fallback + refund backstops), how to build/test (`anchor build && cargo test`), deployment steps (deploy → `initialize_config` → `scripts register` → `deposit`), and the note that the crank/dealer bot lives in the backend repo. Point to `docs/superpowers/specs/2026-08-18-coinflip-program-design.md` for the full design.
