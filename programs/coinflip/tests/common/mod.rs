@@ -1008,6 +1008,20 @@ pub fn setup_open_game_with_fee(
     amount: u64,
     fee_bps: u16,
 ) -> (GameFixture, TransactionMetadata) {
+    setup_open_game_full(svm, payer, amount, fee_bps, Pubkey::new_unique())
+}
+
+/// The full opener: also chooses the mint's ADDRESS. Pin it with `fixed_pubkey`
+/// in any test that measures compute — the treasury ATA is a
+/// `find_program_address` over the mint, so a random mint moves the instruction's
+/// cost by ~1.5k CU per bump miss.
+pub fn setup_open_game_full(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    amount: u64,
+    fee_bps: u16,
+    mint: Pubkey,
+) -> (GameFixture, TransactionMetadata) {
     send_ok(
         svm,
         &[payer],
@@ -1021,7 +1035,7 @@ pub fn setup_open_game_with_fee(
 
     let host = Keypair::new();
     svm.airdrop(&host.pubkey(), 10 * LAMPORTS_PER_SOL).unwrap();
-    let mint = create_mint(svm, 9);
+    let mint = create_mint_at(svm, mint, 9);
     let host_token_account =
         create_token_account(svm, mint, host.pubkey(), amount.saturating_mul(10));
 
@@ -1209,7 +1223,29 @@ pub fn setup_joined_game_with_fee(
     amount: u64,
     fee_bps: u16,
 ) -> (JoinedGame, TransactionMetadata) {
-    let (fixture, _create_meta) = setup_open_game_with_fee(svm, payer, amount, fee_bps);
+    setup_joined_game_full(svm, payer, amount, fee_bps, Pubkey::new_unique())
+}
+
+/// Like `setup_joined_game`, but at a caller-chosen mint ADDRESS — pin it with
+/// `fixed_pubkey` when the test measures compute (see `setup_open_game_full`).
+pub fn setup_joined_game_at_mint(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    amount: u64,
+    mint: Pubkey,
+) -> (JoinedGame, TransactionMetadata) {
+    setup_joined_game_full(svm, payer, amount, DEFAULT_FEE_BPS, mint)
+}
+
+/// The full joined-game flow: explicit protocol fee AND mint address.
+pub fn setup_joined_game_full(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    amount: u64,
+    fee_bps: u16,
+    mint: Pubkey,
+) -> (JoinedGame, TransactionMetadata) {
+    let (fixture, _create_meta) = setup_open_game_full(svm, payer, amount, fee_bps, mint);
     let orao = setup_orao(svm); // already installed by `setup()`; this reads it back
     let joiner = Keypair::new();
     svm.airdrop(&joiner.pubkey(), 10 * LAMPORTS_PER_SOL)

@@ -454,17 +454,27 @@ the full bond back to the host; the joiner's ORAO costs stay sunk (and if ORAO
 never fulfills, the whole 6_103_920 stays locked in the pending request). Same
 for `cancel_game`, where no joiner ever existed.
 
-Compute (LiteSVM, `--features local`): `create_game` **70_621** (stake
-transfer + escrow init + treasury-ATA init + the bond transfer + event — the
-ATA init is most of it, and it is a no-op after the first game of a mint),
-`join_game` **48_376** (stake transfer + the ORAO CPI), `settle` **41_389**
-(request PDA derivation + two transfers + close + reimbursement + event).
-create and settle are exact, not approximate: every PDA they touch is derived
-from a stored bump or a pinned key, so the numbers repeat run to run and the
-test guards sit ~10-15% above them. `join_game` cannot be pinned the same way —
-the request PDA is searched twice (ORAO's `init` plus our own derivation of the
-bump to store) over a seed that hashes the joiner's key, adding ~3k CU per bump
-miss — so its guard (80k) is sized for that geometric tail.
+Compute (LiteSVM, `--features local`, measured against a mint whose treasury
+ATA sits at bump 255): `create_game` **70_621** (stake transfer + escrow init +
+treasury-ATA init + the bond transfer + event — the ATA init is most of it, and
+it is a no-op after the first game of a mint), `join_game` **48_376** (stake
+transfer + the ORAO CPI), `settle` **39_889** (request PDA derivation + two
+transfers + close + reimbursement + event).
+
+What varies, and why the guards differ:
+
+- **`settle` is fixed per mint.** Storing `request_bump` removed its dependence
+  on the VRF seed; the escrow uses a stored bump too, so the only
+  `find_program_address` left is the treasury ATA's, over the mint. A given
+  market therefore always pays the same (39_889 at zero bump misses, ~1.5k per
+  miss above it; the worst mint sampled came to 50_389). The test pins the mint
+  and guards at 47_500 — a regression tripwire, not a ceiling claim.
+- **`create_game` is likewise pinned** in its test (fixed game keypair and mint,
+  since the escrow PDA and the ATA both search), guarded at +10%.
+- **`join_game` cannot be pinned at all:** the request PDA is searched twice
+  (ORAO's `init` plus our own derivation of the bump to store) over a seed that
+  hashes the joiner's key, adding ~3k CU per bump miss, so its guard (80k) is
+  sized for that geometric tail rather than for a single number.
 
 ## Out of scope (v1)
 

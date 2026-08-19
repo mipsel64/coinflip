@@ -100,7 +100,7 @@ All notable changes to this project are documented in this file, in the
     `associated_token_program` (three accounts); `create_game` gains those
     three plus `network_state`, and pays for the one-per-mint ATA init.
     Measured compute: `create_game` 70_621, `join_game` 48_376 (was ~76k),
-    `settle` 41_389.
+    `settle` 39_889 (both create and settle for a zero-bump-miss mint).
   - `Game` grows two `u64`s (plus `request_bump` below): `INIT_SPACE` 244 →
     260 bytes, `_reserved` 22 → 21.
   - Under-bonded edge (ORAO raises its fee between create and join): the
@@ -117,8 +117,10 @@ All notable changes to this project are documented in this file, in the
   - `Game` also gained `request_bump: u8` (after `vrf_seed`): the canonical bump
     of the ORAO request PDA, recorded at join so `settle`/`refund_timeout`
     derive that address with one hash instead of a bump search. `_reserved`
-    shrank 22 → 21 to keep `INIT_SPACE` at 260. Settlement compute is now
-    constant (41_389 CU) instead of varying by thousands with the seed.
+    shrank 22 → 21 to keep `INIT_SPACE` at 260. Settlement compute no longer
+    depends on which VRF seed a game drew; what remains is the treasury ATA's
+    own bump search, which is fixed per mint (39_889 CU for a zero-miss mint,
+    ~1.5k per miss above that), so a given market always pays the same.
 
 ### Notes for integrators
 

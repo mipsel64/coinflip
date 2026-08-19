@@ -30,7 +30,14 @@ fn is_gone(svm: &litesvm::LiteSVM, address: &Pubkey) -> bool {
 #[test]
 fn settle_pays_host_when_host_side_wins() {
     let (mut svm, payer) = setup();
-    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
+    // Fixed mint, because this test pins a compute number: `settle` derives the
+    // treasury ATA with a `find_program_address` over the mint, and a random
+    // mint moves the measurement by ~1.5k CU per bump miss (observed 39_889 to
+    // 50_389 across mints). Pinning the mint pins that search; the game and
+    // joiner keys can stay random, since every other PDA here comes from a
+    // stored bump. `fixed_pubkey(0x02)`'s treasury ATA sits at bump 255, i.e.
+    // zero misses — the cheapest, most representative case to guard against.
+    let (j, _join_meta) = setup_joined_game_at_mint(&mut svm, &payer, STAKE, fixed_pubkey(0x02));
     // host_side = Heads (0); randomness[0] even => Heads => host wins.
     write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(2));
 
@@ -77,10 +84,14 @@ fn settle_pays_host_when_host_side_wins() {
     );
 
     // Budget guard: the request PDA derivation + two transfers + a close + the
-    // reimbursement + the event CPI. Every PDA here is derived from a stored
-    // bump (escrow's and, since the request bump joined the game account, the
-    // request's), so there is no bump search left and the number is the same on
-    // every run: measured 41_389, guarded at +15%.
+    // reimbursement + the event CPI. The escrow and request addresses both come
+    // from stored bumps, so the only bump search left is the treasury ATA's,
+    // over the mint — so settle's cost is fixed PER MINT in production (a given
+    // market always pays the same), and fixed here because the mint above is
+    // pinned: 39_889 on every run. The guard is that + ~19%; a mint whose ATA
+    // bump misses a few times costs ~1.5k more each, which is why this is a
+    // regression tripwire and not a claim about the ceiling (the real budget is
+    // 200k, and the worst mint measured came to 50_389).
     assert!(
         meta.compute_units_consumed < 47_500,
         "settle used {} CU",

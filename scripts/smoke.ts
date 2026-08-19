@@ -42,6 +42,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
  * ceiling (see `maxVrfFee` below).
  */
 const FULFILLED_REQUEST_LEN = 137;
+/** One signature: the joiner signs their own join and nothing else. */
+const JOIN_TX_FEE = 5_000;
 const POLL_INTERVAL_MS = 2_000;
 const POLL_TIMEOUT_MS = 3 * 60_000;
 const STAKE_AMOUNT = new anchor.BN(1_000_000); // 0.001 token (9 decimals)
@@ -407,6 +409,34 @@ async function main() {
   console.log("ORAO fulfilled the request — the outcome is already readable off-chain.");
   console.log("  outcome:", randomness[0] % 2 === 0 ? "Heads" : "Tails");
 
+  // ---- GO / NO-GO: ORAO's rent refund ----
+  // The one link in the economics that no local test can execute: does ORAO's
+  // fulfillment really return the pending→fulfilled rent difference to the
+  // request's payer? The whole bond is sized on the assumption that it does
+  // (the joiner sinks only `request_fee + fulfilled rent`), and LiteSVM can
+  // only model it. It is observable HERE — before settlement, and regardless of
+  // who wins — so this check runs on every smoke, not just on the coin flips
+  // that happen to land on the host.
+  const joinerAfterFulfill = await connection.getBalance(joiner.publicKey);
+  const joinerSpentSoFar = joinerLamportsBefore - joinerAfterFulfill;
+  const expectedSpent =
+    networkStateAccount.config.requestFee.toNumber() + fulfilledRentLamports + JOIN_TX_FEE;
+  console.log(
+    `\nGO/NO-GO — joiner's lamports spent after fulfillment: ${joinerSpentSoFar} ` +
+      `(expected ${expectedSpent} = ORAO fee + 137-byte rent + join tx fee)`
+  );
+  if (joinerSpentSoFar === expectedSpent) {
+    console.log(
+      "  GO: ORAO refunded the pending→fulfilled rent to the joiner, exactly as the bond assumes."
+    );
+  } else {
+    console.log(
+      `  NO-GO: off by ${joinerSpentSoFar - expectedSpent} lamports. ORAO's refund behavior is ` +
+        "not what create_game's bond is sized for — re-derive the bond before shipping."
+    );
+    process.exitCode = 1;
+  }
+
   // ---- settle (the crank's transaction) ----
   const joinerLamportsBeforeSettle = await connection.getBalance(joiner.publicKey);
   const settleTx = await program.methods
@@ -454,36 +484,33 @@ async function main() {
       (await connection.getBalance(joiner.publicKey)) - joinerLamportsBeforeSettle
     );
 
-    // ---- GO / NO-GO ----
-    // The joiner's whole round trip: before the join, after the settlement.
-    // If the host won, this must be exactly -(their join tx fee) — every other
-    // lamport came back, half from ORAO's fulfillment refund and half from the
-    // host's bond. That first half is the ONE link LiteSVM cannot verify (the
-    // Rust suite models ORAO's refund rather than executing it), and the bond's
-    // size is derived from it, so this number is what turns the model into a
-    // measurement. Anything more negative than a transaction fee means ORAO's
-    // refund behavior is not what the bond assumes: do not ship.
+    // Supplementary to the unconditional refund check above: the joiner's whole
+    // round trip, pre-join to post-settle. Only meaningful when the HOST won,
+    // since only then does the bond pay out — a winning joiner keeps the pot and
+    // bears their own costs by design.
     const joinerRoundTrip =
       (await connection.getBalance(joiner.publicKey)) - joinerLamportsBefore;
     const hostWon = event.winner.equals(host.publicKey);
     console.log(
-      `\nGO/NO-GO — joiner's end-to-end lamport net (pre-join -> post-settle): ${joinerRoundTrip}`
+      `Joiner's end-to-end lamport net (pre-join -> post-settle): ${joinerRoundTrip}`
     );
     if (hostWon) {
-      console.log(
-        "  Host won, so this must be exactly -5000 (the joiner's single join transaction fee)."
-      );
-      if (joinerRoundTrip !== -5_000) {
-        console.log("  NO-GO: the losing joiner paid more than their transaction fee.");
+      if (joinerRoundTrip !== -JOIN_TX_FEE) {
+        console.log(
+          `  NO-GO: the losing joiner is out ${-joinerRoundTrip} lamports, not the ` +
+            `${JOIN_TX_FEE} of their join transaction fee — the reimbursement leg is short.`
+        );
         process.exitCode = 1;
       } else {
-        console.log("  GO: the losing joiner paid their stake and their tx fee, nothing else.");
+        console.log(
+          "  GO: the losing joiner paid their stake and their join tx fee, nothing else."
+        );
       }
     } else {
-      // A winning joiner is not reimbursed by design; they took the pot.
       console.log(
-        "  Joiner won, so they correctly bore their own ORAO costs — re-run until the host " +
-          "wins to exercise the reimbursement leg (it is a coin flip)."
+        "  Joiner won, so they correctly bore their own ORAO costs; the bond went back to the " +
+          "host. Re-run to exercise the reimbursement leg (it is a coin flip) — the refund " +
+          "check above already ran either way."
       );
     }
   } else {
