@@ -69,12 +69,24 @@ pub struct Game {
     /// Snapshot of config.refund_timeout_slots at join — this game's refund
     /// window is fixed when the joiner commits, immune to later config changes.
     pub refund_timeout_slots: u64,
+    /// Lamports the host posted into this account at create, on top of its
+    /// rent, to reimburse a losing host's counterparty: `2 * request_fee +
+    /// rent(fulfilled request)` at create-time prices. It is the ceiling on any
+    /// reimbursement, and whatever is left of it sweeps back to the host when
+    /// the game account closes.
+    pub bond_lamports: u64,
+    /// What joining cost the joiner in lamports and never comes back on its
+    /// own: ORAO's request fee plus the rent of the fulfilled-size request
+    /// account (ORAO refunds the rest of the pending rent to them at
+    /// fulfillment). A winning joiner bore it themselves; a losing joiner is
+    /// reimbursed out of the bond. 0 until the game is joined.
+    pub joiner_sunk_lamports: u64,
     pub _reserved: [u8; 22],
 }
 
 const_assert_eq!(
     Game::INIT_SPACE,
-    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 2 + 32 + 32 + 8 + 32 + 8 + 22
+    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 2 + 32 + 32 + 8 + 32 + 8 + 8 + 8 + 22
 );
 
 impl Game {
@@ -162,6 +174,8 @@ mod tests {
             joined_at_slot: 0,
             vrf_seed: [0; 32],
             refund_timeout_slots: 18_000,
+            bond_lamports: 3_844_400,
+            joiner_sunk_lamports: 2_844_400,
             _reserved: [0; 22],
         }
     }
@@ -196,6 +210,8 @@ mod tests {
             joined_at_slot: 123,
             vrf_seed: [9; 32],
             refund_timeout_slots: 20_000,
+            bond_lamports: 3_844_400,
+            joiner_sunk_lamports: 2_844_400,
             _reserved: [7; 22],
         };
         let bytes = game.try_to_vec().unwrap();
@@ -210,6 +226,9 @@ mod tests {
             &game.refund_timeout_slots.to_le_bytes(),
             "refund_timeout_slots moved; the reserved tail must absorb layout changes"
         );
+        // The two lamport ledgers settlement pays out of, in order.
+        assert_eq!(&bytes[222..230], &game.bond_lamports.to_le_bytes());
+        assert_eq!(&bytes[230..238], &game.joiner_sunk_lamports.to_le_bytes());
     }
 
     #[test]

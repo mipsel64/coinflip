@@ -145,6 +145,7 @@ interface GameSettledEvent {
   outcome: number;
   pot: anchor.BN;
   fee: anchor.BN;
+  joinerReimbursed: anchor.BN;
 }
 
 /** Finds and decodes the GameSettled event emitted by transaction `signature`. */
@@ -247,7 +248,17 @@ async function main() {
   console.log("Minted stake tokens to both players.");
 
   // ---- create_game ----
+  // The host pays for everything the game needs before it is joinable: both
+  // rents, the treasury ATA for this mint (once per mint), and the winner-pays
+  // BOND — lamports parked in the game account so that a losing host can
+  // reimburse the joiner's ORAO costs. Unspent bond comes back to the host when
+  // the game account closes (cancel, refund, or a host win).
+  //
+  // `treasury`, `treasuryTokenAccount` and `networkState` are not passed: the
+  // IDL pins them (to the program's constant, that constant's ATA, and ORAO's
+  // config PDA), so anchor-ts resolves them itself.
   console.log();
+  const hostLamportsBefore = await connection.getBalance(host.publicKey);
   const createTx = await program.methods
     .createGame(0, STAKE_AMOUNT) // side = Heads
     .accounts({
@@ -261,6 +272,12 @@ async function main() {
     .signers([host, game])
     .rpc();
   console.log("create_game tx:", createTx);
+  const bondLamports = (await program.account.game.fetch(game.publicKey)).bondLamports;
+  console.log("Host bond posted into the game account:", bondLamports.toString(), "lamports");
+  console.log(
+    "Host's total create-time lamport outlay (rents + ATA + bond + fees):",
+    hostLamportsBefore - (await connection.getBalance(host.publicKey))
+  );
 
   // ---- join_game ----
   // Nonce 0 is the normal case. If someone front-runs the request account at
@@ -287,6 +304,7 @@ async function main() {
     TOKEN_PROGRAM_ID
   );
 
+  const joinerLamportsBefore = await connection.getBalance(joiner.publicKey);
   const joinTx = await program.methods
     .joinGame(NONCE, maxVrfFee)
     .accounts({
@@ -294,9 +312,9 @@ async function main() {
       game: game.publicKey,
       mint,
       joinerTokenAccount: joinerTokenAccount.address,
-      // `treasury` and `networkState` are not passed: the IDL pins them (to the
-      // program's constant and to ORAO's config PDA), so anchor-ts resolves
-      // them — and the treasury ATA derived from the former — itself.
+      // `networkState` is not passed: the IDL pins it to ORAO's config PDA, so
+      // anchor-ts resolves it itself. The join touches no treasury account at
+      // all — create_game made the ATA.
       oraoTreasury,
       request,
       tokenProgram: TOKEN_PROGRAM_ID,
@@ -307,9 +325,16 @@ async function main() {
   console.log("join_game tx:", joinTx);
   console.log("VRF request:", request.toBase58());
   console.log("ORAO request fee paid by the joiner:", networkStateAccount.config.requestFee.toString());
+  console.log(
+    "Joiner's join-time lamport outlay (fee + request rent + tx fee):",
+    joinerLamportsBefore - (await connection.getBalance(joiner.publicKey))
+  );
+  // Recorded by the program: what a LOSING joiner gets back out of the bond.
+  const joinerSunk = (await program.account.game.fetch(game.publicKey)).joinerSunkLamports;
+  console.log("...recorded as reimbursable if they lose:", joinerSunk.toString());
 
-  // treasuryTokenAccount is init_if_needed'd by join_game, so it's guaranteed
-  // to exist by now — this is our pre-settlement baseline for the fee delta.
+  // treasuryTokenAccount was created by create_game, so it's guaranteed to
+  // exist by now — this is our pre-settlement baseline for the fee delta.
   const treasuryBalanceBefore = await connection.getTokenAccountBalance(treasuryTokenAccount);
 
   // ---- poll for fulfillment (what the crank does) ----
@@ -351,12 +376,15 @@ async function main() {
   console.log("  outcome:", randomness[0] % 2 === 0 ? "Heads" : "Tails");
 
   // ---- settle (the crank's transaction) ----
+  const joinerLamportsBeforeSettle = await connection.getBalance(joiner.publicKey);
   const settleTx = await program.methods
     .settle()
     .accounts({
       cranker: provider.wallet.publicKey,
       game: gamePda,
       host: host.publicKey,
+      // The joiner's wallet: the reimbursement target when the host wins.
+      joiner: joiner.publicKey,
       hostTokenAccount: hostTokenAccount.address,
       joinerTokenAccount: joinerTokenAccount.address,
       treasuryTokenAccount,
@@ -384,7 +412,15 @@ async function main() {
       outcome: event.outcome === 0 ? "Heads" : "Tails",
       pot: event.pot.toString(),
       fee: event.fee.toString(),
+      joinerReimbursed: event.joinerReimbursed.toString(),
     });
+    // The loser pays their stake and nothing else: if the host won, the bond
+    // just refunded the joiner's ORAO costs; if the joiner won, they kept the
+    // pot and bore those costs themselves.
+    console.log(
+      "Joiner's lamport delta across settle:",
+      (await connection.getBalance(joiner.publicKey)) - joinerLamportsBeforeSettle
+    );
   } else {
     console.log("Could not decode a GameSettled event from the settle transaction.");
     // The event is the verifiable proof this smoke test exists to produce —

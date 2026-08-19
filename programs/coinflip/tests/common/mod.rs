@@ -47,6 +47,28 @@ pub const DEFAULT_TIMEOUT_SLOTS: u64 = 1_500;
 /// What ORAO's `RequestV2` allocates for a pending request account, and thus
 /// the rent the joiner pays: `8 + RandomnessV2::PENDING_SIZE`.
 pub const PENDING_REQUEST_LEN: usize = 8 + RandomnessV2::PENDING_SIZE;
+/// What ORAO shrinks that account to at fulfillment (`8 +
+/// RandomnessV2::FULFILLED_SIZE`, 137 bytes): its rent is the part the joiner
+/// never gets back, so it is what `create_game` bonds and `join_game` records.
+pub const FULFILLED_REQUEST_LEN: usize = 8 + RandomnessV2::FULFILLED_SIZE;
+
+/// Rent for a fulfilled-size request account — the program's own
+/// `fulfilled_request_rent()`, computed against this SVM's rent parameters.
+pub fn fulfilled_request_rent(svm: &LiteSVM) -> u64 {
+    svm.minimum_balance_for_rent_exemption(FULFILLED_REQUEST_LEN)
+}
+
+/// What `create_game` bonds into the game account at the crafted `REQUEST_FEE`:
+/// `2 * request_fee + rent(fulfilled request)`.
+pub fn expected_bond(svm: &LiteSVM) -> u64 {
+    REQUEST_FEE * 2 + fulfilled_request_rent(svm)
+}
+
+/// What `join_game` records as the joiner's unrecoverable outlay at a given
+/// ORAO fee: `request_fee + rent(fulfilled request)`.
+pub fn expected_joiner_sunk(svm: &LiteSVM, request_fee: u64) -> u64 {
+    request_fee + fulfilled_request_rent(svm)
+}
 
 pub fn config_pda() -> Pubkey {
     Pubkey::find_program_address(&[CONFIG_SEED], &coinflip::ID).0
@@ -248,9 +270,10 @@ pub fn program_data_address(program_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[program_id.as_ref()], &bpf_loader_upgradeable::ID).0
 }
 
-/// Boots an SVM with coinflip + ORAO loaded and a funded payer. That payer is
-/// also coinflip's upgrade authority, so `ix_initialize_config(payer, ..)`
-/// clears the deployer gate.
+/// Boots an SVM with coinflip + ORAO loaded (program AND crafted
+/// `NetworkState`, which `create_game` reads to size the host's bond) and a
+/// funded payer. That payer is also coinflip's upgrade authority, so
+/// `ix_initialize_config(payer, ..)` clears the deployer gate.
 pub fn setup() -> (LiteSVM, Keypair) {
     let mut svm = LiteSVM::new();
     let so_path = coinflip_so_path();
@@ -266,6 +289,7 @@ pub fn setup() -> (LiteSVM, Keypair) {
     .expect("missing tests/fixtures/orao_vrf.so");
     svm.airdrop(&payer.pubkey(), 1_000 * LAMPORTS_PER_SOL)
         .unwrap();
+    setup_orao(&mut svm);
     (svm, payer)
 }
 
@@ -644,9 +668,24 @@ pub struct OraoEnv {
 }
 
 /// Hand-crafts ORAO's `NetworkState` — the one account the VRF program needs
-/// before it will accept a `RequestV2`. Plain VRF has no client registration,
-/// so there is nothing else to fabricate.
+/// before it will accept a `RequestV2`, and the one `create_game` reads to size
+/// the host's bond. Plain VRF has no client registration, so there is nothing
+/// else to fabricate.
+///
+/// Idempotent: `setup()` installs it, so a later call just hands back the env
+/// that is already in place (crafting a second one would move ORAO's treasury
+/// out from under the games already created against it).
 pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
+    let existing = svm.get_account(&network_state_account_address(&orao_solana_vrf::ID));
+    if let Some(account) = existing.filter(|a| !a.data.is_empty()) {
+        let network_state = NetworkState::try_deserialize(&mut &account.data[..])
+            .expect("crafted NetworkState must deserialize");
+        return OraoEnv {
+            network_state: network_state_account_address(&orao_solana_vrf::ID),
+            orao_treasury: network_state.config.treasury,
+        };
+    }
+
     let orao_treasury = Pubkey::new_unique();
     svm.airdrop(&orao_treasury, ORAO_TREASURY_START_LAMPORTS)
         .unwrap();
@@ -680,6 +719,25 @@ pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
         network_state: ns_addr,
         orao_treasury,
     }
+}
+
+/// Rewrites the crafted `NetworkState` with a new `request_fee`, the way ORAO's
+/// authority can raise its fee at any time — including between a create and the
+/// join it is bonded for.
+pub fn set_orao_request_fee(svm: &mut LiteSVM, orao: &OraoEnv, request_fee: u64) {
+    let account = svm
+        .get_account(&orao.network_state)
+        .expect("network state missing");
+    let mut network_state = NetworkState::try_deserialize(&mut &account.data[..]).unwrap();
+    network_state.config.request_fee = request_fee;
+    write_anchor_account(
+        svm,
+        orao.network_state,
+        orao_solana_vrf::ID,
+        &network_state,
+        0,
+        Some(account.data.len()),
+    );
 }
 
 /// Mirrors the program's VRF seed derivation (`join_game`): a hash of the
@@ -835,6 +893,17 @@ pub fn ix_create_game_with_program(
             mint,
             escrow: escrow_pda(&game),
             host_token_account,
+            treasury: treasury(),
+            treasury_token_account: get_associated_token_address_with_program_id(
+                &treasury(),
+                &mint,
+                &token_program,
+            ),
+            // A fixed PDA, so no OraoEnv is needed to build the instruction —
+            // but the account must EXIST (setup() crafts it), because
+            // create_game reads ORAO's fee to size the host's bond.
+            network_state: network_state_account_address(&orao_solana_vrf::ID),
+            associated_token_program: anchor_spl::associated_token::ID,
             token_program,
             system_program: system_program::ID,
             event_authority: event_authority(),
@@ -982,8 +1051,7 @@ pub fn ix_join_game(
 }
 
 /// Like `ix_join_game`, but lets the caller pick the token program (a
-/// Token-2022 game must be joined through `spl_token_2022::ID`, which also
-/// moves the treasury ATA to that program's derivation).
+/// Token-2022 game must be joined through `spl_token_2022::ID`).
 pub fn ix_join_game_with_program(
     f: &GameFixture,
     orao: &OraoEnv,
@@ -1032,8 +1100,6 @@ pub fn ix_join_game_full(
     nonce: u64,
     max_vrf_fee: u64,
 ) -> Instruction {
-    let treasury_token_account =
-        get_associated_token_address_with_program_id(&treasury(), &f.mint, &token_program);
     let request = request_pda(&vrf_seed_for(&f.game.pubkey(), &joiner, nonce));
     Instruction {
         program_id: coinflip::ID,
@@ -1044,13 +1110,10 @@ pub fn ix_join_game_full(
             mint: f.mint,
             escrow: f.escrow,
             joiner_token_account,
-            treasury: treasury(),
-            treasury_token_account,
             vrf: orao_solana_vrf::ID,
             network_state: orao.network_state,
             orao_treasury: orao.orao_treasury,
             request,
-            associated_token_program: anchor_spl::associated_token::ID,
             token_program,
             system_program: system_program::ID,
             event_authority: event_authority(),
@@ -1082,7 +1145,7 @@ pub fn setup_joined_game_with_fee(
     fee_bps: u16,
 ) -> (JoinedGame, TransactionMetadata) {
     let (fixture, _create_meta) = setup_open_game_with_fee(svm, payer, amount, fee_bps);
-    let orao = setup_orao(svm);
+    let orao = setup_orao(svm); // already installed by `setup()`; this reads it back
     let joiner = Keypair::new();
     svm.airdrop(&joiner.pubkey(), 10 * LAMPORTS_PER_SOL)
         .unwrap();
@@ -1167,6 +1230,7 @@ pub fn ix_settle_with_request(
             game: j.fixture.game.pubkey(),
             escrow: j.fixture.escrow,
             host: j.fixture.host.pubkey(),
+            joiner: j.joiner.pubkey(),
             host_token_account,
             joiner_token_account,
             treasury_token_account,

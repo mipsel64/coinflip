@@ -1,5 +1,6 @@
 mod common;
 
+use anchor_spl::associated_token::get_associated_token_address;
 use coinflip::state::{Game, GameState, Side};
 use common::*;
 use solana_sdk::signature::{Keypair, Signer};
@@ -64,6 +65,164 @@ fn create_game_escrows_the_stake() {
     assert_eq!(event.amount, fixture.amount);
     assert_eq!(event.host_side, u8::from(Side::Heads));
     assert_eq!(event.fee_bps, DEFAULT_FEE_BPS);
+}
+
+/// The host funds everything the game needs before anyone can join: the game
+/// account's own rent, the escrow's, the treasury ATA for this mint, and the
+/// reimbursement bond that sits in the game account above its rent.
+#[test]
+fn create_posts_the_bond_and_creates_the_treasury_ata() {
+    let (mut svm, payer) = setup();
+    send_ok(
+        &mut svm,
+        &[&payer],
+        &[ix_initialize_config(
+            payer.pubkey(),
+            payer.pubkey(),
+            DEFAULT_FEE_BPS,
+            DEFAULT_TIMEOUT_SLOTS,
+        )],
+    );
+    let host = Keypair::new();
+    svm.airdrop(&host.pubkey(), 10_000_000_000).unwrap();
+    let stake = 1_000;
+    let mint = create_mint(&mut svm, 9);
+    let host_ta = create_token_account(&mut svm, mint, host.pubkey(), stake * 10);
+    let game = Keypair::new();
+
+    let host_before = svm.get_account(&host.pubkey()).unwrap().lamports;
+    let ix = ix_create_game(host.pubkey(), game.pubkey(), mint, host_ta, 0, stake);
+    let meta = send_ok(&mut svm, &[&host, &game], std::slice::from_ref(&ix));
+
+    // The bond is `2 * request_fee + rent(fulfilled request)` at ORAO's fee as
+    // of create, recorded on the game and actually sitting in the account.
+    let bond = expected_bond(&svm);
+    let game_account = svm.get_account(&game.pubkey()).unwrap();
+    let game_rent = svm.minimum_balance_for_rent_exemption(game_account.data.len());
+    assert_eq!(read_game(&svm, &game.pubkey()).bond_lamports, bond);
+    assert_eq!(
+        read_game(&svm, &game.pubkey()).joiner_sunk_lamports,
+        0,
+        "nothing is sunk until someone joins"
+    );
+    assert_eq!(
+        game_account.lamports,
+        game_rent + bond,
+        "the bond sits in the game account, above its rent-exempt minimum"
+    );
+
+    // The treasury ATA is the host's cost too (they picked the mint), so no
+    // joiner and no cranker ever pays for it.
+    let treasury_ata = get_associated_token_address(&treasury(), &mint);
+    let treasury_ata_rent = svm
+        .get_account(&treasury_ata)
+        .expect("treasury ATA must exist after create")
+        .lamports;
+    assert_eq!(token_balance(&svm, &treasury_ata), 0);
+
+    // Everything the host spends in lamports: two rents, the ATA's rent, the
+    // bond, and the two-signature tx fee (host + the game keypair).
+    let escrow_rent = svm
+        .get_account(&escrow_pda(&game.pubkey()))
+        .unwrap()
+        .lamports;
+    let tx_fee = 2 * 5_000;
+    assert_eq!(
+        host_before - svm.get_account(&host.pubkey()).unwrap().lamports,
+        game_rent + bond + escrow_rent + treasury_ata_rent + tx_fee
+    );
+
+    // Budget guard: token transfer + escrow init + treasury-ATA init + the bond
+    // transfer + the event CPI (measured ~73.5k — the ATA init is most of it,
+    // and it is a no-op for every game after the first of a mint).
+    assert!(
+        meta.compute_units_consumed < 90_000,
+        "create used {} CU",
+        meta.compute_units_consumed
+    );
+}
+
+/// A second game on the same mint finds the treasury ATA already there:
+/// `init_if_needed` makes it a no-op, and that host pays only the bond.
+#[test]
+fn second_game_on_the_same_mint_pays_no_ata_rent() {
+    let (mut svm, payer) = setup();
+    let (f, _meta) = setup_open_game(&mut svm, &payer, 1_000);
+    let treasury_ata = get_associated_token_address(&treasury(), &f.mint);
+    let ata_lamports_before = svm.get_account(&treasury_ata).unwrap().lamports;
+
+    let host_b = Keypair::new();
+    svm.airdrop(&host_b.pubkey(), 10_000_000_000).unwrap();
+    let host_b_ta = create_token_account(&mut svm, f.mint, host_b.pubkey(), 10_000);
+    let game_b = Keypair::new();
+    let host_before = svm.get_account(&host_b.pubkey()).unwrap().lamports;
+    send_ok(
+        &mut svm,
+        &[&host_b, &game_b],
+        &[ix_create_game(
+            host_b.pubkey(),
+            game_b.pubkey(),
+            f.mint,
+            host_b_ta,
+            0,
+            1_000,
+        )],
+    );
+
+    assert_eq!(
+        svm.get_account(&treasury_ata).unwrap().lamports,
+        ata_lamports_before,
+        "the existing treasury ATA must not be re-funded"
+    );
+    let game_b_account = svm.get_account(&game_b.pubkey()).unwrap();
+    let escrow_rent = svm
+        .get_account(&escrow_pda(&game_b.pubkey()))
+        .unwrap()
+        .lamports;
+    let tx_fee = 2 * 5_000;
+    assert_eq!(
+        host_before - svm.get_account(&host_b.pubkey()).unwrap().lamports,
+        game_b_account.lamports + escrow_rent + tx_fee,
+        "the second host pays rents + bond, and nothing for the ATA"
+    );
+}
+
+/// The fee destination must be the treasury's canonical ATA — the address
+/// `settle` will pin — not any account the treasury happens to own.
+#[test]
+fn create_with_non_ata_treasury_account_fails() {
+    let (mut svm, payer) = setup();
+    send_ok(
+        &mut svm,
+        &[&payer],
+        &[ix_initialize_config(
+            payer.pubkey(),
+            payer.pubkey(),
+            DEFAULT_FEE_BPS,
+            DEFAULT_TIMEOUT_SLOTS,
+        )],
+    );
+    let host = Keypair::new();
+    svm.airdrop(&host.pubkey(), 10_000_000_000).unwrap();
+    let mint = create_mint(&mut svm, 9);
+    let host_ta = create_token_account(&mut svm, mint, host.pubkey(), 10_000);
+    // Treasury-owned and the right mint, but not at the ATA address.
+    let fake_treasury_ta = create_token_account(&mut svm, mint, treasury(), 0);
+
+    let game = Keypair::new();
+    let mut ix = ix_create_game(host.pubkey(), game.pubkey(), mint, host_ta, 0, 1_000);
+    let ata_slot = ix
+        .accounts
+        .iter()
+        .position(|meta| meta.pubkey == get_associated_token_address(&treasury(), &mint))
+        .expect("treasury ATA slot");
+    ix.accounts[ata_slot].pubkey = fake_treasury_ta;
+
+    // Anchor's associated-token address constraint (error code 3014).
+    assert_anchor_error(
+        send(&mut svm, &[&host, &game], &[ix]),
+        anchor_lang::error::ErrorCode::AccountNotAssociatedTokenAccount,
+    );
 }
 
 #[test]
@@ -294,7 +453,10 @@ fn cancel_refunds_host_and_closes_accounts() {
 
     let host_lamports_before = svm.get_account(&f.host.pubkey()).unwrap().lamports;
     let escrow_rent = svm.get_account(&f.escrow).unwrap().lamports;
-    let game_rent = svm.get_account(&f.game.pubkey()).unwrap().lamports;
+    let game_account = svm.get_account(&f.game.pubkey()).unwrap();
+    let game_rent = svm.minimum_balance_for_rent_exemption(game_account.data.len());
+    let bond = expected_bond(&svm);
+    assert_eq!(game_account.lamports, game_rent + bond);
 
     let ix = ix_cancel_game(&f);
     let meta = send_ok(&mut svm, &[&f.host], std::slice::from_ref(&ix));
@@ -308,12 +470,13 @@ fn cancel_refunds_host_and_closes_accounts() {
         .get_account(&f.game.pubkey())
         .is_none_or(|a| a.lamports == 0));
 
-    // Escrow + game rent land in the host's wallet, minus the one-signer tx fee.
+    // Escrow + game rent + the whole unspent bond land in the host's wallet,
+    // minus the one-signer tx fee: nobody joined, so nothing was owed.
     let host_lamports_after = svm.get_account(&f.host.pubkey()).unwrap().lamports;
     let tx_fee = 5_000;
     assert_eq!(
         host_lamports_after - host_lamports_before,
-        escrow_rent + game_rent - tx_fee
+        escrow_rent + game_rent + bond - tx_fee
     );
 
     let ev = find_cpi_event::<coinflip::events::GameCancelled>(

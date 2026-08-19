@@ -184,8 +184,22 @@ cli
     console.log("Returned to the joiner on fulfillment:", pendingRent - fulfilledRent, "lamports");
     console.log("Our refund_timeout_slots:", config.refundTimeoutSlots.toString());
     console.log(
-      "Joiner's join-time lamport outlay (excl. tx fee and first-of-mint treasury ATA rent):",
+      "Joiner's join-time lamport outlay (excl. tx fee):",
       networkState.config.requestFee.addn(pendingRent).toString()
+    );
+    // What a losing joiner gets back out of the host's bond: the fee ORAO keeps
+    // plus the rent of the fulfilled-size request account. The rest of the
+    // pending rent comes back from ORAO itself at fulfillment.
+    console.log(
+      "...of which a LOSING joiner is reimbursed by the host:",
+      networkState.config.requestFee.addn(fulfilledRent).toString()
+    );
+    // create_game sizes the bond off this same fee, so a host creating a game
+    // right now parks this much in the game account (returned in full unless
+    // they win, and never more than this even if ORAO's fee is raised later).
+    console.log(
+      "Host's bond at create (2 * request_fee + fulfilled rent):",
+      networkState.config.requestFee.muln(2).addn(fulfilledRent).toString()
     );
 
     // The floor is a program constant, so this can only trip if the deployed
@@ -230,6 +244,7 @@ cli
 
     // Must pass the mint's actual owning token program: a Token-2022 game's
     // treasury ATA lives at a different address than the classic-SPL one.
+    // `create_game` already created this account, so settle never pays rent.
     const treasuryTokenAccount = getAssociatedTokenAddressSync(
       game.tokenMint,
       TREASURY,
@@ -259,6 +274,9 @@ cli
         cranker: p.wallet.publicKey,
         game: gamePubkey,
         host: game.host,
+        // The joiner's WALLET, not a token account: if the host wins, the
+        // joiner's join-time lamports are reimbursed to it out of the bond.
+        joiner: game.joiner,
         hostTokenAccount,
         joinerTokenAccount,
         treasuryTokenAccount,

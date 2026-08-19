@@ -20,8 +20,9 @@ All notable changes to this project are documented in this file, in the
     and IDs only, never logic) — e2e builds use it, deployments must not, and
     a build script warns loudly whenever it is on.
   - `create_game` / `cancel_game`: host opens a game against any accepted
-    SPL/Token-2022 mint, escrowing the stake; cancellable before a joiner
-    arrives.
+    SPL/Token-2022 mint, escrowing the stake, creating the treasury's ATA for
+    that mint, and posting the winner-pays bond; cancellable before a joiner
+    arrives (which returns rent and bond in full).
   - `join_game(nonce, max_vrf_fee)`: joiner matches the stake and CPIs ORAO
     VRF's `request_v2` as ORAO's own payer — the VRF fee and the request
     account's rent come straight out of the joiner's wallet, so the program
@@ -29,7 +30,8 @@ All notable changes to this project are documented in this file, in the
     (retry knob for a front-run request address); `max_vrf_fee` bounds what
     ORAO may charge.
   - `settle`: permissionless settlement once ORAO has fulfilled the request.
-    Sent by the crank in practice; anyone can send it.
+    Sent by the crank in practice; anyone can send it. Also pays the losing
+    joiner's reimbursement out of the host's bond.
   - `refund_timeout`: permissionless backstop returning both stakes if
     randomness is never fulfilled within the timeout.
   - Deny-by-default mint validation (rejects transfer-fee, transfer-hook,
@@ -78,6 +80,31 @@ All notable changes to this project are documented in this file, in the
     `settle`/`refund_timeout` dropped the `config` account neither of them
     reads — one account and ~8k CU less in every crank transaction.
   - New error `VrfFeeTooHigh` (6016).
+- **Winner-pays incidentals: the loser now pays their stake and nothing else**
+  (also pre-release, nothing deployed):
+  - `create_game` posts a **bond** into the game account —
+    `2 * ORAO request_fee + rent(fulfilled request)`, ~0.00284 SOL at today's
+    fee — recorded as `Game.bond_lamports`. It reads ORAO's `network_state`
+    (read-only) to size it.
+  - `join_game` records `Game.joiner_sunk_lamports` (`request_fee +
+    rent(fulfilled request)`): what the join costs the joiner that neither
+    ORAO's own fulfillment refund nor anything else returns.
+  - `settle` reimburses `min(joiner_sunk, bond)` from the game account to the
+    joiner's wallet **when the host wins**, and takes the joiner's wallet as a
+    new account (`joiner`, pinned to `game.joiner`) to do it. When the joiner
+    wins they keep the pot and their own costs, and the whole bond sweeps back
+    to the host. `cancel_game` and `refund_timeout` return the bond in full.
+  - `GameSettled` gains a trailing `joiner_reimbursed: u64`.
+  - **The treasury ATA moved from `join_game` to `create_game`**, payer joiner
+    → host: `join_game` drops `treasury`, `treasury_token_account`, and
+    `associated_token_program` (three accounts, ~76k → ~48k CU); `create_game`
+    gains those three plus `network_state` (~73.5k CU, mostly the one-per-mint
+    ATA init). `settle` is ~41.3k CU.
+  - `Game` grows two `u64`s: `INIT_SPACE` 244 → 260 bytes, `_reserved` still
+    `[u8; 22]`.
+  - Under-bonded edge (ORAO raises its fee between create and join): the
+    reimbursement caps at the bond, no join is rejected, and both figures are
+    public on the open game so a frontend can show the guaranteed amount.
 
 ### Notes for integrators
 
@@ -89,7 +116,7 @@ All notable changes to this project are documented in this file, in the
   `findGameSettledEvent` for a working reference).
 - There is no `config.treasury` field: read the fee destination from the IDL's
   `TREASURY` constant (or let anchor-ts resolve the `treasury` account for
-  `join_game`, which the IDL pins by address). Fees only ever go to that key's
+  `create_game`, which the IDL pins by address). Fees only ever go to that key's
   canonical ATA for the bet mint — Token-2022 games must pass `tokenProgram`
   explicitly so the client derives the same address the program does. See the
   README's "Downstream contract".
@@ -100,5 +127,8 @@ All notable changes to this project are documented in this file, in the
 - Both players' payout token accounts are recorded at create/join; `settle`
   and `refund_timeout` accept the recorded account **or** the player's
   canonical ATA, so a closed account never strands funds.
+- Crank authors: `settle` now needs the joiner's **wallet** (`game.joiner`)
+  alongside their token account — it is where the bond reimbursement lands.
+  `refund_timeout` is unchanged.
 - Error codes (`errors.rs`) and event layouts (`events.rs`) are append-only
   ABI from this point forward.

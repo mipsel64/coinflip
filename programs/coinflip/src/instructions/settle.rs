@@ -30,6 +30,10 @@ pub struct Settle<'info> {
     /// CHECK: rent receiver, must be the game's host.
     #[account(mut, address = game.host @ CoinflipError::OwnerMismatch)]
     pub host: AccountInfo<'info>,
+    /// CHECK: reimbursement target, must be the game's joiner — the wallet that
+    /// paid ORAO at join, not a token account.
+    #[account(mut, address = game.joiner @ CoinflipError::OwnerMismatch)]
+    pub joiner: AccountInfo<'info>,
     /// Any host-owned account of the game mint (liveness: recorded one may be closed).
     #[account(
         mut,
@@ -44,8 +48,9 @@ pub struct Settle<'info> {
         constraint = joiner_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
     )]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// The constant treasury's canonical ATA for this mint — the one `join_game`
-    /// guaranteed exists. Pinned by derivation, not merely by owner: a cranker
+    /// The constant treasury's canonical ATA for this mint — the one
+    /// `create_game` guaranteed exists. Pinned by derivation, not merely by
+    /// owner: a cranker
     /// picks this account, and scattering fees across other treasury-owned
     /// accounts would make collection a manual hunt.
     #[account(
@@ -91,6 +96,42 @@ pub(crate) fn handle(ctx: Context<Settle>) -> Result<()> {
         &randomness,
     )?;
 
+    // The loser pays their stake and nothing else. When the HOST wins, the
+    // joiner's join-time lamport costs come back out of the bond the host
+    // posted at create; capped at that bond, which is all this game ever
+    // promised (a fee raise between create and join can leave the joiner
+    // short — the bond is public before anyone joins).
+    //
+    // A winning joiner is not reimbursed: they bore their own costs, which is
+    // what "the loser pays only their stake" means from the other side.
+    //
+    // Done by lamport arithmetic, not a system CPI: the game account is
+    // program-owned, so a transfer out of it can only be a direct debit — and
+    // it must happen here, in the handler, because `close = host` sweeps
+    // whatever is left after this instruction returns.
+    let mut joiner_reimbursed = 0u64;
+    if outcome.winner == ctx.accounts.game.host {
+        let game = &ctx.accounts.game;
+        joiner_reimbursed = game.joiner_sunk_lamports.min(game.bond_lamports);
+        if joiner_reimbursed > 0 {
+            let game_info = game.to_account_info();
+            // Cannot underflow (the bond sits above the account's rent) or
+            // overflow, but this is a value path: checked, one borrow at a time.
+            let debited = game_info
+                .lamports()
+                .checked_sub(joiner_reimbursed)
+                .ok_or(CoinflipError::NumericalOverflow)?;
+            **game_info.try_borrow_mut_lamports()? = debited;
+            let credited = ctx
+                .accounts
+                .joiner
+                .lamports()
+                .checked_add(joiner_reimbursed)
+                .ok_or(CoinflipError::NumericalOverflow)?;
+            **ctx.accounts.joiner.try_borrow_mut_lamports()? = credited;
+        }
+    }
+
     emit_cpi!(GameSettled {
         game: ctx.accounts.game.key(),
         winner: outcome.winner,
@@ -98,6 +139,7 @@ pub(crate) fn handle(ctx: Context<Settle>) -> Result<()> {
         outcome: outcome.outcome,
         pot: outcome.pot,
         fee: outcome.fee,
+        joiner_reimbursed,
     });
     Ok(())
 }

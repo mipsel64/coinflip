@@ -37,10 +37,17 @@ fn settle_pays_host_when_host_side_wins() {
     let game_key = j.fixture.game.pubkey();
     let host = j.fixture.host.pubkey();
     // Both rents belong to the host; the settle payer is a third party, so the
-    // host's lamport delta is exactly game rent + escrow rent.
-    let game_rent = svm.get_account(&game_key).unwrap().lamports;
+    // host's lamport delta is game rent + escrow rent + whatever is left of the
+    // bond after the losing host reimburses the joiner.
+    let game_account = svm.get_account(&game_key).unwrap();
+    let game_rent = svm.minimum_balance_for_rent_exemption(game_account.data.len());
+    let bond = expected_bond(&svm);
+    let sunk = expected_joiner_sunk(&svm, REQUEST_FEE);
+    assert_eq!(game_account.lamports, game_rent + bond);
+    assert_eq!(read_game(&svm, &game_key).joiner_sunk_lamports, sunk);
     let escrow_rent = svm.get_account(&j.fixture.escrow).unwrap().lamports;
     let host_lamports_before = svm.get_account(&host).unwrap().lamports;
+    let joiner_lamports_before = svm.get_account(&j.joiner.pubkey()).unwrap().lamports;
 
     let ix = ix_settle(&j, payer.pubkey());
     let meta = send_ok(&mut svm, &[&payer], std::slice::from_ref(&ix));
@@ -54,15 +61,23 @@ fn settle_pays_host_when_host_side_wins() {
     assert_eq!(token_balance(&svm, &j.treasury_token_account), FEE);
     assert!(is_gone(&svm, &j.fixture.escrow), "escrow must be closed");
     assert!(is_gone(&svm, &game_key), "game must be closed");
+    // The losing joiner is out their stake and NOTHING else: every lamport the
+    // join cost them comes back from the winning host's bond. They are not a
+    // signer here, so there is no tx fee to net out either.
+    assert_eq!(
+        svm.get_account(&j.joiner.pubkey()).unwrap().lamports - joiner_lamports_before,
+        sunk,
+        "the losing joiner must be made whole on their join-time lamports"
+    );
     assert_eq!(
         svm.get_account(&host).unwrap().lamports,
-        host_lamports_before + game_rent + escrow_rent,
-        "both rents must return to the host"
+        host_lamports_before + game_rent + escrow_rent + bond - sunk,
+        "the host recovers both rents plus what is left of the bond"
     );
 
     // Budget guard: the request PDA derivation + two transfers + a close + the
-    // event CPI (measured ~39k with both payout accounts recorded; the
-    // ATA-fallback path derives two more).
+    // reimbursement + the event CPI (measured ~41k with both payout accounts
+    // recorded; the ATA-fallback path derives two more).
     assert!(
         meta.compute_units_consumed < 60_000,
         "settle used {} CU",
@@ -82,6 +97,7 @@ fn settle_pays_host_when_host_side_wins() {
     assert_eq!(ev.outcome, u8::from(coinflip::state::Side::Heads));
     assert_eq!(ev.pot, POT);
     assert_eq!(ev.fee, FEE);
+    assert_eq!(ev.joiner_reimbursed, sunk);
 }
 
 #[test]
@@ -90,6 +106,15 @@ fn settle_pays_joiner_when_host_side_loses() {
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
     // randomness[0] odd => Tails => joiner (host picked Heads) wins.
     write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(3));
+
+    let game_key = j.fixture.game.pubkey();
+    let host = j.fixture.host.pubkey();
+    let game_account = svm.get_account(&game_key).unwrap();
+    let game_rent = svm.minimum_balance_for_rent_exemption(game_account.data.len());
+    let bond = expected_bond(&svm);
+    let escrow_rent = svm.get_account(&j.fixture.escrow).unwrap().lamports;
+    let host_lamports_before = svm.get_account(&host).unwrap().lamports;
+    let joiner_lamports_before = svm.get_account(&j.joiner.pubkey()).unwrap().lamports;
 
     let ix = ix_settle(&j, payer.pubkey());
     let meta = send_ok(&mut svm, &[&payer], std::slice::from_ref(&ix));
@@ -104,6 +129,20 @@ fn settle_pays_joiner_when_host_side_loses() {
     );
     assert_eq!(token_balance(&svm, &j.treasury_token_account), FEE);
 
+    // The winning joiner bore their own join-time costs — that is the other
+    // half of "the loser pays only their stake" — so the whole bond goes home
+    // with the losing host, who is out nothing but the stake.
+    assert_eq!(
+        svm.get_account(&j.joiner.pubkey()).unwrap().lamports,
+        joiner_lamports_before,
+        "a winning joiner is never reimbursed"
+    );
+    assert_eq!(
+        svm.get_account(&host).unwrap().lamports,
+        host_lamports_before + game_rent + escrow_rent + bond,
+        "the full bond returns to the host"
+    );
+
     let ev = find_cpi_event::<coinflip::events::GameSettled>(
         std::slice::from_ref(&ix),
         &payer.pubkey(),
@@ -113,6 +152,82 @@ fn settle_pays_joiner_when_host_side_loses() {
     .expect("GameSettled not emitted");
     assert_eq!(ev.winner, j.joiner.pubkey());
     assert_eq!(ev.outcome, u8::from(coinflip::state::Side::Tails));
+    assert_eq!(ev.joiner_reimbursed, 0);
+}
+
+/// The bond is sized from ORAO's fee at CREATE time. If that fee is raised
+/// before the join, the joiner sinks more than the bond covers — the
+/// reimbursement then caps at the bond rather than eating into the rents (which
+/// would leave the game account short of what `close` owes the host).
+#[test]
+fn under_bonded_game_reimburses_up_to_the_bond() {
+    let (mut svm, payer) = setup();
+    let (f, _create_meta) = setup_open_game(&mut svm, &payer, STAKE);
+    let bond = expected_bond(&svm);
+    assert_eq!(read_game(&svm, &f.game.pubkey()).bond_lamports, bond);
+
+    // ORAO's authority raises the fee after the game was bonded.
+    let orao = setup_orao(&mut svm);
+    let raised_fee = REQUEST_FEE * 5;
+    set_orao_request_fee(&mut svm, &orao, raised_fee);
+
+    let joiner = Keypair::new();
+    svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
+    let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), STAKE * 10);
+    send_ok(
+        &mut svm,
+        &[&joiner],
+        &[ix_join_game(&f, &orao, joiner.pubkey(), joiner_ta)],
+    );
+
+    let vrf_seed = vrf_seed_for(&f.game.pubkey(), &joiner.pubkey(), 0);
+    let sunk = expected_joiner_sunk(&svm, raised_fee);
+    assert_eq!(read_game(&svm, &f.game.pubkey()).joiner_sunk_lamports, sunk);
+    assert!(sunk > bond, "this game must actually be under-bonded");
+
+    let treasury_token_account = get_associated_token_address(&treasury(), &f.mint);
+    let j = JoinedGame {
+        fixture: f,
+        joiner,
+        joiner_token_account: joiner_ta,
+        treasury_token_account,
+        orao,
+        request: request_pda(&vrf_seed),
+        vrf_seed,
+    };
+    // randomness[0] even => Heads => the host (who picked Heads) wins.
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(2));
+
+    let game_key = j.fixture.game.pubkey();
+    let host = j.fixture.host.pubkey();
+    let game_rent =
+        svm.minimum_balance_for_rent_exemption(svm.get_account(&game_key).unwrap().data.len());
+    let escrow_rent = svm.get_account(&j.fixture.escrow).unwrap().lamports;
+    let host_lamports_before = svm.get_account(&host).unwrap().lamports;
+    let joiner_lamports_before = svm.get_account(&j.joiner.pubkey()).unwrap().lamports;
+
+    let ix = ix_settle(&j, payer.pubkey());
+    let meta = send_ok(&mut svm, &[&payer], std::slice::from_ref(&ix));
+
+    assert_eq!(
+        svm.get_account(&j.joiner.pubkey()).unwrap().lamports - joiner_lamports_before,
+        bond,
+        "reimbursement caps at the bond, not at what the joiner actually sank"
+    );
+    assert_eq!(
+        svm.get_account(&host).unwrap().lamports,
+        host_lamports_before + game_rent + escrow_rent,
+        "the whole bond is spent; the rents are untouched"
+    );
+
+    let ev = find_cpi_event::<coinflip::events::GameSettled>(
+        std::slice::from_ref(&ix),
+        &payer.pubkey(),
+        &coinflip::ID,
+        &meta,
+    )
+    .expect("GameSettled not emitted");
+    assert_eq!(ev.joiner_reimbursed, bond);
 }
 
 #[test]

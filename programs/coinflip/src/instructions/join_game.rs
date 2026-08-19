@@ -1,8 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::{
-    associated_token::AssociatedToken,
-    token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked},
-};
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 use orao_solana_vrf::{cpi as orao_cpi, program::OraoVrf, state::NetworkState};
 
 use crate::{
@@ -33,19 +30,6 @@ pub struct JoinGame<'info> {
         constraint = joiner_token_account.owner == joiner.key() @ CoinflipError::OwnerMismatch,
     )]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// CHECK: the compile-time fee-destination authority.
-    #[account(address = crate::treasury::ID @ CoinflipError::OwnerMismatch)]
-    pub treasury: AccountInfo<'info>,
-    /// Created here so settlement never has to: a cranker's transaction should
-    /// not be the one paying rent for the protocol's fee account.
-    #[account(
-        init_if_needed,
-        payer = joiner,
-        associated_token::mint = mint,
-        associated_token::authority = treasury,
-        associated_token::token_program = token_program,
-    )]
-    pub treasury_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     pub vrf: Program<'info, OraoVrf>,
     #[account(
         mut,
@@ -65,7 +49,6 @@ pub struct JoinGame<'info> {
     /// what the hash and the nonce each defend against.
     #[account(mut)]
     pub request: AccountInfo<'info>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
     #[account(
         constraint = token_program.key() == *mint.to_account_info().owner
             @ CoinflipError::MintMismatch,
@@ -82,6 +65,7 @@ pub struct JoinGame<'info> {
 ///   any time, and the joiner pays it directly, so the joiner — not this
 ///   program — states their limit.
 pub(crate) fn handle(ctx: Context<JoinGame>, nonce: u64, max_vrf_fee: u64) -> Result<()> {
+    let request_fee = ctx.accounts.network_state.config.request_fee;
     ctx.accounts.game.require_state(GameState::Open)?;
     require!(
         ctx.accounts.joiner.key() != ctx.accounts.game.host,
@@ -90,10 +74,7 @@ pub(crate) fn handle(ctx: Context<JoinGame>, nonce: u64, max_vrf_fee: u64) -> Re
     // Fee cap up front with the other entry guards: reject before any
     // transfer so the failure path does no work and reads like the rest of
     // the codebase's checks-effects-interactions ordering.
-    require!(
-        ctx.accounts.network_state.config.request_fee <= max_vrf_fee,
-        CoinflipError::VrfFeeTooHigh
-    );
+    require!(request_fee <= max_vrf_fee, CoinflipError::VrfFeeTooHigh);
 
     let game_key = ctx.accounts.game.key();
 
@@ -158,6 +139,13 @@ pub(crate) fn handle(ctx: Context<JoinGame>, nonce: u64, max_vrf_fee: u64) -> Re
     // Snapshotted, not read live at refund time: a later config change must not
     // retro-shrink this game's settle window.
     game.refund_timeout_slots = ctx.accounts.config.refund_timeout_slots;
+    // What this join just cost the joiner and never comes back on its own: the
+    // fee ORAO keeps, plus the rent of the request account at its fulfilled
+    // size (ORAO returns the rest of the rent to them when it fulfills). A
+    // losing host reimburses exactly this out of the bond; see `settle`.
+    game.joiner_sunk_lamports = request_fee
+        .checked_add(super::fulfilled_request_rent()?)
+        .ok_or(CoinflipError::NumericalOverflow)?;
     game.state = GameState::AwaitingRandomness.into();
 
     emit_cpi!(GameJoined {

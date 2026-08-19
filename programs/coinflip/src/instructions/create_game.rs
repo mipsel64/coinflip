@@ -1,11 +1,16 @@
-use anchor_lang::prelude::*;
+use anchor_lang::{
+    prelude::*,
+    system_program::{self, Transfer},
+};
 use anchor_spl::{
+    associated_token::AssociatedToken,
     token_2022::spl_token_2022::{
         self,
         extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions},
     },
     token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked},
 };
+use orao_solana_vrf::state::NetworkState;
 
 use crate::{
     constants::{CONFIG_SEED, ESCROW_SEED},
@@ -42,6 +47,30 @@ pub struct CreateGame<'info> {
         constraint = host_token_account.owner == host.key() @ CoinflipError::OwnerMismatch,
     )]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: the compile-time fee-destination authority.
+    #[account(address = crate::treasury::ID @ CoinflipError::OwnerMismatch)]
+    pub treasury: AccountInfo<'info>,
+    /// Created here, by the host, so neither the joiner nor a cranker ever pays
+    /// rent for the protocol's fee account. The host picked the mint, so the
+    /// per-mint cost is theirs; it is a no-op for every game after the first of
+    /// a given mint.
+    #[account(
+        init_if_needed,
+        payer = host,
+        associated_token::mint = mint,
+        associated_token::authority = treasury,
+        associated_token::token_program = token_program,
+    )]
+    pub treasury_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// Read-only: ORAO's live `request_fee` sizes the host's bond (see the
+    /// handler). Nothing is paid to ORAO here — the joiner does that at join.
+    #[account(
+        seeds = [orao_solana_vrf::CONFIG_ACCOUNT_SEED],
+        seeds::program = orao_solana_vrf::ID,
+        bump,
+    )]
+    pub network_state: Box<Account<'info, NetworkState>>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
@@ -106,6 +135,38 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
         ctx.accounts.mint.decimals,
     )?;
 
+    // The winner-pays bond: lamports the host parks in the game account, above
+    // its rent, so that a LOSING host can reimburse the joiner's join-time
+    // costs (the loser must be out only their stake). It is sized here, at
+    // create, from ORAO's live fee — 2x it, plus the rent the joiner sinks into
+    // the request account — so it still covers a joiner who joins after a
+    // moderate fee raise. Beyond that the reimbursement caps at the bond
+    // (`settle`), which is why the bond is stored where a frontend can read it
+    // before anyone joins. Whatever is not paid out returns to the host when
+    // the game account closes — in full on cancel, on refund, and on a joiner
+    // win; the remainder after the reimbursement when the host wins.
+    let bond = ctx
+        .accounts
+        .network_state
+        .config
+        .request_fee
+        .checked_mul(2)
+        .ok_or(CoinflipError::NumericalOverflow)?
+        .checked_add(super::fulfilled_request_rent()?)
+        .ok_or(CoinflipError::NumericalOverflow)?;
+    // Safe to fund now, not before: `init` runs pre-handler, so the game
+    // account exists and is already rent-exempt for its own data.
+    system_program::transfer(
+        CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.host.to_account_info(),
+                to: ctx.accounts.game.to_account_info(),
+            },
+        ),
+        bond,
+    )?;
+
     let game = &mut ctx.accounts.game;
     game.version = Game::LAYOUT_VERSION;
     game.state = GameState::Open.into();
@@ -123,6 +184,9 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
     // Snapshotted at join, not here: the refund window starts when the joiner
     // commits, under whatever timeout was configured then.
     game.refund_timeout_slots = 0;
+    game.bond_lamports = bond;
+    // Recorded at join, once there is a joiner with costs to reimburse.
+    game.joiner_sunk_lamports = 0;
     game._reserved = [0; 22];
 
     emit_cpi!(GameCreated {

@@ -48,6 +48,18 @@ fn join_escrows_stake_and_creates_vrf_request() {
     assert_eq!(game.vrf_seed, vrf_seed);
     // The refund deadline is fixed here, from live config, and never re-read.
     assert_eq!(game.refund_timeout_slots, DEFAULT_TIMEOUT_SLOTS);
+    // What the join cost the joiner and never comes back on its own — the fee
+    // plus the fulfilled-size rent, i.e. everything except the pending-rent
+    // surplus ORAO refunds at fulfillment. A losing host reimburses it.
+    assert_eq!(
+        game.joiner_sunk_lamports,
+        expected_joiner_sunk(&svm, REQUEST_FEE)
+    );
+    assert_eq!(
+        game.bond_lamports,
+        expected_bond(&svm),
+        "the host's bond is untouched by the join"
+    );
 
     // The real ORAO program created the request account, rent-funded, at the
     // address derived from the hashed seed.
@@ -76,27 +88,29 @@ fn join_escrows_stake_and_creates_vrf_request() {
         ORAO_TREASURY_START_LAMPORTS + REQUEST_FEE
     );
 
-    // The treasury ATA exists ahead of settlement, so no cranker ever pays for it.
+    // The treasury ATA was already there before this join: the HOST pays that
+    // per-mint rent at create, so neither the joiner nor a cranker ever does.
     let treasury_ata = get_associated_token_address(&treasury(), &f.mint);
-    let treasury_ata_rent = svm
-        .get_account(&treasury_ata)
-        .expect("treasury ATA must exist")
-        .lamports;
+    assert!(
+        svm.get_account(&treasury_ata).is_some(),
+        "treasury ATA must already exist, created at create_game"
+    );
     assert_eq!(token_balance(&svm, &treasury_ata), 0);
 
     // Everything the joiner spends in lamports (i.e. stake aside): ORAO's
-    // request fee, the request account's rent, the treasury ATA's rent it
-    // pre-pays, and the one-signature tx fee.
+    // request fee, the request account's rent, and the one-signature tx fee.
+    // Nothing else — no treasury ATA rent, no bond.
     let tx_fee = 5_000;
     assert_eq!(
         joiner_before - svm.get_account(&joiner.pubkey()).unwrap().lamports,
-        REQUEST_FEE + request_rent + treasury_ata_rent + tx_fee
+        REQUEST_FEE + request_rent + tx_fee
     );
 
-    // Budget guard: token transfer + ATA init + the ORAO CPI must stay well
-    // inside one transaction's compute budget (measured ~75k).
+    // Budget guard: token transfer + the ORAO CPI must stay well inside one
+    // transaction's compute budget (measured ~48k, down from ~76k when the
+    // join still created the treasury ATA).
     assert!(
-        meta.compute_units_consumed < 100_000,
+        meta.compute_units_consumed < 70_000,
         "join used {} CU",
         meta.compute_units_consumed
     );
@@ -268,34 +282,6 @@ fn join_with_third_party_token_account_fails() {
         &[ix_join_game(&f, &orao, joiner.pubkey(), victim_ta)],
     );
     assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
-}
-
-/// The fee destination must be the treasury's canonical ATA — the address
-/// `settle` will pin — not any account the treasury happens to own.
-#[test]
-fn join_with_non_ata_treasury_account_fails() {
-    let (mut svm, payer) = setup();
-    let (f, _meta) = setup_open_game(&mut svm, &payer, 1_000);
-    let orao = setup_orao(&mut svm);
-    let joiner = Keypair::new();
-    svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
-    let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), 10_000);
-    // Treasury-owned and the right mint, but not at the ATA address.
-    let fake_treasury_ta = create_token_account(&mut svm, f.mint, treasury(), 0);
-
-    let mut ix = ix_join_game(&f, &orao, joiner.pubkey(), joiner_ta);
-    let ata_slot = ix
-        .accounts
-        .iter()
-        .position(|meta| meta.pubkey == get_associated_token_address(&treasury(), &f.mint))
-        .expect("treasury ATA slot");
-    ix.accounts[ata_slot].pubkey = fake_treasury_ta;
-
-    // Anchor's associated-token address constraint (error code 3014).
-    assert_anchor_error(
-        send(&mut svm, &[&joiner], &[ix]),
-        anchor_lang::error::ErrorCode::AccountNotAssociatedTokenAccount,
-    );
 }
 
 /// Plain VRF creates the request with Anchor's `init`, which absorbs a
@@ -486,15 +472,8 @@ fn join_with_wrong_token_program_fails() {
             anchor_spl::token_2022::ID,
         )],
     );
-    // The treasury ATA's `init_if_needed` runs before our `token_program`
-    // constraint (accounts validate in declaration order), so the associated
-    // token program rejects it first; our constraint is the backstop for the
-    // paths that get past it.
-    assert!(
-        matches!(
-            result.unwrap_err().err,
-            TransactionError::InstructionError(_, InstructionError::IncorrectProgramId)
-        ),
-        "wrong token program must be rejected"
-    );
+    // Now that the treasury ATA (whose `init_if_needed` used to reject this
+    // first, from inside the associated-token program) is created at create
+    // time, our own `token_program` constraint is what fires.
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::MintMismatch);
 }

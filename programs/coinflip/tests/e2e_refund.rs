@@ -45,11 +45,16 @@ fn refund_after_timeout_returns_both_stakes() {
     let j = setup_joined_at_known_slot(&mut svm, &payer);
     let game_key = j.fixture.game.pubkey();
     let host = j.fixture.host.pubkey();
-    // Both rents belong to the host; the cranker is a third party, so the
-    // host's lamport delta is exactly game rent + escrow rent.
-    let game_rent = svm.get_account(&game_key).unwrap().lamports;
+    // Both rents and the whole bond belong to the host; the cranker is a third
+    // party, so that sum is exactly the host's lamport delta. Nobody won, so
+    // the joiner is not reimbursed — their sunk ORAO costs stay sunk.
+    let game_account = svm.get_account(&game_key).unwrap();
+    let game_rent = svm.minimum_balance_for_rent_exemption(game_account.data.len());
+    let bond = expected_bond(&svm);
+    assert_eq!(game_account.lamports, game_rent + bond);
     let escrow_rent = svm.get_account(&j.fixture.escrow).unwrap().lamports;
     let host_lamports_before = svm.get_account(&host).unwrap().lamports;
+    let joiner_lamports_before = svm.get_account(&j.joiner.pubkey()).unwrap().lamports;
 
     svm.warp_to_slot(DEADLINE + 1);
     let ix = ix_refund_timeout(&j, payer.pubkey());
@@ -62,8 +67,13 @@ fn refund_after_timeout_returns_both_stakes() {
     assert!(is_gone(&svm, &game_key), "game must be closed");
     assert_eq!(
         svm.get_account(&host).unwrap().lamports,
-        host_lamports_before + game_rent + escrow_rent,
-        "both rents must return to the host"
+        host_lamports_before + game_rent + escrow_rent + bond,
+        "both rents and the unspent bond must return to the host"
+    );
+    assert_eq!(
+        svm.get_account(&j.joiner.pubkey()).unwrap().lamports,
+        joiner_lamports_before,
+        "a refund reimburses nobody: there is no loser to charge"
     );
 
     let ev = find_cpi_event::<coinflip::events::GameRefunded>(

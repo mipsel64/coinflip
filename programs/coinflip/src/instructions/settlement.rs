@@ -30,8 +30,8 @@ pub(crate) struct SettlementAccounts<'a, 'info> {
 }
 
 /// The one account fees may ever land in for a given mint: the constant
-/// treasury's canonical ATA, which `join_game` created before the request went
-/// out. `settle` pins it by this derivation.
+/// treasury's canonical ATA, which `create_game` created before the game was
+/// ever joinable. `settle` pins it by this derivation.
 pub(crate) fn treasury_ata(mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
     anchor_spl::associated_token::get_associated_token_address_with_program_id(
         &crate::treasury::ID,

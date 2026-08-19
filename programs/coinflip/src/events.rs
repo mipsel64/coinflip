@@ -26,6 +26,9 @@ pub struct GameSettled {
     pub outcome: u8,
     pub pot: u64,
     pub fee: u64,
+    /// Lamports paid out of the host's bond to the joiner, because the host
+    /// won and the loser owes only their stake. 0 when the joiner won.
+    pub joiner_reimbursed: u64,
 }
 
 #[event]

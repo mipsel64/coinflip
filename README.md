@@ -8,7 +8,9 @@ seconds later, and a **permissionless** `settle` pays out. Players sign exactly
 two transactions — create and join — and never the settlement. The winner
 receives the pot minus a configurable protocol fee (default 1%, snapshotted
 onto the game at creation so a later fee change never affects games already in
-flight).
+flight). **The loser pays their stake and nothing else** — every join-time
+incidental lands on the winner, via a bond the host posts at create (see
+[Economics](#economics--accepted-limitations)).
 
 **Worked example:** each player bets 5 SOL (as wSOL). Pot = 10 SOL. Fee = 1%
 of the pot = 0.1 SOL, paid to the treasury. Winner receives 9.9 SOL.
@@ -27,13 +29,13 @@ trade-offs), see
 |---|---|---|---|
 | 1 | `initialize_config(admin, fee_bps, refund_timeout_slots)` | the program's **upgrade authority** (verified against ProgramData) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to `[MIN, MAX]_REFUND_TIMEOUT_SLOTS`; admin must be a non-default key |
 | 2 | `update_config(...)` | `admin` | Rotate admin, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). The treasury is **not** config state — see [Treasury](#treasury) |
-| 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates the mint. Inits `Game` + escrow, transfers the host stake into escrow, records the host's payout token account. State → `Open` |
-| 4 | `cancel_game` | host | Requires state `Open`. Refunds the host stake, closes escrow + game (rent to host) |
-| 5 | `join_game(nonce, max_vrf_fee)` | joiner | Requires state `Open`, `joiner != host`. Transfers the matching stake into escrow; ensures the treasury ATA exists; rejects an ORAO fee above `max_vrf_fee`; CPIs ORAO's `request_v2` with the joiner as ORAO's payer (they pay the VRF fee and the request account's rent directly — the program holds no VRF float). `nonce` salts the VRF seed so a blocked request address can be retried at a fresh one. Records the joiner, `joined_at_slot`, and the refund-timeout snapshot. State → `AwaitingRandomness` |
-| 6 | `settle` | anyone (the crank, in practice) | Requires state `AwaitingRandomness` and a **fulfilled** request. Runs the core settlement |
-| 7 | `refund_timeout` | anyone | Requires state `AwaitingRandomness`, past `refund_timeout_slots`, and randomness **not** fulfilled. Returns both stakes, no fee |
+| 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates the mint. Inits `Game` + escrow, transfers the host stake into escrow, records the host's payout token account. Also ensures the treasury ATA for the mint exists (**host-paid**, once per mint) and parks the reimbursement **bond** in the game account, sized from ORAO's live request fee. State → `Open` |
+| 4 | `cancel_game` | host | Requires state `Open`. Refunds the host stake, closes escrow + game (rent **and the whole bond** to host) |
+| 5 | `join_game(nonce, max_vrf_fee)` | joiner | Requires state `Open`, `joiner != host`. Transfers the matching stake into escrow; rejects an ORAO fee above `max_vrf_fee`; CPIs ORAO's `request_v2` with the joiner as ORAO's payer (they pay the VRF fee and the request account's rent directly — the program holds no VRF float). `nonce` salts the VRF seed so a blocked request address can be retried at a fresh one. Records the joiner, `joined_at_slot`, the refund-timeout snapshot, and `joiner_sunk_lamports` (what a losing host will owe them). Touches no treasury account. State → `AwaitingRandomness` |
+| 6 | `settle` | anyone (the crank, in practice) | Requires state `AwaitingRandomness` and a **fulfilled** request. Runs the core settlement, including the bond reimbursement — so it also takes the joiner's **wallet** |
+| 7 | `refund_timeout` | anyone | Requires state `AwaitingRandomness`, past `refund_timeout_slots`, and randomness **not** fulfilled. Returns both stakes, no fee; rent and the whole bond go to the host |
 
-**Core settlement**: `outcome = randomness[0] & 1` (0 = Heads, 1 = Tails); winner = host if `outcome == host_side` else joiner; `pot` = the escrow's actual balance (so any donated dust goes to the winner); `fee = pot * fee_bps / 10_000` (floored, rate snapshotted at create); fee → treasury ATA, `pot - fee` → winner. State → `Settled`, escrow + game close (rent to host).
+**Core settlement**: `outcome = randomness[0] & 1` (0 = Heads, 1 = Tails); winner = host if `outcome == host_side` else joiner; `pot` = the escrow's actual balance (so any donated dust goes to the winner); `fee = pot * fee_bps / 10_000` (floored, rate snapshotted at create); fee → treasury ATA, `pot - fee` → winner. If the **host** won, `min(joiner_sunk_lamports, bond_lamports)` moves from the game account to the joiner's wallet, reported as `GameSettled.joiner_reimbursed`; if the joiner won, nothing moves and the whole bond returns to the host. State → `Settled`, escrow + game close (rent + leftover bond to host).
 
 ## Lifecycle
 
@@ -191,7 +193,9 @@ Then, order matters:
    — calls `initialize_config`. Must be signed by the program's **upgrade
    authority** (checked against `ProgramData`).
 6. `npx tsx scripts/ops.ts -k <keypair> check-orao` — prints ORAO's live
-   request fee and treasury and what a joiner will pay out of their own wallet.
+   request fee and treasury, what a joiner will pay out of their own wallet,
+   how much of that a losing joiner gets reimbursed, and the bond a host posts
+   at create.
 7. `npx tsx scripts/smoke.ts` — creates + joins a throwaway game between two
    ephemeral wallets, polls the ORAO request until it is fulfilled, sends
    `settle` (the crank's transaction), and decodes the `GameSettled` event —
@@ -217,22 +221,38 @@ Measured against the LiteSVM harness and mainnet's live ORAO configuration
 (`5ER1oENnV4srxYdAynUfRzWeQCPQaqMiAp4VqyMbSqnK`; 500_000-lamport request fee
 when this was written — `scripts/ops.ts check-orao` reprints it live).
 
+- **The loser pays their stake and nothing else.** Join-time incidentals are
+  lamports, and they fall due before a winner exists, so they are settled as a
+  *reimbursement* out of a bond rather than deducted from the token pot (which
+  would need a price oracle).
 - **The joiner pays ORAO directly, and gets most of it back.** At join they
   front the request fee (0.0005 SOL) plus rent for the 749-byte pending request
   account (0.0061 SOL) — 0.0066 SOL, plus the 0.000005 SOL transaction fee.
   When ORAO fulfills, it shrinks that account to 137 bytes and returns the
-  freed 0.00426 SOL **to the joiner** (they are the request's `client`). Net
-  cost of a settled game: ~0.00235 SOL, of which 0.00184 SOL stays permanently
-  locked in the immutable fulfilled request account and 0.0005 SOL is ORAO's
-  fee. Nothing accrues to this program, and there is no shared balance for join
-  spam to drain.
-- **A refunded game is the joiner's worst case:** if ORAO never fulfills, the
-  full 0.0061 SOL rent stays locked in the pending request (recovered only if
-  ORAO fulfills it later).
-- **First joiner of a given mint pays the treasury ATA's rent** (~0.00204 SOL) —
-  `join_game` creates it `init_if_needed` so that no cranker ever has to.
-- **Reimbursing the joiner out of the pot is not implemented** (planned as a
-  winner-pays bond). Today the joiner carries the VRF cost of every game.
+  freed 0.00426 SOL **to the joiner** (they are the request's `client`). That
+  leaves 0.00235 SOL sunk (0.00184 rent locked in the immutable fulfilled
+  request + ORAO's 0.0005 fee), which the program records as
+  `game.joiner_sunk_lamports`. Nothing accrues to this program, and there is no
+  shared balance for join spam to drain.
+- **The host bonds that reimbursement at create.** `create_game` parks
+  `2 * request_fee + 0.00184 SOL` (0.00284 SOL at today's fee) in the game
+  account, on top of its rent, and records it as `game.bond_lamports`. If the
+  **host wins**, `min(joiner_sunk, bond)` is paid to the joiner's wallet during
+  `settle` — the losing joiner ends the game down exactly their stake. If the
+  **joiner wins**, they bore their own costs (they took the pot) and the entire
+  bond returns to the host. Cancel and refund also return it in full.
+- **A fee raise between create and join caps the reimbursement.** The bond is
+  sized from ORAO's fee at create time; the 2x multiplier absorbs a doubling.
+  Beyond that, the reimbursement caps at `bond_lamports` and the joiner absorbs
+  the rest — no join is rejected for it. Both numbers are on the open game
+  account, so a frontend can show the guaranteed amount before anyone joins.
+- **A refunded game is the joiner's worst case:** nobody won, so nobody
+  reimburses; the joiner's sunk costs stay sunk, and if ORAO never fulfills at
+  all, the full 0.0061 SOL rent stays locked in the pending request (recovered
+  only if ORAO fulfills it later).
+- **The host pays the treasury ATA's rent** (~0.00204 SOL), once per mint, at
+  `create_game` — they chose the mint, and it means neither a joiner nor a
+  cranker ever pays for the protocol's own fee account.
 - **A host can front-run a join with `cancel_game`.** Both target an `Open`
   game, so whichever lands first wins; the loser's join fails on the state
   check having moved nothing. The joiner is out a transaction fee, never
@@ -254,7 +274,7 @@ when this was written — `scripts/ops.ts check-orao` reprints it live).
   is blocked by `AlreadyFulfilled` at that point. Accepted for a fun project.
 - **Token-2022 test coverage:** the e2e suite exercises T22 end-to-end on
   `create_game`, `cancel_game`, and `join_game` (see `t22_game_full_join`,
-  including the T22-derived treasury ATA). Settlement e2e coverage is classic
+  including the T22-derived treasury ATA `create_game` makes). Settlement e2e coverage is classic
   SPL only; the settlement code is token-program-agnostic (`TokenInterface` +
   `transfer_checked` throughout), so this is a coverage gap, not a behavioral
   one.
@@ -348,11 +368,20 @@ elsewhere:
 - **`config.treasury` is gone.** `Config` holds `admin`, `fee_bps`,
   `refund_timeout_slots` only; a client that fetches it looking for a treasury
   gets a decode/undefined error. Read the IDL's `TREASURY` constant instead.
-- **Do not pass `treasury` or `networkState` to `join_game`.** The IDL pins
-  both by address/PDA, so anchor-ts (>= 0.30) resolves them — and the
-  `treasury_token_account` derived from the former — itself; passing them
-  explicitly is a type error. You **must** pass `oraoTreasury` (read it from
-  ORAO's `NetworkState`) and `request` (`[b"orao-vrf-randomness-request",
+- **The treasury ATA moved from `join_game` to `create_game`.** `join_game` no
+  longer takes `treasury`, `treasury_token_account`, or
+  `associated_token_program` at all (three fewer accounts); `create_game` takes
+  them, plus ORAO's `network_state` (read-only, to size the bond). All four are
+  IDL-resolvable, so anchor-ts (>= 0.30) fills them in — passing them
+  explicitly is a type error. A non-anchor client must add them to
+  `create_game` itself.
+- **`settle` takes the joiner's wallet** (`joiner`, `mut`, pinned to
+  `game.joiner`) in addition to `joiner_token_account`: it is where the bond
+  reimbursement lands when the host wins.
+- **Do not pass `networkState` to `join_game`.** The IDL pins it to ORAO's
+  config PDA, so anchor-ts resolves it. You **must** pass `oraoTreasury` (read
+  it from ORAO's `NetworkState`) and `request`
+  (`[b"orao-vrf-randomness-request",
   sha256("coinflip-vrf-seed", game, joiner, nonce_le_u64)]` under ORAO's
   program — the SAME nonce you pass as the instruction argument).
 - **`join_game` takes two arguments now:** `nonce: u64` (start at 0; on a
@@ -369,16 +398,16 @@ elsewhere:
   `game.vrf_seed` for you); non-anchor clients derive it from the seed above.
 - **Token-2022 games must pass `tokenProgram` explicitly.** anchor-ts cannot
   infer a mint's owning program, and the treasury ATA derivation depends on it:
-  omit it and the client derives the classic-SPL address, which the program
-  rejects. (Same for `settle`'s `treasury_token_account`, which non-anchor
-  clients derive themselves.)
+  omit it on `create_game` and the client derives the classic-SPL address,
+  which the program rejects. (Same for `settle`'s `treasury_token_account`,
+  which non-anchor clients derive themselves.)
 - **Non-anchor clients must read the constant, never hardcode it** — the IDL is
   the single source, and `scripts/verify-artifact.ts` is what guarantees the
   published IDL matches the deployed binary.
 - **Mismatches fail closed**, never silently: a client built against the wrong
-  IDL hits `OwnerMismatch` on `join_game` (the address-pinned treasury account)
-  or `InvalidPayoutAccount` on `settle` (the ATA pin). No fee ever goes
-  anywhere else.
+  IDL hits `OwnerMismatch` on `create_game` (the address-pinned treasury
+  account) or `InvalidPayoutAccount` on `settle` (the ATA pin). No fee ever
+  goes anywhere else.
 
 ## Further reading
 
