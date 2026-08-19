@@ -38,8 +38,14 @@ Accepted trade-offs of the callback variant (vs. plain VRF + manual settle):
   past its `callback_deadline`, fulfills the randomness **ignoring the callback**
   — so no callback-side failure can permanently strand a game: it always
   degrades into the permissionless `settle_fallback` path. This property is what
-  makes the two-path design safe, and is why `MIN_REFUND_TIMEOUT_SLOTS` must
-  exceed that deadline.
+  makes the two-path design safe, and is why the refund window must open only
+  with margin above that deadline (`refund_timeout_slots >= callback_deadline +
+  MIN_SETTLE_MARGIN_SLOTS`, enforced dynamically at every join): in the sliver
+  where the deadline sits just under the refund window, a loser could read the
+  bare-fulfilled randomness and race a refund to convert a loss into a push.
+  Operations: ORAO's `callback_deadline` is a hard live dependency of the join
+  path (fail-closed) — run a standing monitor alerting when it approaches
+  `refund_timeout_slots - MIN_SETTLE_MARGIN_SLOTS`.
 
 ## Architecture
 
