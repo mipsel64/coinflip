@@ -2450,12 +2450,15 @@ pub struct SettleCallback<'info> {
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, address = game.joiner_token_account @ CoinflipError::MintMismatch)]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// Frozen at request time by the ORAO-validated callback list — do NOT
-    /// re-check against live config.treasury: rotating the treasury must not
-    /// brick in-flight games (their fees go to the treasury they were joined
-    /// under, matching the fee-snapshot philosophy).
+    /// LIVE-treasury policy (unified with settle_fallback): the fee RATE is the
+    /// player guarantee (snapshotted); the destination is protocol-internal.
+    /// After a rotation, in-flight callbacks fail until the new treasury's
+    /// token account exists (runbook: create it BEFORE rotating), then ORAO
+    /// retries / degrades to fulfill-without-callback and fallback settles.
     #[account(
         mut,
+        constraint = treasury_token_account.owner == config.treasury
+            @ CoinflipError::OwnerMismatch,
         constraint = treasury_token_account.mint == game.token_mint
             @ CoinflipError::MintMismatch,
     )]

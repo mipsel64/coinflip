@@ -34,9 +34,12 @@ Accepted trade-offs of the callback variant (vs. plain VRF + manual settle):
   joiner reimburse the fee at join.
 - The callback's account list is fixed at request time; the winner is unknown then,
   so **both** players' token accounts are passed and must exist at join.
-- If the callback fails repeatedly, ORAO fulfills the randomness after a deadline and
-  **ignores the callback** — so a permissionless `settle_fallback` backstop remains
-  in the design. The callback makes it the exception, not the removal of it.
+- If the callback fails repeatedly, ORAO retries with increasing intervals and,
+  past its `callback_deadline`, fulfills the randomness **ignoring the callback**
+  — so no callback-side failure can permanently strand a game: it always
+  degrades into the permissionless `settle_fallback` path. This property is what
+  makes the two-path design safe, and is why `MIN_REFUND_TIMEOUT_SLOTS` must
+  exceed that deadline.
 
 ## Architecture
 
@@ -71,7 +74,7 @@ routes fee reimbursements (see the Config section below).
 | `admin` | `Pubkey` | Can call `update_config` |
 | `treasury` | `Pubkey` | Authority whose ATA receives fees |
 | `fee_bps` | `u16` | Default 100 (1%); hard cap `MAX_FEE_BPS = 1000` (10%) |
-| `refund_timeout_slots` | `u64` | Slots after join before `refund_timeout` is allowed; bounded to [`MIN_REFUND_TIMEOUT_SLOTS`, `MAX_REFUND_TIMEOUT_SLOTS`] |
+| `refund_timeout_slots` | `u64` | Slots after join before `refund_timeout` is allowed; bounded to [`MIN_REFUND_TIMEOUT_SLOTS`, `MAX_REFUND_TIMEOUT_SLOTS`]. The MIN (18_000 slots ≈ 2h) must exceed ORAO's callback-retry deadline (crate default 9_000): otherwise a player could sabotage their recorded payout account, block the callback, and force a refund before ORAO falls back to fulfilling without it |
 | `_reserved` | `[u8; 64]` | Zeroed tail for future fields |
 
 `Config` doubles as the registered VRF **state PDA**: it signs `Request` CPIs and is
@@ -128,7 +131,7 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 | # | Instruction | Signer | Behavior |
 |---|---|---|---|
 | 1 | `initialize_config(admin, treasury, fee_bps, refund_timeout_slots)` | deployer (first caller — initialize immediately after deploy) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to [MIN, MAX]_REFUND_TIMEOUT_SLOTS; admin/treasury must be non-default keys |
-| 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). Treasury rotation: in-flight joined games' callbacks keep paying the OLD treasury's frozen ATA (consistent with the fee-snapshot philosophy; the callback does not re-check live config); new games route to the new treasury. `settle_fallback` always uses the CURRENT treasury |
+| 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). Treasury rotation: BOTH settle paths pay the CURRENT `config.treasury` (the fee *rate* is the player guarantee and is snapshotted; the *destination* is protocol-internal). Runbook: create the new treasury's token accounts for every active mint BEFORE rotating — in-flight callbacks fail until then, degrade to ORAO's fulfill-without-callback, and settle via fallback |
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. State = Open |
 | 4 | `cancel_game` | host | Requires state == Open. Refund host stake, close escrow + game (rent to host) |
 | 5 | `join_game` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; ensure treasury ATA exists (`init_if_needed`, payer = joiner). Transfer the current VRF fee PLUS the pending request account's rent (sized via ORAO's own `RequestAccount::expected_size`) in lamports joiner → Client PDA, so the shared Client balance is exactly neutral per join and cannot be drained by cheap join spam. CPI ORAO `Request` (seed = game pubkey, `Config` PDA signs, Client PDA pays) with a request-level callback targeting `settle_callback` and carrying: game, escrow, host + joiner token accounts, treasury ATA, mint, token program. Record joiner, joiner token account, `joined_at_slot`. State = AwaitingRandomness |
@@ -139,7 +142,7 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 **Core settlement** (shared by 6 and 7): verify the request account is the ORAO PDA
 for seed = game pubkey under our client; `outcome = fulfilled_randomness[0] & 1`
 (0 = Heads, 1 = Tails); winner = host if outcome == host_side else joiner;
-`pot = 2 * amount`; `fee = pot * game.fee_bps / 10_000` (fee snapshotted at create; u128 widening, floor); fee →
+`pot = the escrow's actual balance` (donated dust goes to the winner and can never brick the close); `fee = pot * game.fee_bps / 10_000` (rate snapshotted at create; u128 widening, floor); fee →
 treasury ATA, `pot - fee` → winner's recorded token account. Set state = Settled
 before transfers, close escrow + game, rent to host.
 
@@ -224,10 +227,20 @@ gap without any special authority:
   party's account is rejected so winnings always land in the winner's own
   account.
 - Liveness rule: `settle_callback` pays the exact recorded accounts (its account
-  list is frozen at request time), but `cancel_game`, `settle_fallback`, and
-  `refund_timeout` accept **any** token account owned by the respective player
-  for the right mint — so a player who closed their recorded account can never
-  strand a payout or block the other player's refund.
+  list is frozen at request time). `cancel_game` accepts any host-owned account
+  of the game mint (the host signs). `settle_fallback` and `refund_timeout` are
+  permissionless, so their player accounts are tightened to **the recorded
+  account or the player's canonical ATA** (owner+mint checked as well) — a
+  closed recorded account can never strand funds (the ATA is permissionlessly
+  re-creatable), and a third-party cranker cannot route a payout into some
+  other, possibly delegated, player-owned account.
+- Both players' accounts are required at settlement even though only the winner
+  is paid (the account set is fixed before the outcome is known) — if the loser
+  closed every candidate account, anyone can re-create their ATA to unblock.
+- Frozen-mint dead end (accepted USDC-style risk, documented): if the mint has a
+  freeze authority and every candidate winner account is frozen while the
+  request is already fulfilled, the pot and rents are stuck — `refund_timeout`
+  is blocked by `AlreadyFulfilled` and no transfer can succeed until a thaw.
 - Fees are collected in the bet token, into the treasury's ATA for that mint
   (existence ensured at join).
 
