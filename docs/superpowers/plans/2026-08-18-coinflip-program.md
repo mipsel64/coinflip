@@ -3242,3 +3242,49 @@ a transaction fee).
 
 Measured after the amendment: `join_game` 75_983 CU, `settle` 39_241 CU, 74
 tests.
+
+
+---
+
+### Task 18: winner-pays bond (Option A) + host-paid treasury ATA
+
+User decision: the loser must pay only their stake. All join-time incidentals
+land on the winner, engineered as reimbursement (costs are due before the
+winner exists; the pot is in tokens, costs in lamports).
+
+Mechanism:
+- **Treasury ATA moves to create_game** (host chose the mint, host pays the
+  per-mint rent, usually a no-op): create gains treasury/treasury_token_account
+  (init_if_needed, payer = host)/associated_token_program; join LOSES all
+  three (join never pays the treasury — settlement does, and settle already
+  carries the ATA).
+- **Host bond at create**: create_game also takes `network_state` and
+  transfers `bond = 2 * request_fee_now + rent(8 + RandomnessV2::FULFILLED_SIZE)`
+  lamports host → game account (system transfer; the game account holds it
+  above rent-exemption). Store `game.bond_lamports`.
+- **Joiner's sunk cost recorded at join**:
+  `game.joiner_sunk_lamports = request_fee_at_join + rent(fulfilled size)` —
+  exactly what the joiner never gets back after ORAO's automatic
+  pending→fulfilled rent refund.
+- **Settlement**: Settle gains the joiner's WALLET account (mut, address =
+  game.joiner). If the HOST wins: move `min(joiner_sunk, bond)` lamports from
+  the game account directly to the joiner (program-owned account: debit via
+  lamport arithmetic, no CPI), remainder sweeps to the host via `close = host`.
+  If the JOINER wins: no move — the whole bond returns to the host via close
+  (the winner-joiner bore their own costs). GameSettled gains
+  `joiner_reimbursed: u64`.
+- **Cancel**: bond returns to host via close (already does — everything in the
+  game account sweeps to host).
+- **Refund_timeout**: nobody won; bond → host via close; the joiner's sunk fee
+  + fulfilled-rent stays sunk (ORAO holds it; documented).
+- **Under-bonded edge** (fee spikes between create and join): reimbursement
+  caps at the bond; the bond is public on the game account so frontends can
+  show "reimbursement guaranteed up to X" pre-join. No join rejection.
+- Game layout: +bond_lamports u64, +joiner_sunk_lamports u64; keep
+  _reserved [u8; 22]; INIT_SPACE grows 244 → 260 (nothing deployed; update
+  asserts + layout tests + rent numbers in docs).
+- Tests: host-wins reimbursement exact (joiner lamport delta across settle ==
+  joiner_sunk); joiner-wins → bond back to host exactly; under-bonded cap;
+  cancel/refund bond sweep; create's bond transfer + ATA move (join drops 3
+  accounts — CU re-measure both); README/spec economics rewritten (loser pays
+  stake only; net winner cost table).
