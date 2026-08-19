@@ -11,6 +11,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { web3 } from "@coral-xyz/anchor";
 import { OraoCb, RegisterBuilder, clientAddress } from "@orao-network/solana-vrf-cb";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { Command } from "commander";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -60,31 +61,74 @@ function programDataAddress(programId: web3.PublicKey): web3.PublicKey {
   )[0];
 }
 
-function provider(cluster: string, keyPath: string): anchor.AnchorProvider {
-  const url =
-    cluster === "devnet" ? web3.clusterApiUrl("devnet") : web3.clusterApiUrl("mainnet-beta");
-  const kp = loadKeypair(keyPath);
-  return new anchor.AnchorProvider(
-    new web3.Connection(url, "confirmed"),
-    new anchor.Wallet(kp),
-    {}
+// Raw (snake_case) IDL, loaded once. `anchor.Program` camelCases it internally
+// when building method/account namespaces, but we also read it here directly
+// (its `address` and `constants` fields) before any of that conversion.
+interface RawIdlConstant {
+  name: string;
+  type: string;
+  value: string;
+}
+interface RawIdl {
+  address: string;
+  constants?: RawIdlConstant[];
+}
+
+const IDL_RAW = require("../target/idl/coinflip.json") as RawIdl;
+
+const idlAddress = new web3.PublicKey(IDL_RAW.address);
+if (!idlAddress.equals(PROGRAM_ID)) {
+  throw new Error(
+    `program id mismatch: target/idl/coinflip.json's address (${idlAddress.toBase58()}) ` +
+      `does not match the keypair's pubkey (${PROGRAM_ID.toBase58()}) — rebuild the IDL ` +
+      "(`anchor build`) after redeploying under a new program id"
   );
 }
 
-function coinflipProgram(p: anchor.AnchorProvider): anchor.Program<Coinflip> {
-  const idl = require("../target/idl/coinflip.json") as Coinflip;
-  const idlAddress = new web3.PublicKey(idl.address);
-  if (!idlAddress.equals(PROGRAM_ID)) {
+/** Reads a `#[constant]` value straight out of the IDL instead of hardcoding it. */
+function idlConstant(name: string): anchor.BN {
+  const found = IDL_RAW.constants?.find((c) => c.name === name);
+  if (!found) {
     throw new Error(
-      `program id mismatch: target/idl/coinflip.json's address (${idlAddress.toBase58()}) ` +
-        `does not match the keypair's pubkey (${PROGRAM_ID.toBase58()}) — rebuild the IDL ` +
-        "(`anchor build`) after redeploying under a new program id"
+      `IDL constant "${name}" not found in target/idl/coinflip.json — rebuild the IDL ` +
+        "(`anchor build`), or this #[constant] was renamed/removed in the program source"
     );
   }
-  return new anchor.Program<Coinflip>(idl, p);
+  return new anchor.BN(found.value);
+}
+
+const MIN_SETTLE_MARGIN_SLOTS = idlConstant("MIN_SETTLE_MARGIN_SLOTS");
+const MIN_REFUND_TIMEOUT_SLOTS = idlConstant("MIN_REFUND_TIMEOUT_SLOTS");
+
+const ALLOWED_CLUSTERS = ["devnet", "mainnet"] as const;
+
+function clusterUrl(cluster: string): string {
+  if (cluster === "devnet") return web3.clusterApiUrl("devnet");
+  if (cluster === "mainnet") return web3.clusterApiUrl("mainnet-beta");
+  // Never fall through to a default cluster — an operator typo must not
+  // silently point a mainnet-authority key at the wrong network.
+  throw new Error(
+    `invalid --cluster "${cluster}" — must be one of: ${ALLOWED_CLUSTERS.join(", ")}`
+  );
+}
+
+function provider(cluster: string, keyPath: string): anchor.AnchorProvider {
+  const url = clusterUrl(cluster);
+  const wallet = new anchor.Wallet(loadKeypair(keyPath));
+  console.log("Cluster:", url);
+  console.log("Wallet:", wallet.publicKey.toBase58());
+  return new anchor.AnchorProvider(new web3.Connection(url, "confirmed"), wallet, {});
+}
+
+function coinflipProgram(p: anchor.AnchorProvider): anchor.Program<Coinflip> {
+  return new anchor.Program<Coinflip>(IDL_RAW as unknown as Coinflip, p);
 }
 
 const cli = new Command();
+cli.description(
+  "Ops CLI for the coinflip program. Order: 1) anchor deploy 2) init-config " +
+    "3) register 4) deposit 5) check-orao, then scripts/smoke.ts"
+);
 cli.requiredOption("-k, --key <path>", "upgrade-authority keypair path");
 cli.option("-c, --cluster <name>", "devnet|mainnet", "devnet");
 
@@ -111,6 +155,7 @@ cli
 
 cli
   .command("deposit")
+  .description("Deposits SOL into the ORAO client's balance (pays request fees + request rent)")
   .requiredOption("--lamports <n>", "amount to deposit into the client balance")
   .action(async (opts, cmd) => {
     const p = provider(cmd.parent.opts().cluster, cmd.parent.opts().key);
@@ -140,8 +185,8 @@ cli
   .option(
     "--refund-timeout-slots <n>",
     "slots after join before refund_timeout is allowed " +
-      "(must clear ORAO's callback_deadline + 1800-slot margin; see check-orao)",
-    "18000"
+      "(must clear ORAO's callback_deadline + MIN_SETTLE_MARGIN_SLOTS margin; see check-orao)",
+    MIN_REFUND_TIMEOUT_SLOTS.toString()
   )
   .action(async (opts, cmd) => {
     const p = provider(cmd.parent.opts().cluster, cmd.parent.opts().key);
@@ -184,12 +229,12 @@ cli
     console.log("ORAO callback_deadline:", callbackDeadline.toString(), "slots");
     console.log("Our refund_timeout_slots:", config.refundTimeoutSlots.toString());
 
-    // Mirrors join_game's own dynamic check (MIN_SETTLE_MARGIN_SLOTS = 1_800).
-    const minTimeout = callbackDeadline.addn(1_800);
+    // Mirrors join_game's own dynamic check.
+    const minTimeout = callbackDeadline.add(MIN_SETTLE_MARGIN_SLOTS);
     if (minTimeout.gt(config.refundTimeoutSlots)) {
       console.warn(
-        `WARNING: callback_deadline + 1800 (${minTimeout.toString()}) exceeds ` +
-          `refund_timeout_slots (${config.refundTimeoutSlots.toString()}) — join_game ` +
+        `WARNING: callback_deadline + MIN_SETTLE_MARGIN_SLOTS (${minTimeout.toString()}) ` +
+          `exceeds refund_timeout_slots (${config.refundTimeoutSlots.toString()}) — join_game ` +
           "will reject every join until refund_timeout_slots is raised via update_config."
       );
     } else {
@@ -197,6 +242,63 @@ cli
         "OK: refund_timeout_slots clears ORAO's callback deadline by the required margin."
       );
     }
+  });
+
+cli
+  .command("settle-fallback")
+  .description(
+    "Runs the permissionless settle_fallback crank on a stuck game (the liveness " +
+      "backstop for when ORAO fulfills but the callback never runs)"
+  )
+  .requiredOption("--game <pubkey>", "the game account's pubkey")
+  .option(
+    "--host-token-account <pubkey>",
+    "override the host's payout account (defaults to the one recorded on the game)"
+  )
+  .option(
+    "--joiner-token-account <pubkey>",
+    "override the joiner's payout account (defaults to the one recorded on the game)"
+  )
+  .action(async (opts, cmd) => {
+    const p = provider(cmd.parent.opts().cluster, cmd.parent.opts().key);
+    const program = coinflipProgram(p);
+
+    const gamePubkey = new web3.PublicKey(opts.game);
+    const game = await program.account.game.fetch(gamePubkey);
+    const config = await program.account.config.fetch(CONFIG_PDA);
+
+    const treasuryTokenAccount = getAssociatedTokenAddressSync(
+      game.tokenMint,
+      config.treasury,
+      true
+    );
+    const hostTokenAccount = opts.hostTokenAccount
+      ? new web3.PublicKey(opts.hostTokenAccount)
+      : game.hostTokenAccount;
+    const joinerTokenAccount = opts.joinerTokenAccount
+      ? new web3.PublicKey(opts.joinerTokenAccount)
+      : game.joinerTokenAccount;
+
+    const mintInfo = await p.connection.getAccountInfo(game.tokenMint);
+    if (!mintInfo) {
+      throw new Error(`mint ${game.tokenMint.toBase58()} not found`);
+    }
+
+    const tx = await program.methods
+      .settleFallback()
+      .accounts({
+        cranker: p.wallet.publicKey,
+        game: gamePubkey,
+        host: game.host,
+        hostTokenAccount,
+        joinerTokenAccount,
+        treasuryTokenAccount,
+        mint: game.tokenMint,
+        tokenProgram: mintInfo.owner,
+        program: PROGRAM_ID,
+      })
+      .rpc();
+    console.log("settle_fallback tx:", tx);
   });
 
 await cli.parseAsync().catch((err) => {
