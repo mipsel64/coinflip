@@ -1,26 +1,23 @@
-// Devnet smoke test: create_game + join_game against a REAL deployed ORAO
-// VRF, then watch for the callback to settle the game with no third
-// transaction. LiteSVM (the Rust test suite) fabricates ORAO's accounts, so
-// this is the only place the actual callback happy path gets exercised.
+// Devnet smoke test for the FULL production flow: create_game + join_game
+// against a REAL deployed ORAO VRF, poll the request account until the oracle
+// quorum fulfills it, then send `settle` — which is exactly what the crank
+// does. LiteSVM (the Rust test suite) fabricates the fulfillment, so this is
+// the only place a genuine oracle response drives a settlement.
 //
-// Prerequisites (see register.ts): the program is deployed, registered as an
-// ORAO client, the client is deposited with SOL, and initialize_config has
-// run. The provider wallet just needs enough SOL to fund two ephemeral
-// players and pay rent/fees.
+// Prerequisites (see ops.ts): the program is deployed and initialize_config
+// has run. There is nothing to register with ORAO and no program-owned float
+// to top up — the joiner pays ORAO directly. The provider wallet just needs
+// enough SOL to fund two ephemeral players and pay rent/fees.
 //
 // Event decoding: the program emits events via `emit_cpi!` (a self-CPI whose
 // instruction data IS the event), not the older `sol_log_data`/"Program
 // data:" log convention — so `Program.addEventListener` (which only parses
-// text logs) can never see it. Instead, once the poll below tells us the
-// game closed, we fetch that one closing transaction and pick the event out
-// of its `innerInstructions`, exactly like the Rust test suite's
-// `find_cpi_event` helper (tests/common/mod.rs) does. That's also more
-// reliable than a log subscription here: no WebSocket needs to stay open
-// across the whole (up to 3-minute) poll loop, just one HTTP call after we
-// already know settlement happened.
+// text logs) can never see it. Instead we fetch the settle transaction we
+// just sent and pick the event out of its `innerInstructions`, exactly like
+// the Rust test suite's `find_cpi_event` helper (tests/common/mod.rs) does.
 import * as anchor from "@coral-xyz/anchor";
 import { web3 } from "@coral-xyz/anchor";
-import { OraoCb, clientAddress, requestAccountAddress } from "@orao-network/solana-vrf-cb";
+import { Orao, randomnessAccountAddress } from "@orao-network/solana-vrf";
 import {
   createMint,
   getAssociatedTokenAddressSync,
@@ -149,15 +146,13 @@ interface GameSettledEvent {
   fee: anchor.BN;
 }
 
-/** Finds and decodes the GameSettled event out of the transaction that closed `gamePda`. */
+/** Finds and decodes the GameSettled event emitted by transaction `signature`. */
 async function findGameSettledEvent(
   connection: web3.Connection,
   program: anchor.Program<Coinflip>,
-  gamePda: web3.PublicKey
+  signature: string
 ): Promise<GameSettledEvent | null> {
-  const [sigInfo] = await connection.getSignaturesForAddress(gamePda, { limit: 1 });
-  if (!sigInfo) return null;
-  const tx = await connection.getTransaction(sigInfo.signature, {
+  const tx = await connection.getTransaction(signature, {
     maxSupportedTransactionVersion: 0,
   });
   if (!tx?.meta?.innerInstructions) return null;
@@ -195,7 +190,7 @@ async function main() {
   }
 
   const program = new anchor.Program<Coinflip>(IDL_RAW as unknown as Coinflip, provider);
-  const vrf = new OraoCb(provider);
+  const vrf = new Orao(provider);
 
   console.log("Program:", PROGRAM_ID.toBase58());
 
@@ -268,8 +263,7 @@ async function main() {
 
   // ---- join_game ----
   const vrfSeed = vrfSeedFor(game.publicKey, joiner.publicKey);
-  const [client] = clientAddress(PROGRAM_ID, CONFIG_PDA);
-  const [request] = requestAccountAddress(client, vrfSeed);
+  const request = randomnessAccountAddress(vrfSeed);
   const networkStateAccount = await vrf.getNetworkState();
   const oraoTreasury = networkStateAccount.config.treasury;
   const treasuryTokenAccount = getAssociatedTokenAddressSync(mint, TREASURY, true);
@@ -279,12 +273,11 @@ async function main() {
     .accounts({
       joiner: joiner.publicKey,
       game: game.publicKey,
-      host: host.publicKey,
       mint,
       joinerTokenAccount: joinerTokenAccount.address,
-      hostTokenAccount: hostTokenAccount.address,
-      // `treasury` is not passed: the IDL pins it to the program's constant, so
-      // anchor-ts resolves it (and the treasury ATA derived from it) itself.
+      // `treasury` and `networkState` are not passed: the IDL pins them (to the
+      // program's constant and to ORAO's config PDA), so anchor-ts resolves
+      // them — and the treasury ATA derived from the former — itself.
       oraoTreasury,
       request,
       tokenProgram: TOKEN_PROGRAM_ID,
@@ -293,93 +286,101 @@ async function main() {
     .signers([joiner])
     .rpc();
   console.log("join_game tx:", joinTx);
-  console.log(
-    `Inspect logs: solana logs ${PROGRAM_ID.toBase58()} -u devnet ` +
-      "(watch for settle_callback + GameSettled once ORAO fulfills)"
-  );
+  console.log("VRF request:", request.toBase58());
 
   // treasuryTokenAccount is init_if_needed'd by join_game, so it's guaranteed
   // to exist by now — this is our pre-settlement baseline for the fee delta.
   const treasuryBalanceBefore = await connection.getTokenAccountBalance(treasuryTokenAccount);
 
-  // ---- poll for settlement ----
+  // ---- poll for fulfillment (what the crank does) ----
   const gamePda = game.publicKey;
   console.log(
-    `\nPolling game account every ${POLL_INTERVAL_MS / 1000}s for up to ` +
+    `\nPolling the VRF request every ${POLL_INTERVAL_MS / 1000}s for up to ` +
       `${POLL_TIMEOUT_MS / 60_000} minutes...`
   );
   const deadline = Date.now() + POLL_TIMEOUT_MS;
-  let settled = false;
+  let randomness: Uint8Array | null = null;
   while (Date.now() < deadline) {
     await sleep(POLL_INTERVAL_MS);
-    const info = await connection.getAccountInfo(gamePda);
-    if (info === null) {
-      settled = true;
-      break;
+    try {
+      randomness = (await vrf.getRandomness(vrfSeed)).getFulfilledRandomness();
+    } catch {
+      // The account can lag the join by a slot or two at this commitment.
+      randomness = null;
     }
+    if (randomness !== null) break;
     process.stdout.write(".");
   }
   console.log();
 
-  if (settled) {
-    console.log("Game account closed — settled via the ORAO callback (no third tx needed).");
-    const hostBalance = await connection.getTokenAccountBalance(hostTokenAccount.address);
-    const joinerBalance = await connection.getTokenAccountBalance(joinerTokenAccount.address);
-    console.log("Host token balance:", hostBalance.value.uiAmountString);
-    console.log("Joiner token balance:", joinerBalance.value.uiAmountString);
-
-    const event = await findGameSettledEvent(connection, program, gamePda);
-    if (event) {
-      console.log("GameSettled event:", {
-        winner: event.winner.toBase58(),
-        outcome: event.outcome === 0 ? "Heads" : "Tails",
-        pot: event.pot.toString(),
-        fee: event.fee.toString(),
-      });
-    } else {
-      console.log(
-        "Could not decode a GameSettled event from the closing transaction " +
-          "(check the explorer link below)."
-      );
-      // The event is the verifiable proof this smoke test exists to produce —
-      // a missing decode is a failure, not a footnote.
-      process.exitCode = 1;
-    }
-
-    const treasuryBalanceAfter = await connection.getTokenAccountBalance(treasuryTokenAccount);
-    const treasuryDelta =
-      BigInt(treasuryBalanceAfter.value.amount) - BigInt(treasuryBalanceBefore.value.amount);
-    console.log("Treasury token balance delta:", treasuryDelta.toString());
-
-    // The most recent tx touching the program right after settlement is almost
-    // certainly ORAO's fulfill (the one that CPIs into our settle_callback) —
-    // point at it directly instead of just the program's activity page.
-    const [latest] = await connection.getSignaturesForAddress(PROGRAM_ID, { limit: 1 });
-    console.log(
-      "\nCompute units: inspect the settle_callback CPI's compute units on the explorer:\n" +
-        (latest
-          ? `  https://explorer.solana.com/tx/${latest.signature}?cluster=devnet`
-          : `  https://explorer.solana.com/address/${PROGRAM_ID.toBase58()}?cluster=devnet`)
-    );
-  } else {
-    // The callback not firing within the window is exactly the failure mode
-    // this script exists to catch — it must not exit 0.
+  if (randomness === null) {
+    // No fulfillment means no settlement is even possible — the eventual
+    // liveness path is refund_timeout, not settle.
     process.exitCode = 1;
     console.log(
-      "Timed out waiting for the callback. The permissionless settle_fallback crank " +
-        "derives everything it needs (request, escrow, client, treasury ATA) " +
-        "from the game account itself — run:"
+      "Timed out waiting for ORAO to fulfill the request. `settle` cannot run until it is " +
+        "fulfilled (it fails with RandomnessNotFulfilled); after refund_timeout_slots the " +
+        "permissionless refund_timeout unwinds the game instead. Inspect with:"
     );
-    console.log(
-      `  npx tsx register.ts -k <keypair> settle-fallback --game ${gamePda.toBase58()}`
-    );
-    console.log(
-      "Note: settle_fallback requires the ORAO request to already be fulfilled — it will " +
-        "fail with RandomnessNotFulfilled before that (check with " +
-        "`npx tsx register.ts -k <keypair> check-orao`; see refund_timeout for the eventual " +
-        "liveness path)."
-    );
+    console.log("  npx tsx ops.ts -k <keypair> check-orao");
+    console.log(`  Request account: ${request.toBase58()}`);
+    return;
   }
+
+  console.log("ORAO fulfilled the request — the outcome is already readable off-chain.");
+  console.log("  outcome:", randomness[0] % 2 === 0 ? "Heads" : "Tails");
+
+  // ---- settle (the crank's transaction) ----
+  const settleTx = await program.methods
+    .settle()
+    .accounts({
+      cranker: provider.wallet.publicKey,
+      game: gamePda,
+      host: host.publicKey,
+      hostTokenAccount: hostTokenAccount.address,
+      joinerTokenAccount: joinerTokenAccount.address,
+      treasuryTokenAccount,
+      mint,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      program: PROGRAM_ID,
+    })
+    .rpc();
+  console.log("settle tx:", settleTx);
+
+  if ((await connection.getAccountInfo(gamePda)) !== null) {
+    console.log("Game account still exists after settle — it should have been closed.");
+    process.exitCode = 1;
+  }
+
+  const hostBalance = await connection.getTokenAccountBalance(hostTokenAccount.address);
+  const joinerBalance = await connection.getTokenAccountBalance(joinerTokenAccount.address);
+  console.log("Host token balance:", hostBalance.value.uiAmountString);
+  console.log("Joiner token balance:", joinerBalance.value.uiAmountString);
+
+  const event = await findGameSettledEvent(connection, program, settleTx);
+  if (event) {
+    console.log("GameSettled event:", {
+      winner: event.winner.toBase58(),
+      outcome: event.outcome === 0 ? "Heads" : "Tails",
+      pot: event.pot.toString(),
+      fee: event.fee.toString(),
+    });
+  } else {
+    console.log("Could not decode a GameSettled event from the settle transaction.");
+    // The event is the verifiable proof this smoke test exists to produce —
+    // a missing decode is a failure, not a footnote.
+    process.exitCode = 1;
+  }
+
+  const treasuryBalanceAfter = await connection.getTokenAccountBalance(treasuryTokenAccount);
+  const treasuryDelta =
+    BigInt(treasuryBalanceAfter.value.amount) - BigInt(treasuryBalanceBefore.value.amount);
+  console.log("Treasury token balance delta:", treasuryDelta.toString());
+
+  console.log(
+    "\nCompute units: inspect the settle transaction on the explorer:\n" +
+      `  https://explorer.solana.com/tx/${settleTx}?cluster=devnet`
+  );
 }
 
 main().catch((err) => {

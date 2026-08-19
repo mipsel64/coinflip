@@ -161,7 +161,7 @@ fn refund_exactly_at_deadline_fails() {
 fn refund_of_fulfilled_request_fails() {
     let (mut svm, payer) = setup();
     let j = setup_joined_at_known_slot(&mut svm, &payer);
-    write_fulfilled_request(&mut svm, j.orao.client, j.vrf_seed, [1u8; 64]);
+    write_fulfilled_request(&mut svm, j.vrf_seed, [1u8; 64]);
 
     svm.warp_to_slot(DEADLINE + 1);
     let result = send(
@@ -317,8 +317,8 @@ fn refund_rejects_foreign_request() {
     let (mut svm, payer) = setup();
     let j = setup_joined_at_known_slot(&mut svm, &payer);
 
-    // A second game on the same config/ORAO client, joined (so its request
-    // exists and is pending, exactly like game A's).
+    // A second game on the same config, joined (so its request exists and is
+    // pending, exactly like game A's).
     let host_b = Keypair::new();
     svm.airdrop(&host_b.pubkey(), 10 * LAMPORTS_PER_SOL)
         .unwrap();
@@ -354,10 +354,7 @@ fn refund_rejects_foreign_request() {
         &[&joiner_b],
         &[ix_join_game(&f_b, &j.orao, joiner_b.pubkey(), joiner_b_ta)],
     );
-    let request_b = request_pda(
-        &j.orao.client,
-        &vrf_seed_for(&game_b_key, &joiner_b.pubkey()),
-    );
+    let request_b = request_pda(&vrf_seed_for(&game_b_key, &joiner_b.pubkey()));
 
     svm.warp_to_slot(DEADLINE + 1);
     let result = send(
@@ -396,7 +393,7 @@ fn refund_of_open_game_fails() {
         joiner,
         joiner_token_account,
         treasury_token_account,
-        request: request_pda(&orao.client, &vrf_seed),
+        request: request_pda(&vrf_seed),
         orao,
         vrf_seed,
     };

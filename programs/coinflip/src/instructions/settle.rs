@@ -1,9 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
-use orao_solana_vrf_cb::{
-    state::{client::Client, request::RequestAccount},
-    CB_CLIENT_ACCOUNT_SEED, CB_REQUEST_ACCOUNT_SEED,
-};
+use orao_solana_vrf::{state::RandomnessV2, RANDOMNESS_ACCOUNT_SEED};
 
 use crate::{
     constants::{CONFIG_SEED, ESCROW_SEED},
@@ -15,24 +12,19 @@ use crate::{
 
 #[event_cpi]
 #[derive(Accounts)]
-pub struct SettleFallback<'info> {
+pub struct Settle<'info> {
     /// Permissionless fee-payer slot; carries no authority.
     pub cranker: Signer<'info>,
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
+    /// Seed binding: this must be THE request for this game. The seed lives in
+    /// ORAO's global request namespace, so `game.vrf_seed` is the whole binding.
     #[account(
-        seeds = [CB_CLIENT_ACCOUNT_SEED, crate::ID.as_ref(), config.key().as_ref()],
-        seeds::program = orao_solana_vrf_cb::ID,
-        bump = client.bump,
+        seeds = [RANDOMNESS_ACCOUNT_SEED, game.vrf_seed.as_ref()],
+        seeds::program = orao_solana_vrf::ID,
+        bump,
     )]
-    pub client: Box<Account<'info, Client>>,
-    /// Seed binding: this must be THE request for this game.
-    #[account(
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.vrf_seed.as_ref()],
-        seeds::program = orao_solana_vrf_cb::ID,
-        bump = request.bump,
-    )]
-    pub request: Box<Account<'info, RequestAccount>>,
+    pub request: Box<Account<'info, RandomnessV2>>,
     #[account(mut, close = host)]
     pub game: Box<Account<'info, Game>>,
     #[account(mut, seeds = [ESCROW_SEED, game.key().as_ref()], bump = game.escrow_bump)]
@@ -76,7 +68,7 @@ pub struct SettleFallback<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub(crate) fn handle(ctx: Context<SettleFallback>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<Settle>) -> Result<()> {
     let randomness = ctx
         .accounts
         .request

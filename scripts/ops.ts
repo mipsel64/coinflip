@@ -1,16 +1,10 @@
-// ORAO Callback-VRF client registration/deposit + coinflip config bootstrap.
-// Modeled on ORAO's own `callback/rust/examples/cpi/cli.ts`.
-//
-// IMPORTANT (see the runbook in the plan): never burn the program's upgrade
-// authority without first running ORAO's `Transfer` to move the client
-// `owner` to a surviving, team-controlled key — owner-signed `Withdraw` is
-// the only way to recover the Client PDA's accumulating rent surplus
-// (~0.0067 SOL per fulfilled game). `register` below sets that owner to
-// whatever wallet you pass as `-k`, so use a team-controlled key, not a
-// throwaway one.
+// Ops CLI: coinflip config bootstrap, an ORAO health check, and a manual
+// `settle` crank. Plain ORAO VRF needs no client registration and no program-
+// owned float, so there is nothing to register or top up here — the joiner
+// pays ORAO directly at join time.
 import * as anchor from "@coral-xyz/anchor";
 import { web3 } from "@coral-xyz/anchor";
-import { OraoCb, RegisterBuilder, clientAddress } from "@orao-network/solana-vrf-cb";
+import { Orao } from "@orao-network/solana-vrf";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { Command } from "commander";
 import { existsSync, readFileSync } from "node:fs";
@@ -44,10 +38,7 @@ if (!PROGRAM_KEYPAIR_PATH) {
 
 const PROGRAM_ID = loadKeypair(PROGRAM_KEYPAIR_PATH).publicKey;
 
-const [CONFIG_PDA, CONFIG_BUMP] = web3.PublicKey.findProgramAddressSync(
-  [Buffer.from("config")],
-  PROGRAM_ID
-);
+const [CONFIG_PDA] = web3.PublicKey.findProgramAddressSync([Buffer.from("config")], PROGRAM_ID);
 
 const BPF_LOADER_UPGRADEABLE_ID = new web3.PublicKey(
   "BPFLoaderUpgradeab1e11111111111111111111111"
@@ -68,8 +59,8 @@ if (!IDL_ADDRESS.equals(PROGRAM_ID)) {
   );
 }
 
-const MIN_SETTLE_MARGIN_SLOTS = idlConstant("MIN_SETTLE_MARGIN_SLOTS");
 const MIN_REFUND_TIMEOUT_SLOTS = idlConstant("MIN_REFUND_TIMEOUT_SLOTS");
+const MAX_REFUND_TIMEOUT_SLOTS = idlConstant("MAX_REFUND_TIMEOUT_SLOTS");
 // The fee destination is baked into the program, not stored in Config: an IDL
 // built with `--features local` carries the test key, so the IDL must come
 // from the same build as the deployed binary.
@@ -114,51 +105,11 @@ function coinflipProgram(p: anchor.AnchorProvider): anchor.Program<Coinflip> {
 const cli = new Command();
 cli.description(
   "Ops CLI for the coinflip program. Order: 1) anchor deploy 2) init-config " +
-    "3) register 4) deposit 5) check-orao, then scripts/smoke.ts"
+    "3) check-orao, then scripts/smoke.ts. Settlement is the crank's job; " +
+    "`settle` here is the manual version of it."
 );
 cli.requiredOption("-k, --key <path>", "upgrade-authority keypair path");
 cli.option("-c, --cluster <name>", "devnet|mainnet", "devnet");
-
-cli
-  .command("register")
-  .description("Registers the coinflip program as an ORAO VRF client (state PDA = Config)")
-  .action(async (_opts, cmd) => {
-    const p = provider(cmd.parent.opts().cluster, cmd.parent.opts().key);
-    const vrf = new OraoCb(p);
-    const builder = await new RegisterBuilder(vrf, PROGRAM_ID, CONFIG_PDA, [
-      Buffer.from("config"),
-      Buffer.from([CONFIG_BUMP]),
-    ]).build();
-    const tx = await builder.rpc();
-    console.log("Registered client:", clientAddress(PROGRAM_ID, CONFIG_PDA)[0].toBase58());
-    console.log("Tx:", tx);
-    console.log(
-      "\nIMPORTANT: the client owner is now this wallet. Only an owner-signed " +
-        "Withdraw can recover the Client PDA's rent surplus — keep this key, or " +
-        "run ORAO's Transfer to move ownership to a surviving team key before " +
-        "ever retiring it."
-    );
-  });
-
-cli
-  .command("deposit")
-  .description("Deposits SOL into the ORAO client's balance (pays request fees + request rent)")
-  .requiredOption("--lamports <n>", "amount to deposit into the client balance")
-  .action(async (opts, cmd) => {
-    const p = provider(cmd.parent.opts().cluster, cmd.parent.opts().key);
-    const [client] = clientAddress(PROGRAM_ID, CONFIG_PDA);
-    const tx = await p.sendAndConfirm(
-      new web3.Transaction().add(
-        web3.SystemProgram.transfer({
-          fromPubkey: p.publicKey,
-          toPubkey: client,
-          // bigint, not Number(): avoids silent precision loss above 2^53 lamports.
-          lamports: BigInt(opts.lamports),
-        })
-      )
-    );
-    console.log("Deposited. Tx:", tx);
-  });
 
 cli
   .command("init-config")
@@ -170,8 +121,8 @@ cli
   .option("--fee-bps <n>", "protocol fee in basis points", "100")
   .option(
     "--refund-timeout-slots <n>",
-    "slots after join before refund_timeout is allowed " +
-      "(must clear ORAO's callback_deadline + MIN_SETTLE_MARGIN_SLOTS margin; see check-orao)",
+    `slots after join before refund_timeout is allowed (bounded to ` +
+      `[${MIN_REFUND_TIMEOUT_SLOTS}, ${MAX_REFUND_TIMEOUT_SLOTS}])`,
     MIN_REFUND_TIMEOUT_SLOTS.toString()
   )
   .action(async (opts, cmd) => {
@@ -198,44 +149,56 @@ cli
 cli
   .command("check-orao")
   .description(
-    "Fetches ORAO's NetworkState and our Config, and warns if the refund " +
-      "timeout doesn't clear ORAO's callback deadline by the required margin"
+    "Fetches ORAO's NetworkState and our Config, and reports what a joiner " +
+      "will pay ORAO out of their own wallet at join time"
   )
   .action(async (_opts, cmd) => {
     const p = provider(cmd.parent.opts().cluster, cmd.parent.opts().key);
-    const vrf = new OraoCb(p);
+    const vrf = new Orao(p);
     const networkState = await vrf.getNetworkState();
     const program = coinflipProgram(p);
     const config = await program.account.config.fetch(CONFIG_PDA);
 
-    const requestFee = networkState.config.requestFee;
-    const callbackDeadline = networkState.config.callbackDeadline;
-    console.log("ORAO request_fee:", requestFee.toString(), "lamports");
-    console.log("ORAO callback_deadline:", callbackDeadline.toString(), "slots");
-    console.log("Our refund_timeout_slots:", config.refundTimeoutSlots.toString());
+    // `8 + RandomnessV2::PENDING_SIZE` — what ORAO's RequestV2 allocates. ORAO
+    // shrinks the account to its fulfilled size on fulfillment and returns the
+    // freed rent to the request's client, i.e. to the joiner.
+    const PENDING_REQUEST_LEN = 749;
+    const FULFILLED_REQUEST_LEN = 137;
+    const [pendingRent, fulfilledRent] = await Promise.all([
+      p.connection.getMinimumBalanceForRentExemption(PENDING_REQUEST_LEN),
+      p.connection.getMinimumBalanceForRentExemption(FULFILLED_REQUEST_LEN),
+    ]);
 
-    // Mirrors join_game's own dynamic check.
-    const minTimeout = callbackDeadline.add(MIN_SETTLE_MARGIN_SLOTS);
-    if (minTimeout.gt(config.refundTimeoutSlots)) {
+    console.log("ORAO program:", vrf.programId.toBase58());
+    console.log("ORAO treasury:", networkState.config.treasury.toBase58());
+    console.log("ORAO request_fee:", networkState.config.requestFee.toString(), "lamports");
+    console.log("ORAO fulfillment authorities:", networkState.config.fulfillmentAuthorities.length);
+    console.log("Pending request rent (paid by the joiner):", pendingRent, "lamports");
+    console.log("Returned to the joiner on fulfillment:", pendingRent - fulfilledRent, "lamports");
+    console.log("Our refund_timeout_slots:", config.refundTimeoutSlots.toString());
+    console.log(
+      "Joiner's join-time lamport outlay (excl. tx fee and first-of-mint treasury ATA rent):",
+      networkState.config.requestFee.addn(pendingRent).toString()
+    );
+
+    // The floor is a program constant, so this can only trip if the deployed
+    // binary and the IDL this script reads disagree.
+    if (config.refundTimeoutSlots.lt(MIN_REFUND_TIMEOUT_SLOTS)) {
       console.warn(
-        `WARNING: callback_deadline + MIN_SETTLE_MARGIN_SLOTS (${minTimeout.toString()}) ` +
-          `exceeds refund_timeout_slots (${config.refundTimeoutSlots.toString()}) — join_game ` +
-          "will reject every join until refund_timeout_slots is raised via update_config."
+        `WARNING: refund_timeout_slots (${config.refundTimeoutSlots.toString()}) is below ` +
+          `MIN_REFUND_TIMEOUT_SLOTS (${MIN_REFUND_TIMEOUT_SLOTS.toString()}) — the IDL and the ` +
+          "deployed program are out of sync."
       );
       // Non-zero so this can gate a monitor/runbook, not just a human reading stdout.
       process.exitCode = 1;
-    } else {
-      console.log(
-        "OK: refund_timeout_slots clears ORAO's callback deadline by the required margin."
-      );
     }
   });
 
 cli
-  .command("settle-fallback")
+  .command("settle")
   .description(
-    "Runs the permissionless settle_fallback crank on a stuck game (the liveness " +
-      "backstop for when ORAO fulfills but the callback never runs)"
+    "Manually runs the permissionless `settle` instruction on one game — the " +
+      "same call the crank makes once ORAO fulfills the request"
   )
   .requiredOption("--game <pubkey>", "the game account's pubkey")
   .option(
@@ -274,7 +237,7 @@ cli
       : game.joinerTokenAccount;
 
     const tx = await program.methods
-      .settleFallback()
+      .settle()
       .accounts({
         cranker: p.wallet.publicKey,
         game: gamePubkey,
@@ -287,7 +250,7 @@ cli
         program: PROGRAM_ID,
       })
       .rpc();
-    console.log("settle_fallback tx:", tx);
+    console.log("settle tx:", tx);
   });
 
 await cli.parseAsync().catch((err) => {

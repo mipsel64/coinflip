@@ -1,11 +1,9 @@
 mod common;
 
-use anchor_lang::{InstructionData, ToAccountMetas};
 use anchor_spl::{associated_token::get_associated_token_address, token::spl_token};
 use common::*;
 use solana_sdk::{
     account::Account as SolanaAccount,
-    instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::TransactionError,
@@ -29,131 +27,12 @@ fn is_gone(svm: &litesvm::LiteSVM, address: &Pubkey) -> bool {
     svm.get_account(address).is_none_or(|a| a.lamports == 0)
 }
 
-/// The callback's account metas, exactly as ORAO would build them (`client` is
-/// a parameter so a test can forge that slot).
-fn settle_callback_metas(j: &JoinedGame, client: Pubkey) -> Vec<AccountMeta> {
-    coinflip::accounts::SettleCallback {
-        client,
-        config: config_pda(),
-        network_state: j.orao.network_state,
-        request: j.request,
-        game: j.fixture.game.pubkey(),
-        escrow: j.fixture.escrow,
-        host: j.fixture.host.pubkey(),
-        host_token_account: j.fixture.host_token_account,
-        joiner_token_account: j.joiner_token_account,
-        treasury_token_account: j.treasury_token_account,
-        mint: j.fixture.mint,
-        token_program: spl_token::ID,
-        event_authority: event_authority(),
-        program: coinflip::ID,
-    }
-    .to_account_metas(None)
-}
-
-fn settle_callback_ix(accounts: Vec<AccountMeta>) -> Instruction {
-    Instruction {
-        program_id: coinflip::ID,
-        accounts,
-        data: coinflip::instruction::SettleCallback {}.data(),
-    }
-}
-
-/// The oracle replays the account list frozen into the request at join time,
-/// prefixed by its own four fixed accounts. `SettleCallback` must therefore
-/// declare exactly that list, in that order, with that writability — a mismatch
-/// would only surface on-chain, at callback time.
-#[test]
-fn settle_callback_shape_matches_frozen_list() {
-    let (mut svm, payer) = setup();
-    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
-
-    let metas = settle_callback_metas(&j, j.orao.client);
-    // ORAO's fixed prefix: client (signer), state (our config), network_state, request.
-    assert_eq!(
-        metas[..4].iter().map(|m| m.pubkey).collect::<Vec<_>>(),
-        vec![j.orao.client, config_pda(), j.orao.network_state, j.request],
-    );
-    assert!(metas[0].is_signer, "ORAO signs as the client PDA");
-    // ...then our accounts, which must match the request's validated callback.
-    assert_eq!(
-        metas[4..]
-            .iter()
-            .map(|m| (m.pubkey, m.is_writable))
-            .collect::<Vec<_>>(),
-        request_callback_account_metas(&svm, &j.request),
-    );
-}
-
-/// Without the ORAO client PDA's signature the callback is inert — anyone could
-/// otherwise settle a game the instant the request is fulfilled.
-#[test]
-fn settle_callback_rejects_unsigned_client() {
-    let (mut svm, payer) = setup();
-    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(2),
-    );
-
-    let mut accounts = settle_callback_metas(&j, j.orao.client);
-    // We cannot sign as the client PDA — flip the meta to non-signer to even
-    // get the tx past sanitization; the program must still reject it.
-    for meta in accounts.iter_mut() {
-        meta.is_signer = false;
-    }
-
-    let result = send(&mut svm, &[&payer], &[settle_callback_ix(accounts)]);
-    assert_anchor_error(result, anchor_lang::error::ErrorCode::ConstraintSigner);
-    assert_eq!(token_balance(&svm, &j.fixture.escrow), POT);
-}
-
-/// ...and the signature must come from THE client PDA: a self-signed keypair in
-/// that slot is not the oracle.
-#[test]
-fn settle_callback_rejects_forged_client_account() {
-    let (mut svm, payer) = setup();
-    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(2),
-    );
-
-    let mallory = Keypair::new();
-    svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
-
-    let result = send(
-        &mut svm,
-        &[&payer, &mallory],
-        &[settle_callback_ix(settle_callback_metas(
-            &j,
-            mallory.pubkey(),
-        ))],
-    );
-    // Mallory's account is not even an ORAO-owned `Client`, so it fails before
-    // the seeds check ever runs.
-    assert_anchor_error(
-        result,
-        anchor_lang::error::ErrorCode::AccountOwnedByWrongProgram,
-    );
-    assert_eq!(token_balance(&svm, &j.fixture.escrow), POT);
-}
-
 #[test]
 fn settle_pays_host_when_host_side_wins() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
     // host_side = Heads (0); randomness[0] even => Heads => host wins.
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(2),
-    );
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(2));
 
     let game_key = j.fixture.game.pubkey();
     let host = j.fixture.host.pubkey();
@@ -163,7 +42,7 @@ fn settle_pays_host_when_host_side_wins() {
     let escrow_rent = svm.get_account(&j.fixture.escrow).unwrap().lamports;
     let host_lamports_before = svm.get_account(&host).unwrap().lamports;
 
-    let ix = ix_settle_fallback(&j, payer.pubkey());
+    let ix = ix_settle(&j, payer.pubkey());
     let meta = send_ok(&mut svm, &[&payer], std::slice::from_ref(&ix));
 
     // pot 10, fee 1% = 0.1, payout 9.9 (in base units)
@@ -181,8 +60,9 @@ fn settle_pays_host_when_host_side_wins() {
         "both rents must return to the host"
     );
 
-    // Budget guard: two transfers + a close + the event CPI (measured ~42k with
-    // both payout accounts recorded; the ATA-fallback path derives two more).
+    // Budget guard: the request PDA derivation + two transfers + a close + the
+    // event CPI (measured ~47k with both payout accounts recorded; the
+    // ATA-fallback path derives two more).
     assert!(
         meta.compute_units_consumed < 60_000,
         "settle used {} CU",
@@ -209,14 +89,9 @@ fn settle_pays_joiner_when_host_side_loses() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
     // randomness[0] odd => Tails => joiner (host picked Heads) wins.
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(3),
-    );
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(3));
 
-    let ix = ix_settle_fallback(&j, payer.pubkey());
+    let ix = ix_settle(&j, payer.pubkey());
     let meta = send_ok(&mut svm, &[&payer], std::slice::from_ref(&ix));
 
     assert_eq!(
@@ -245,11 +120,7 @@ fn settle_before_fulfillment_fails() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
     // Request exists (real, pending) but is NOT fulfilled.
-    let result = send(
-        &mut svm,
-        &[&payer],
-        &[ix_settle_fallback(&j, payer.pubkey())],
-    );
+    let result = send(&mut svm, &[&payer], &[ix_settle(&j, payer.pubkey())]);
     assert_coinflip_error(
         result,
         coinflip::errors::CoinflipError::RandomnessNotFulfilled,
@@ -260,26 +131,13 @@ fn settle_before_fulfillment_fails() {
 fn settle_twice_fails() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(0),
-    );
-    send_ok(
-        &mut svm,
-        &[&payer],
-        &[ix_settle_fallback(&j, payer.pubkey())],
-    );
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(0));
+    send_ok(&mut svm, &[&payer], &[ix_settle(&j, payer.pubkey())]);
 
     // The game account is closed, so a second settle can't even load it — and
     // `send` expires the blockhash, so this really is a fresh transaction and
     // not a duplicate the runtime dropped before execution.
-    let result = send(
-        &mut svm,
-        &[&payer],
-        &[ix_settle_fallback(&j, payer.pubkey())],
-    );
+    let result = send(&mut svm, &[&payer], &[ix_settle(&j, payer.pubkey())]);
     let failure = result.unwrap_err();
     assert!(
         !matches!(failure.err, TransactionError::AlreadyProcessed),
@@ -303,15 +161,11 @@ fn settle_twice_fails() {
 /// payout still lands — but only in their canonical ATA, which anyone can
 /// re-create permissionlessly.
 #[test]
-fn settle_fallback_pays_ata_when_recorded_account_is_gone() {
+fn settle_pays_ata_when_recorded_account_is_gone() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(2), // host wins
-    );
+    // randomness[0] even => Heads => the host (who picked Heads) wins.
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(2));
     // The recorded account is closed after the join (0 lamports, no data).
     svm.set_account(j.fixture.host_token_account, SolanaAccount::default())
         .unwrap();
@@ -327,7 +181,7 @@ fn settle_fallback_pays_ata_when_recorded_account_is_gone() {
     send_ok(
         &mut svm,
         &[&payer],
-        &[ix_settle_fallback_full(
+        &[ix_settle_full(
             &j,
             payer.pubkey(),
             host_ata,
@@ -343,22 +197,18 @@ fn settle_fallback_pays_ata_when_recorded_account_is_gone() {
 /// ...and nothing else: a cranker cannot redirect the payout into some other
 /// account the winner happens to own (which could carry a delegate).
 #[test]
-fn settle_fallback_rejects_non_ata_payout_account() {
+fn settle_rejects_non_ata_payout_account() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(2), // host wins
-    );
+    // randomness[0] even => Heads => the host (who picked Heads) wins.
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(2));
     // Host-owned, right mint — but neither the recorded account nor the ATA.
     let side_account = create_token_account(&mut svm, j.fixture.mint, j.fixture.host.pubkey(), 0);
 
     let result = send(
         &mut svm,
         &[&payer],
-        &[ix_settle_fallback_full(
+        &[ix_settle_full(
             &j,
             payer.pubkey(),
             side_account,
@@ -380,12 +230,7 @@ fn settle_fallback_rejects_non_ata_payout_account() {
 fn settle_rejects_non_treasury_fee_account() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(2),
-    );
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(2));
     // Right mint, real token accounts — one owned by a random key, one owned by
     // the treasury itself but sitting at a non-ATA address.
     let mallory_ta = create_token_account(&mut svm, j.fixture.mint, Pubkey::new_unique(), 0);
@@ -395,7 +240,7 @@ fn settle_rejects_non_treasury_fee_account() {
         let result = send(
             &mut svm,
             &[&payer],
-            &[ix_settle_fallback_full(
+            &[ix_settle_full(
                 &j,
                 payer.pubkey(),
                 j.fixture.host_token_account,
@@ -447,13 +292,9 @@ fn settlement_drains_donated_dust_to_winner() {
     );
     assert_eq!(token_balance(&svm, &j.fixture.escrow), POT + DUST);
 
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(2), // host wins
-    );
-    let ix = ix_settle_fallback(&j, payer.pubkey());
+    // randomness[0] even => Heads => the host (who picked Heads) wins.
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(2));
+    let ix = ix_settle(&j, payer.pubkey());
     let meta = send_ok(&mut svm, &[&payer], std::slice::from_ref(&ix));
 
     // Fee is charged on the FULL escrow balance, not on 2 * stake.
@@ -489,7 +330,7 @@ fn settle_rejects_foreign_request() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
 
-    // A second game on the same config/ORAO client, joined and fulfilled.
+    // A second game on the same config, joined and fulfilled.
     let host_b = Keypair::new();
     svm.airdrop(&host_b.pubkey(), 10_000_000_000).unwrap();
     let host_b_ta = create_token_account(&mut svm, j.fixture.mint, host_b.pubkey(), STAKE * 10);
@@ -525,7 +366,6 @@ fn settle_rejects_foreign_request() {
     );
     let request_b = write_fulfilled_request(
         &mut svm,
-        j.orao.client,
         vrf_seed_for(&game_b_key, &joiner_b.pubkey()),
         randomness_with_first_byte(2),
     );
@@ -533,7 +373,7 @@ fn settle_rejects_foreign_request() {
     let result = send(
         &mut svm,
         &[&payer],
-        &[ix_settle_fallback_with_request(
+        &[ix_settle_with_request(
             &j,
             payer.pubkey(),
             request_b,
@@ -555,14 +395,10 @@ fn settle_rejects_foreign_request() {
 fn zero_fee_game_settles_full_pot() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game_with_fee(&mut svm, &payer, STAKE, 0);
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(2), // host wins
-    );
+    // randomness[0] even => Heads => the host (who picked Heads) wins.
+    write_fulfilled_request(&mut svm, j.vrf_seed, randomness_with_first_byte(2));
 
-    let ix = ix_settle_fallback(&j, payer.pubkey());
+    let ix = ix_settle(&j, payer.pubkey());
     let meta = send_ok(&mut svm, &[&payer], std::slice::from_ref(&ix));
 
     assert_eq!(

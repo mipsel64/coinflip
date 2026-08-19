@@ -12,24 +12,22 @@ All notable changes to this project are documented in this file, in the
     admin, a configurable protocol fee (default 1%, hard cap 10%), and a
     bounded `refund_timeout_slots`.
   - Treasury as a compile-time constant (`coinflip::treasury::ID`, exported to
-    the IDL as `TREASURY`) rather than admin-rotatable config state: both
-    settle paths pin the fee account to the treasury's **canonical ATA** by
-    derivation, so a frozen callback account list and a later fallback crank
-    can never disagree, and a permissionless cranker cannot scatter fees across
-    other treasury-owned accounts. Rotating the treasury is a program upgrade.
+    the IDL as `TREASURY`) rather than admin-rotatable config state: `settle`
+    pins the fee account to the treasury's **canonical ATA** by derivation, so
+    a permissionless cranker cannot scatter fees across other treasury-owned
+    accounts. Rotating the treasury is a program upgrade.
     The `local` cargo feature swaps it for a committed test keypair (constants
     and IDs only, never logic) — e2e builds use it, deployments must not, and
     a build script warns loudly whenever it is on.
   - `create_game` / `cancel_game`: host opens a game against any accepted
     SPL/Token-2022 mint, escrowing the stake; cancellable before a joiner
     arrives.
-  - `join_game`: joiner matches the stake and CPIs an ORAO Callback VRF
-    `Request`, reimbursing the VRF fee and pending-request rent so the
-    program's ORAO Client PDA balance stays neutral per join.
-  - `settle_callback` / `settle_fallback`: ORAO's oracle normally settles the
-    game directly via callback (no third transaction); `settle_fallback` is
-    a permissionless backstop for a fulfilled-but-uncallbacked request. Both
-    share one core settlement function.
+  - `join_game`: joiner matches the stake and CPIs ORAO VRF's `request_v2` as
+    ORAO's own payer — the VRF fee and the request account's rent come
+    straight out of the joiner's wallet, so the program holds no float and
+    needs no ORAO registration.
+  - `settle`: permissionless settlement once ORAO has fulfilled the request.
+    Sent by the crank in practice; anyone can send it.
   - `refund_timeout`: permissionless backstop returning both stakes if
     randomness is never fulfilled within the timeout.
   - Deny-by-default mint validation (rejects transfer-fee, transfer-hook,
@@ -39,14 +37,41 @@ All notable changes to this project are documented in this file, in the
   - Events (`GameCreated`, `GameJoined`, `GameSettled`, `GameCancelled`,
     `GameRefunded`) emitted via `emit_cpi!`, since game and escrow accounts
     close on every terminal state.
-  - Ops CLI (`scripts/register.ts`, `scripts/smoke.ts`) for one-time ORAO
-    client registration/deposit, config init, a live devnet smoke test, and a
-    manual `settle_fallback` crank invocation.
+  - Ops CLI (`scripts/ops.ts`) for config init, an ORAO health/cost check, and
+    a manual `settle`; `scripts/smoke.ts` plays a real devnet game end to end
+    (create → join → poll ORAO for fulfillment → `settle` → decode
+    `GameSettled`), which is exactly the production crank flow.
   - `scripts/verify-artifact.ts`: proves a build is deployable before (and,
     with `--url`, after) it ships — byte-probes `target/deploy/coinflip.so` or
     the on-chain ProgramData for the treasury constant it actually carries, and
     rejects a `--features local` binary or IDL. Needs no keypair; exits 1 on
     any failure. Shared IDL access lives in `scripts/idl.ts`.
+
+### Changed
+
+- **Randomness moved from ORAO Callback VRF to plain ORAO VRF with crank
+  settlement** (nothing was deployed, so this is a pre-release redesign rather
+  than a breaking change to a live program):
+  - Dependency `orao-solana-vrf-cb` 0.4 → `orao-solana-vrf` 0.7 (program
+    `VRFCBePmGTpZ234BhbzNNzmyg39Rgdd6VgdfhHwKypU` →
+    `VRFzZoJdhFWL8rkvu87LpKM3RbcVezpMEc6X5GVDr7y`).
+  - `settle_callback` **deleted**; `settle_fallback` renamed `settle` and
+    promoted from backstop to the one settlement path. The instruction count
+    drops from 8 to 7.
+  - `join_game` loses `host`, `host_token_account`, and the ORAO client
+    accounts, along with the fee-reimbursement transfer and the
+    `refund_timeout_slots >= callback_deadline + MIN_SETTLE_MARGIN_SLOTS`
+    invariant. The joiner is now ORAO's payer.
+  - `MIN_REFUND_TIMEOUT_SLOTS` 18_000 → 1_500 (~10 min); `MIN_SETTLE_MARGIN_SLOTS`
+    removed — both existed only to clear the callback-retry deadline.
+  - `UnauthorizedVrfClient` (6009) is retired but keeps its slot; error codes
+    stay append-only.
+  - No ORAO client registration or deposit: `scripts/register.ts` is now
+    `scripts/ops.ts` without its `register`/`deposit` subcommands, and
+    `settle-fallback` is now `settle`.
+  - Joiner economics improved: they front ~0.0066 SOL at join and ORAO returns
+    ~0.00426 SOL of it to them when it fulfills (the freed request rent), where
+    the callback design routed that surplus to a program-owned Client PDA.
 
 ### Notes for integrators
 
@@ -62,8 +87,12 @@ All notable changes to this project are documented in this file, in the
   canonical ATA for the bet mint — Token-2022 games must pass `tokenProgram`
   explicitly so the client derives the same address the program does. See the
   README's "Downstream contract".
-- Both players' payout token accounts must exist at join time — the
-  callback's account list is fixed when the VRF request is made, before the
-  winner is known, and the callback itself cannot create accounts.
+- Settlement is a third transaction, and it is permissionless: the crank sends
+  it, but a client that wants the result sooner can read the ORAO request
+  account directly — the randomness is public the moment ORAO fulfills, before
+  `settle` lands.
+- Both players' payout token accounts are recorded at create/join; `settle`
+  and `refund_timeout` accept the recorded account **or** the player's
+  canonical ATA, so a closed account never strands funds.
 - Error codes (`errors.rs`) and event layouts (`events.rs`) are append-only
   ABI from this point forward.

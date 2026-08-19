@@ -53,8 +53,8 @@ mod tests {
 
     #[test]
     fn timeout_bounds() {
-        assert!(Config::validate_timeout(17_999).is_err());
-        assert!(Config::validate_timeout(18_000).is_ok());
+        assert!(Config::validate_timeout(1_499).is_err());
+        assert!(Config::validate_timeout(1_500).is_ok());
         assert!(Config::validate_timeout(10_000_000).is_ok());
         assert!(Config::validate_timeout(10_000_001).is_err());
     }

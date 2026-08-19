@@ -20,9 +20,11 @@ pub enum CoinflipError {
     UnsupportedMintExtension, // 6006
     #[msg("randomness request is not fulfilled yet")]
     RandomnessNotFulfilled, // 6007
-    #[msg("randomness already fulfilled; call settle_fallback instead")]
+    #[msg("randomness already fulfilled; call settle instead")]
     AlreadyFulfilled, // 6008
-    #[msg("callback caller is not the registered VRF client")]
+    /// Retired with the callback VRF (Task 17). The slot stays reserved:
+    /// codes are ABI and must never be reused for a different meaning.
+    #[msg("retired: callback caller is not the registered VRF client")]
     UnauthorizedVrfClient, // 6009
     #[msg("refund timeout has not been reached")]
     TimeoutNotReached, // 6010

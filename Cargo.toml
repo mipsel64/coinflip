@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.dependencies]
 anchor-lang = "0.32.1"
 anchor-spl = "0.32.1"
-orao-solana-vrf-cb = { version = "0.4", default-features = false, features = ["cpi"] }
+orao-solana-vrf = { version = "0.7", default-features = false, features = ["cpi"] }
 solana-sha256-hasher = "2.3"
 num_enum = "0.7"
 static_assertions = "1.1"

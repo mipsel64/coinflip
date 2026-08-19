@@ -76,7 +76,7 @@ jobs:
       # compile standalone.
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test -p coinflip
-      # scripts/register.ts and scripts/smoke.ts import the target/types
+      # scripts/ops.ts and scripts/smoke.ts import the target/types
       # generated above, so this runs here rather than as a separate job —
       # a separate job would need artifact upload/download to see that file.
       - name: scripts typecheck

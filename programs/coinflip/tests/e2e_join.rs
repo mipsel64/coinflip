@@ -29,7 +29,6 @@ fn join_escrows_stake_and_creates_vrf_request() {
     svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
     let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), stake * 10);
 
-    let client_before = svm.get_account(&orao.client).unwrap().lamports;
     let joiner_before = svm.get_account(&joiner.pubkey()).unwrap().lamports;
 
     let ix = ix_join_game(&f, &orao, joiner.pubkey(), joiner_ta);
@@ -40,7 +39,7 @@ fn join_escrows_stake_and_creates_vrf_request() {
     assert_eq!(token_balance(&svm, &joiner_ta), stake * 10 - stake);
 
     let vrf_seed = vrf_seed_for(&f.game.pubkey(), &joiner.pubkey());
-    let request_addr = request_pda(&orao.client, &vrf_seed);
+    let request_addr = request_pda(&vrf_seed);
     let game = read_game(&svm, &f.game.pubkey());
     assert_eq!(game.state, u8::from(GameState::AwaitingRandomness));
     assert_eq!(game.joiner, joiner.pubkey());
@@ -55,25 +54,29 @@ fn join_escrows_stake_and_creates_vrf_request() {
     let request = svm
         .get_account(&request_addr)
         .expect("request account must exist");
-    assert_eq!(request.owner, orao_solana_vrf_cb::ID);
+    assert_eq!(request.owner, orao_solana_vrf::ID);
+    assert_eq!(
+        request.data.len(),
+        PENDING_REQUEST_LEN,
+        "ORAO allocates 8 + RandomnessV2::PENDING_SIZE for a pending request"
+    );
     let request_rent = svm.minimum_balance_for_rent_exemption(request.data.len());
     assert_eq!(request.lamports, request_rent);
+    // The joiner is ORAO's `client` for this request: whatever the oracle
+    // refunds at fulfillment goes back to them, not to this program.
+    let pending = read_request(&svm, &request_addr);
+    assert_eq!(*pending.client(), joiner.pubkey());
+    assert_eq!(*pending.seed(), vrf_seed);
+    assert!(pending.fulfilled().is_none(), "request must start pending");
 
-    // The joiner reimbursed the VRF fee, which ORAO moved on to its treasury.
+    // The joiner paid ORAO's request fee straight into ORAO's treasury — no
+    // Client PDA float, no reimbursement leg.
     assert_eq!(
         svm.get_account(&orao.orao_treasury).unwrap().lamports,
         ORAO_TREASURY_START_LAMPORTS + REQUEST_FEE
     );
 
-    // The shared Client PDA comes out exactly neutral: it paid the fee and the
-    // request's rent and was reimbursed for precisely that, so repeated joins
-    // cannot drain the balance every client of this program shares.
-    assert_eq!(
-        svm.get_account(&orao.client).unwrap().lamports,
-        client_before
-    );
-
-    // The treasury ATA exists ahead of settlement (the callback can't pay rent).
+    // The treasury ATA exists ahead of settlement, so no cranker ever pays for it.
     let treasury_ata = get_associated_token_address(&treasury(), &f.mint);
     let treasury_ata_rent = svm
         .get_account(&treasury_ata)
@@ -81,9 +84,9 @@ fn join_escrows_stake_and_creates_vrf_request() {
         .lamports;
     assert_eq!(token_balance(&svm, &treasury_ata), 0);
 
-    // Everything the joiner spends in lamports (i.e. stake aside): the VRF fee
-    // and request rent it reimburses the client for, the treasury ATA's rent
-    // it pre-pays, and the one-signature tx fee.
+    // Everything the joiner spends in lamports (i.e. stake aside): ORAO's
+    // request fee, the request account's rent, the treasury ATA's rent it
+    // pre-pays, and the one-signature tx fee.
     let tx_fee = 5_000;
     assert_eq!(
         joiner_before - svm.get_account(&joiner.pubkey()).unwrap().lamports,
@@ -108,63 +111,6 @@ fn join_escrows_stake_and_creates_vrf_request() {
     assert_eq!(ev.game, f.game.pubkey());
     assert_eq!(ev.joiner, joiner.pubkey());
     assert_eq!(ev.vrf_request, request_addr);
-}
-
-/// The refund window must open a settle-margin AFTER ORAO stops retrying the
-/// callback. If the oracle widens its deadline past what our config allows for,
-/// joins stop rather than opening a window where a loser could read the
-/// bare-fulfilled randomness and race a refund.
-#[test]
-fn join_rejects_timeout_below_orao_deadline_margin() {
-    let (mut svm, payer) = setup();
-    let stake = 5_000_000_000;
-    let (f, _create_meta) = setup_open_game(&mut svm, &payer, stake);
-    // 17_000 + 1_800 margin > the config's 18_000 refund timeout.
-    let orao = setup_orao_with_deadline(&mut svm, 17_000);
-    let joiner = Keypair::new();
-    svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
-    let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), stake * 10);
-
-    let result = send(
-        &mut svm,
-        &[&joiner],
-        &[ix_join_game(&f, &orao, joiner.pubkey(), joiner_ta)],
-    );
-    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidTimeout);
-
-    // The join never happened: only the host's stake is escrowed.
-    assert_eq!(token_balance(&svm, &f.escrow), stake);
-    assert_eq!(token_balance(&svm, &joiner_ta), stake * 10);
-    assert_eq!(
-        read_game(&svm, &f.game.pubkey()).state,
-        u8::from(GameState::Open)
-    );
-}
-
-/// The callback account list is frozen into the request at join time; the
-/// `SettleCallback` accounts struct must line up with it position for
-/// position, so pin the exact order here.
-#[test]
-fn join_pins_callback_account_order() {
-    let (mut svm, payer) = setup();
-    let (joined, _meta) = setup_joined_game(&mut svm, &payer, 1_000);
-    let f = &joined.fixture;
-
-    assert_eq!(
-        request_callback_account_metas(&svm, &joined.request),
-        vec![
-            (f.game.pubkey(), true),
-            (f.escrow, true),
-            (f.host.pubkey(), true),
-            (f.host_token_account, true),
-            (joined.joiner_token_account, true),
-            (joined.treasury_token_account, true),
-            (f.mint, false),
-            (anchor_spl::token::ID, false),
-            (event_authority(), false),
-            (coinflip::ID, false),
-        ],
-    );
 }
 
 /// Token-2022 end to end: create and join a game whose mint carries an allowed
@@ -324,9 +270,8 @@ fn join_with_third_party_token_account_fails() {
     assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
 }
 
-/// The fee destination must be the treasury's canonical ATA — the address the
-/// callback will be frozen against — not any account the treasury happens to
-/// own.
+/// The fee destination must be the treasury's canonical ATA — the address
+/// `settle` will pin — not any account the treasury happens to own.
 #[test]
 fn join_with_non_ata_treasury_account_fails() {
     let (mut svm, payer) = setup();
@@ -353,11 +298,12 @@ fn join_with_non_ata_treasury_account_fails() {
     );
 }
 
-/// The reason the seed is hashed: with the seed being the game pubkey alone,
-/// anyone could derive an open game's request address and pre-fund it with one
-/// lamport, permanently blocking the join. That address is now irrelevant.
+/// Plain VRF creates the request with Anchor's `init`, which absorbs a
+/// pre-existing lamport balance instead of failing on it — so the one-lamport
+/// grief that the callback VRF's raw `create_account` was vulnerable to does
+/// not block a join here, at the real address or any other.
 #[test]
-fn pre_funded_game_keyed_request_address_does_not_block_join() {
+fn pre_funded_request_address_does_not_block_join() {
     let (mut svm, payer) = setup();
     let (f, _meta) = setup_open_game(&mut svm, &payer, 1_000);
     let orao = setup_orao(&mut svm);
@@ -365,9 +311,12 @@ fn pre_funded_game_keyed_request_address_does_not_block_join() {
     svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
     let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), 10_000);
 
-    // The address the old (game-keyed) scheme would have used.
-    let guessable = request_pda(&orao.client, &f.game.pubkey().to_bytes());
-    svm.airdrop(&guessable, 1).unwrap();
+    // Both the address the old (game-keyed) scheme would have used and the one
+    // this join will ACTUALLY use.
+    svm.airdrop(&request_pda(&f.game.pubkey().to_bytes()), 1)
+        .unwrap();
+    let real = request_pda(&vrf_seed_for(&f.game.pubkey(), &joiner.pubkey()));
+    svm.airdrop(&real, 1).unwrap();
 
     send_ok(
         &mut svm,
@@ -378,11 +327,14 @@ fn pre_funded_game_keyed_request_address_does_not_block_join() {
     assert_eq!(game.state, u8::from(GameState::AwaitingRandomness));
 }
 
-/// Control for the test above: pre-funding the address the join will ACTUALLY
-/// use does block it, so the defense is the seed's unpredictability, not any
-/// immunity to pre-funding.
+/// What the hashed seed actually defends against under plain VRF: requests
+/// live in ORAO's GLOBAL namespace, so anyone may create one for any seed. If
+/// the seed were the game pubkey (public the moment a game opens), an attacker
+/// could send ORAO's own `request_v2` first and permanently block that game's
+/// join. Prove the block is real for a seed the attacker can predict — which
+/// is exactly why the real seed is `sha256(.., game, joiner)`.
 #[test]
-fn pre_funded_real_request_address_blocks_join() {
+fn front_run_request_for_the_same_seed_blocks_join() {
     let (mut svm, payer) = setup();
     let (f, _meta) = setup_open_game(&mut svm, &payer, 1_000);
     let orao = setup_orao(&mut svm);
@@ -390,26 +342,38 @@ fn pre_funded_real_request_address_blocks_join() {
     svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
     let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), 10_000);
 
-    let real = request_pda(
-        &orao.client,
-        &vrf_seed_for(&f.game.pubkey(), &joiner.pubkey()),
+    // The attacker knows (or guesses) the joiner, so they can derive the seed.
+    let mallory = Keypair::new();
+    svm.airdrop(&mallory.pubkey(), 10_000_000_000).unwrap();
+    let seed = vrf_seed_for(&f.game.pubkey(), &joiner.pubkey());
+    send_ok(
+        &mut svm,
+        &[&mallory],
+        &[ix_orao_request_v2(&orao, mallory.pubkey(), seed)],
     );
-    svm.airdrop(&real, 1).unwrap();
 
     let result = send(
         &mut svm,
         &[&joiner],
         &[ix_join_game(&f, &orao, joiner.pubkey(), joiner_ta)],
     );
-    // The system program refuses to create an account that already holds
-    // lamports: SystemError::AccountAlreadyInUse == Custom(0). (Anchor-level
-    // errors are all >= 6000, so this code is unambiguous.)
+    // Anchor's `init` refuses an address that already holds an initialized
+    // account owned by someone else.
+    // Anchor's `init` falls back to allocate+assign on a pre-funded address,
+    // and the system program refuses to allocate an account that already has
+    // data: SystemError::AccountAlreadyInUse == Custom(0). (Anchor-level codes
+    // are all >= 2000, so this one is unambiguous.)
     assert!(
         matches!(
             result.unwrap_err().err,
             TransactionError::InstructionError(_, InstructionError::Custom(0))
         ),
-        "expected the ORAO request creation to hit AccountAlreadyInUse"
+        "the join must fail once the request account already exists"
+    );
+    assert_eq!(
+        read_game(&svm, &f.game.pubkey()).state,
+        u8::from(GameState::Open),
+        "the blocked join must leave the game untouched"
     );
 }
 

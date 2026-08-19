@@ -59,12 +59,8 @@ pub mod coinflip {
         instructions::join_game::handle(ctx)
     }
 
-    pub fn settle_callback(ctx: Context<SettleCallback>) -> Result<()> {
-        instructions::settle_callback::handle(ctx)
-    }
-
-    pub fn settle_fallback(ctx: Context<SettleFallback>) -> Result<()> {
-        instructions::settle_fallback::handle(ctx)
+    pub fn settle(ctx: Context<Settle>) -> Result<()> {
+        instructions::settle::handle(ctx)
     }
 
     pub fn refund_timeout(ctx: Context<RefundTimeout>) -> Result<()> {

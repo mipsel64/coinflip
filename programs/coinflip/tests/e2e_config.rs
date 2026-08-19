@@ -2,9 +2,7 @@ mod common;
 
 use anchor_lang::AccountDeserialize;
 use common::*;
-use orao_solana_vrf_cb::state::{
-    client::Client, network_state::NetworkState, request::RequestAccount,
-};
+use orao_solana_vrf::state::NetworkState;
 use solana_sdk::{pubkey::Pubkey, signature::Signer, transaction::TransactionError};
 
 #[test]
@@ -242,35 +240,57 @@ fn admin_rotation_round_trip() {
     );
 }
 
-/// Verifies the crafted ORAO accounts (`NetworkState`, `Client`, a fulfilled
-/// `RequestAccount`) actually round-trip through Anchor's own deserializer
-/// with the shapes/values the rest of the harness assumes, instead of only
-/// ever being read back out through our own hand-rolled writer. Covers the
-/// ORAO side of the harness that later tasks (join/settle) depend on.
+/// The floor moved with the callback's removal (18_000 → 1_500 slots): pin
+/// both sides of the boundary against the deployed program, not just the
+/// host-side unit test in `state/config.rs`.
+#[test]
+fn init_config_pins_the_timeout_floor() {
+    let (mut svm, payer) = setup();
+    let result = send(
+        &mut svm,
+        &[&payer],
+        &[ix_initialize_config(
+            payer.pubkey(),
+            payer.pubkey(),
+            DEFAULT_FEE_BPS,
+            coinflip::constants::MIN_REFUND_TIMEOUT_SLOTS - 1,
+        )],
+    );
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidTimeout);
+
+    send_ok(
+        &mut svm,
+        &[&payer],
+        &[ix_initialize_config(
+            payer.pubkey(),
+            payer.pubkey(),
+            DEFAULT_FEE_BPS,
+            coinflip::constants::MIN_REFUND_TIMEOUT_SLOTS,
+        )],
+    );
+}
+
+/// Verifies the crafted ORAO accounts (`NetworkState` and a fulfilled
+/// `RandomnessV2`) actually round-trip through Anchor's own deserializer with
+/// the shapes/values the rest of the harness assumes, instead of only ever
+/// being read back out through our own hand-rolled writer.
 #[test]
 fn orao_accounts_round_trip() {
     let (mut svm, _payer) = setup();
     let orao = setup_orao(&mut svm);
     let game = Pubkey::new_unique();
     let joiner = Pubkey::new_unique();
+    let seed = vrf_seed_for(&game, &joiner);
     let randomness = [7u8; 64];
-    let request_addr = write_fulfilled_request_unchecked(
-        &mut svm,
-        orao.client,
-        vrf_seed_for(&game, &joiner),
-        randomness,
-    );
+    let request_addr = write_fulfilled_request_unchecked(&mut svm, joiner, seed, randomness);
 
     let ns_account = svm.get_account(&orao.network_state).unwrap();
     let network_state = NetworkState::try_deserialize(&mut &ns_account.data[..]).unwrap();
     assert_eq!(network_state.config.request_fee, REQUEST_FEE);
+    assert_eq!(network_state.config.treasury, orao.orao_treasury);
 
-    let client_account = svm.get_account(&orao.client).unwrap();
-    let client = Client::try_deserialize(&mut &client_account.data[..]).unwrap();
-    assert_eq!(client.state, config_pda());
-    assert_eq!(client.program, coinflip::ID);
-
-    let request_account = svm.get_account(&request_addr).unwrap();
-    let request = RequestAccount::try_deserialize(&mut &request_account.data[..]).unwrap();
+    let request = read_request(&svm, &request_addr);
     assert_eq!(request.fulfilled().unwrap().randomness, randomness);
+    assert_eq!(*request.seed(), seed);
+    assert_eq!(*request.client(), joiner);
 }

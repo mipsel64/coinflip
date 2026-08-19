@@ -2,10 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{
     self, CloseAccount, Mint, TokenAccount, TokenInterface, TransferChecked,
 };
-use orao_solana_vrf_cb::{
-    state::{client::Client, request::RequestAccount},
-    CB_CLIENT_ACCOUNT_SEED, CB_REQUEST_ACCOUNT_SEED,
-};
+use orao_solana_vrf::{state::RandomnessV2, RANDOMNESS_ACCOUNT_SEED};
 
 use crate::{
     constants::{CONFIG_SEED, ESCROW_SEED},
@@ -22,19 +19,14 @@ pub struct RefundTimeout<'info> {
     pub cranker: Signer<'info>,
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
+    /// Seed binding: this must be THE request for this game. The seed lives in
+    /// ORAO's global request namespace, so `game.vrf_seed` is the whole binding.
     #[account(
-        seeds = [CB_CLIENT_ACCOUNT_SEED, crate::ID.as_ref(), config.key().as_ref()],
-        seeds::program = orao_solana_vrf_cb::ID,
-        bump = client.bump,
+        seeds = [RANDOMNESS_ACCOUNT_SEED, game.vrf_seed.as_ref()],
+        seeds::program = orao_solana_vrf::ID,
+        bump,
     )]
-    pub client: Box<Account<'info, Client>>,
-    /// Seed binding: this must be THE request for this game.
-    #[account(
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.vrf_seed.as_ref()],
-        seeds::program = orao_solana_vrf_cb::ID,
-        bump = request.bump,
-    )]
-    pub request: Box<Account<'info, RequestAccount>>,
+    pub request: Box<Account<'info, RandomnessV2>>,
     #[account(mut, close = host)]
     pub game: Box<Account<'info, Game>>,
     #[account(mut, seeds = [ESCROW_SEED, game.key().as_ref()], bump = game.escrow_bump)]
@@ -74,9 +66,8 @@ pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
         ctx.accounts.request.fulfilled().is_none(),
         CoinflipError::AlreadyFulfilled
     );
-    // The game's own snapshot, not live config: the margin over ORAO's callback
-    // deadline was verified at join, and an admin lowering the timeout later
-    // must not open an early, informed refund on a game already in flight.
+    // The game's own snapshot, not live config: an admin lowering the timeout
+    // later must not open an early, informed refund on a game already in flight.
     let deadline = ctx
         .accounts
         .game
@@ -88,7 +79,7 @@ pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
         CoinflipError::TimeoutNotReached
     );
     // Permissionless cranker: refunds may only land on recorded-or-ATA
-    // destinations (same rule as settle_fallback; see settlement.rs).
+    // destinations (same rule as settle; see settlement.rs).
     require_payout_account(
         &ctx.accounts.host_token_account,
         ctx.accounts.game.host_token_account,

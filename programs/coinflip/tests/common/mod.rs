@@ -17,10 +17,9 @@ use litesvm::{
     types::{FailedTransactionMetadata, TransactionMetadata},
     LiteSVM,
 };
-use orao_solana_vrf_cb::state::{
-    client::Client,
-    network_state::{NetworkConfiguration, NetworkState},
-    request::{Fulfilled, RequestAccount, RequestState},
+use orao_solana_vrf::{
+    network_state_account_address, randomness_account_address,
+    state::{FulfilledRequest, NetworkConfiguration, NetworkState, RandomnessV2, RequestAccount},
 };
 use solana_sdk::{
     account::Account as SolanaAccount,
@@ -43,10 +42,11 @@ pub const REQUEST_FEE: u64 = 1_000_000; // what our crafted NetworkState charges
 /// deltas against it.
 pub const ORAO_TREASURY_START_LAMPORTS: u64 = LAMPORTS_PER_SOL;
 pub const DEFAULT_FEE_BPS: u16 = 100;
-pub const DEFAULT_TIMEOUT_SLOTS: u64 = 18_000;
-/// `NetworkConfiguration::DEFAULT_CALLBACK_DEADLINE` (crate-private): ~1 hour
-/// of 400ms slots. `DEFAULT_TIMEOUT_SLOTS` clears it by more than the margin.
-pub const ORAO_DEFAULT_CALLBACK_DEADLINE: u64 = 1000 * 60 * 60 / 400;
+/// The floor (`MIN_REFUND_TIMEOUT_SLOTS`); refund tests warp past it anyway.
+pub const DEFAULT_TIMEOUT_SLOTS: u64 = 1_500;
+/// What ORAO's `RequestV2` allocates for a pending request account, and thus
+/// the rent the joiner pays: `8 + RandomnessV2::PENDING_SIZE`.
+pub const PENDING_REQUEST_LEN: usize = 8 + RandomnessV2::PENDING_SIZE;
 
 pub fn config_pda() -> Pubkey {
     Pubkey::find_program_address(&[CONFIG_SEED], &coinflip::ID).0
@@ -260,10 +260,10 @@ pub fn setup() -> (LiteSVM, Keypair) {
     let payer = Keypair::new();
     add_upgradeable_program(&mut svm, coinflip::ID, &elf, payer.pubkey());
     svm.add_program_from_file(
-        orao_solana_vrf_cb::ID,
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/orao_vrf_cb.so"),
+        orao_solana_vrf::ID,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/orao_vrf.so"),
     )
-    .expect("missing tests/fixtures/orao_vrf_cb.so");
+    .expect("missing tests/fixtures/orao_vrf.so");
     svm.airdrop(&payer.pubkey(), 1_000 * LAMPORTS_PER_SOL)
         .unwrap();
     (svm, payer)
@@ -640,73 +640,44 @@ pub fn find_cpi_event<T: AnchorDeserialize + Discriminator>(
 
 pub struct OraoEnv {
     pub network_state: Pubkey,
-    pub client: Pubkey,
     pub orao_treasury: Pubkey,
 }
 
-/// Hand-crafts the ORAO NetworkState + Client accounts (registration is an
-/// off-chain deployment step; tests fabricate its result), keeping the ORAO
-/// crate's own default callback deadline.
+/// Hand-crafts ORAO's `NetworkState` — the one account the VRF program needs
+/// before it will accept a `RequestV2`. Plain VRF has no client registration,
+/// so there is nothing else to fabricate.
 pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
-    setup_orao_with_deadline(svm, ORAO_DEFAULT_CALLBACK_DEADLINE)
-}
-
-/// Like `setup_orao`, but with an explicit `callback_deadline` — `join_game`
-/// requires the configured refund timeout to clear it by `MIN_SETTLE_MARGIN_SLOTS`.
-pub fn setup_orao_with_deadline(svm: &mut LiteSVM, callback_deadline: u64) -> OraoEnv {
     let orao_treasury = Pubkey::new_unique();
     svm.airdrop(&orao_treasury, ORAO_TREASURY_START_LAMPORTS)
         .unwrap();
 
-    let (ns_addr, ns_bump) = NetworkState::find_address(&orao_solana_vrf_cb::ID);
-    let mut network_state = NetworkState::new(
-        ns_bump,
-        NetworkConfiguration::new(Pubkey::new_unique(), orao_treasury, REQUEST_FEE),
-    );
-    // `NetworkConfiguration::new` seeds the crate default; the field is public,
-    // so tests can move it to model a different oracle configuration.
-    assert_eq!(
-        network_state.config.callback_deadline, ORAO_DEFAULT_CALLBACK_DEADLINE,
-        "ORAO's default callback deadline changed; revisit MIN_REFUND_TIMEOUT_SLOTS"
-    );
-    network_state.config.callback_deadline = callback_deadline;
-    // Mainnet's NetworkState always has at least one fulfill authority; match
-    // that account shape instead of the degenerate empty-vec case.
-    network_state.config.fulfill_authorities = vec![Pubkey::new_unique()];
+    let network_state = NetworkState {
+        config: NetworkConfiguration {
+            authority: Pubkey::new_unique(),
+            treasury: orao_treasury,
+            request_fee: REQUEST_FEE,
+            // Mainnet's NetworkState always has at least one fulfillment
+            // authority; match that shape, not the degenerate empty-vec case.
+            fulfillment_authorities: vec![Pubkey::new_unique()],
+            // No SPL fee path: `join_game` always pays ORAO in lamports.
+            token_fee_config: None,
+        },
+        num_received: 0,
+    };
+    let ns_addr = network_state_account_address(&orao_solana_vrf::ID);
+    // ORAO's own `InitNetwork` allocates `8 + 464`; match it so the account the
+    // program writes `num_received` back into is the size it expects.
     write_anchor_account(
         svm,
         ns_addr,
-        orao_solana_vrf_cb::ID,
+        orao_solana_vrf::ID,
         &network_state,
         0,
-        Some(8 + network_state.size()),
-    );
-
-    let (client_addr, client_bump) =
-        Client::find_address(&coinflip::ID, &config_pda(), &orao_solana_vrf_cb::ID);
-    let client = Client::new(
-        client_bump,
-        Pubkey::new_unique(), // owner (irrelevant for tests)
-        coinflip::ID,
-        config_pda(),
-        0,
-        None,
-    );
-    // 10 SOL of client balance to pay request fees + rent. `Client::STATIC_SIZE`
-    // is sized as if a callback were present; ours is `None`, so this over-
-    // allocates slightly to match a real, callback-capable client's account size.
-    write_anchor_account(
-        svm,
-        client_addr,
-        orao_solana_vrf_cb::ID,
-        &client,
-        10 * LAMPORTS_PER_SOL,
-        Some(8 + Client::STATIC_SIZE),
+        Some(8 + 464),
     );
 
     OraoEnv {
         network_state: ns_addr,
-        client: client_addr,
         orao_treasury,
     }
 }
@@ -718,34 +689,56 @@ pub fn vrf_seed_for(game: &Pubkey, joiner: &Pubkey) -> [u8; 32] {
     solana_sdk::hash::hashv(&[b"coinflip-vrf-seed", game.as_ref(), joiner.as_ref()]).to_bytes()
 }
 
-pub fn request_pda(client: &Pubkey, seed: &[u8; 32]) -> Pubkey {
-    RequestAccount::find_address(client, seed, &orao_solana_vrf_cb::ID).0
+/// The ORAO request PDA for `seed`. Plain VRF namespaces requests globally —
+/// `[RANDOMNESS_ACCOUNT_SEED, seed]`, with no per-client component — so the
+/// hashed `vrf_seed` is what makes ours unique and unpredictable.
+pub fn request_pda(seed: &[u8; 32]) -> Pubkey {
+    randomness_account_address(&orao_solana_vrf::ID, seed)
+}
+
+/// ORAO's own `request_v2`, sent directly rather than through `join_game` —
+/// requests live in a global namespace, so anyone can create one for any seed.
+pub fn ix_orao_request_v2(orao: &OraoEnv, payer: Pubkey, seed: [u8; 32]) -> Instruction {
+    Instruction {
+        program_id: orao_solana_vrf::ID,
+        accounts: orao_solana_vrf::accounts::RequestV2 {
+            payer,
+            network_state: orao.network_state,
+            treasury: orao.orao_treasury,
+            request: request_pda(&seed),
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: orao_solana_vrf::instruction::RequestV2 { seed }.data(),
+    }
+}
+
+/// Reads a (real) request account back out of the SVM.
+pub fn read_request(svm: &LiteSVM, address: &Pubkey) -> RandomnessV2 {
+    let account = svm.get_account(address).expect("request account missing");
+    RandomnessV2::try_deserialize(&mut &account.data[..])
+        .expect("failed to deserialize RandomnessV2")
 }
 
 /// Overwrite a request account with a fulfilled state carrying `randomness`.
 ///
-/// Models the post-callback frozen shape (`responses: None`); a request that
-/// was fulfilled but whose callback hasn't run yet would carry
-/// `Some(responses)` instead — harmless here because only `randomness` is
-/// ever read back out of a fulfilled request in these tests.
+/// LiteSVM cannot produce the oracle quorum's ed25519 signatures, so this
+/// stands in for a real `fulfill_v2`. The `client` is carried over from the
+/// pending request the ORAO program actually wrote, rather than guessed.
 ///
-/// Panics if `client`+`seed` doesn't already have a (real, pending) request
-/// account in the SVM: this helper is meant to settle a request that a real
-/// `request` CPI created, not to conjure one out of nothing. For a standalone
-/// write with no pre-existing request, use `write_fulfilled_request_unchecked`.
-pub fn write_fulfilled_request(
-    svm: &mut LiteSVM,
-    client: Pubkey,
-    seed: [u8; 32],
-    randomness: [u8; 64],
-) -> Pubkey {
-    let (addr, _) = RequestAccount::find_address(&client, &seed, &orao_solana_vrf_cb::ID);
+/// Panics if `seed` doesn't already have a (real, pending) request account in
+/// the SVM: this helper is meant to fulfill a request that a real `request_v2`
+/// CPI created, not to conjure one out of nothing. For a standalone write with
+/// no pre-existing request, use `write_fulfilled_request_unchecked`.
+pub fn write_fulfilled_request(svm: &mut LiteSVM, seed: [u8; 32], randomness: [u8; 64]) -> Pubkey {
+    let addr = request_pda(&seed);
     assert!(
         svm.get_account(&addr).is_some(),
         "request account {addr} does not exist yet; join the game (or otherwise \
-         trigger a real `request` CPI) before fulfilling it, or use \
+         trigger a real `request_v2` CPI) before fulfilling it, or use \
          write_fulfilled_request_unchecked for a standalone write"
     );
+    let client = *read_request(svm, &addr).client();
     write_fulfilled_request_unchecked(svm, client, seed, randomness)
 }
 
@@ -758,48 +751,16 @@ pub fn write_fulfilled_request_unchecked(
     seed: [u8; 32],
     randomness: [u8; 64],
 ) -> Pubkey {
-    let (addr, bump) = RequestAccount::find_address(&client, &seed, &orao_solana_vrf_cb::ID);
-    let request = RequestAccount::new(
-        bump,
-        0,
-        client,
-        seed,
-        RequestState::Fulfilled(Fulfilled::new(randomness, None)),
-    );
-    write_anchor_account(svm, addr, orao_solana_vrf_cb::ID, &request, 0, None);
+    let addr = request_pda(&seed);
+    let request = RandomnessV2 {
+        request: RequestAccount::Fulfilled(FulfilledRequest {
+            client,
+            seed,
+            randomness,
+        }),
+    };
+    write_anchor_account(svm, addr, orao_solana_vrf::ID, &request, 0, None);
     addr
-}
-
-/// Deserializes a (real, pending) request account and returns the pubkeys of
-/// its callback's remaining accounts, in order. Task 10 uses this to pin
-/// callback account ordering against the real ORAO callback CPI.
-pub fn request_callback_accounts(svm: &LiteSVM, request: &Pubkey) -> Vec<Pubkey> {
-    request_callback_account_metas(svm, request)
-        .into_iter()
-        .map(|(pubkey, _)| pubkey)
-        .collect()
-}
-
-/// Like `request_callback_accounts`, but also reports each account's
-/// writability *as ORAO validated it* — an `arbitrary_writable` the oracle
-/// refused to authorize is silently downgraded to read-only here, and would
-/// only blow up later, at callback time.
-pub fn request_callback_account_metas(svm: &LiteSVM, request: &Pubkey) -> Vec<(Pubkey, bool)> {
-    let acct = svm.get_account(request).expect("request account missing");
-    let request_account = RequestAccount::try_deserialize(&mut &acct.data[..])
-        .expect("failed to deserialize RequestAccount");
-    let pending = request_account
-        .pending()
-        .expect("request is not pending (already fulfilled?)");
-    let callback = pending
-        .callback
-        .as_ref()
-        .expect("request has no callback configured");
-    callback
-        .remaining_accounts()
-        .iter()
-        .map(|ra| (*ra.pubkey(), ra.is_writable()))
-        .collect()
 }
 
 // ---------- instruction builders ----------
@@ -1025,22 +986,19 @@ pub fn ix_join_game_with_program(
 ) -> Instruction {
     let treasury_token_account =
         get_associated_token_address_with_program_id(&treasury(), &f.mint, &token_program);
-    let request = request_pda(&orao.client, &vrf_seed_for(&f.game.pubkey(), &joiner));
+    let request = request_pda(&vrf_seed_for(&f.game.pubkey(), &joiner));
     Instruction {
         program_id: coinflip::ID,
         accounts: coinflip::accounts::JoinGame {
             joiner,
             config: config_pda(),
             game: f.game.pubkey(),
-            host: f.host.pubkey(),
             mint: f.mint,
             escrow: f.escrow,
             joiner_token_account,
-            host_token_account: f.host_token_account,
             treasury: treasury(),
             treasury_token_account,
-            vrf: orao_solana_vrf_cb::ID,
-            client: orao.client,
+            vrf: orao_solana_vrf::ID,
             network_state: orao.network_state,
             orao_treasury: orao.orao_treasury,
             request,
@@ -1098,7 +1056,7 @@ pub fn setup_joined_game_with_fee(
     );
     let treasury_token_account = get_associated_token_address(&treasury(), &fixture.mint);
     let vrf_seed = vrf_seed_for(&fixture.game.pubkey(), &joiner.pubkey());
-    let request = request_pda(&orao.client, &vrf_seed);
+    let request = request_pda(&vrf_seed);
     (
         JoinedGame {
             fixture,
@@ -1113,8 +1071,8 @@ pub fn setup_joined_game_with_fee(
     )
 }
 
-pub fn ix_settle_fallback(j: &JoinedGame, cranker: Pubkey) -> Instruction {
-    ix_settle_fallback_full(
+pub fn ix_settle(j: &JoinedGame, cranker: Pubkey) -> Instruction {
+    ix_settle_full(
         j,
         cranker,
         j.fixture.host_token_account,
@@ -1123,17 +1081,17 @@ pub fn ix_settle_fallback(j: &JoinedGame, cranker: Pubkey) -> Instruction {
     )
 }
 
-/// Like `ix_settle_fallback`, but lets the caller pick the payout/fee
-/// destinations (liveness: any winner-owned account of the game mint is
-/// accepted, and the fee must go to an account the constant treasury owns).
-pub fn ix_settle_fallback_full(
+/// Like `ix_settle`, but lets the caller pick the payout/fee destinations
+/// (liveness: any winner-owned account of the game mint is accepted, and the
+/// fee must go to an account the constant treasury owns).
+pub fn ix_settle_full(
     j: &JoinedGame,
     cranker: Pubkey,
     host_token_account: Pubkey,
     joiner_token_account: Pubkey,
     treasury_token_account: Pubkey,
 ) -> Instruction {
-    ix_settle_fallback_with_request(
+    ix_settle_with_request(
         j,
         cranker,
         j.request,
@@ -1143,9 +1101,9 @@ pub fn ix_settle_fallback_full(
     )
 }
 
-/// Like `ix_settle_fallback_full`, but also lets the caller pick the request
-/// account — used to prove a foreign game's request cannot settle this game.
-pub fn ix_settle_fallback_with_request(
+/// Like `ix_settle_full`, but also lets the caller pick the request account —
+/// used to prove a foreign game's request cannot settle this game.
+pub fn ix_settle_with_request(
     j: &JoinedGame,
     cranker: Pubkey,
     request: Pubkey,
@@ -1155,10 +1113,9 @@ pub fn ix_settle_fallback_with_request(
 ) -> Instruction {
     Instruction {
         program_id: coinflip::ID,
-        accounts: coinflip::accounts::SettleFallback {
+        accounts: coinflip::accounts::Settle {
             cranker,
             config: config_pda(),
-            client: j.orao.client,
             request,
             game: j.fixture.game.pubkey(),
             escrow: j.fixture.escrow,
@@ -1172,7 +1129,7 @@ pub fn ix_settle_fallback_with_request(
             program: coinflip::ID,
         }
         .to_account_metas(None),
-        data: coinflip::instruction::SettleFallback {}.data(),
+        data: coinflip::instruction::Settle {}.data(),
     }
 }
 
@@ -1217,7 +1174,6 @@ pub fn ix_refund_timeout_with_request(
         accounts: coinflip::accounts::RefundTimeout {
             cranker,
             config: config_pda(),
-            client: j.orao.client,
             request,
             game: j.fixture.game.pubkey(),
             escrow: j.fixture.escrow,

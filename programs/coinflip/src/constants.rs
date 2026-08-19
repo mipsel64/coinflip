@@ -19,18 +19,13 @@ pub const MAX_FEE_BPS: u16 = 1_000;
 #[constant]
 pub const BPS_DENOMINATOR: u16 = 10_000;
 
-/// Must exceed ORAO's callback-retry deadline (crate default 9_000 slots ≈ 1h):
-/// otherwise a player could sabotage their recorded payout account, block the
-/// callback, and force a refund before ORAO falls back to fulfilling without
-/// it. ~2 hours at 400ms slots.
+/// Floor on the refund window: ~10 minutes at 400ms slots. ORAO's oracle
+/// quorum answers a request in seconds, and the crank settles as soon as it
+/// does, so this covers a fulfillment outage with a wide margin while keeping
+/// the escape hatch reachable. There is no oracle-side deadline to clear
+/// anymore — plain VRF has no callback and no retry window.
 #[constant]
-pub const MIN_REFUND_TIMEOUT_SLOTS: u64 = 18_000;
-
-/// Extra slack between ORAO's callback-retry deadline and the refund window,
-/// so a permissionless fallback crank always has time to settle after ORAO
-/// fulfills-without-callback and randomness becomes public (~12 min).
-#[constant]
-pub const MIN_SETTLE_MARGIN_SLOTS: u64 = 1_800;
+pub const MIN_REFUND_TIMEOUT_SLOTS: u64 = 1_500;
 
 /// Upper bound keeps the refund deadline reachable (~46 days).
 #[constant]

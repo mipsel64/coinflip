@@ -17,8 +17,7 @@ pub(crate) struct SettlementOutcome {
     pub fee: u64,
 }
 
-/// Named so the two call sites (callback and fallback) cannot transpose
-/// same-typed token accounts.
+/// Named so no call site can transpose same-typed token accounts.
 pub(crate) struct SettlementAccounts<'a, 'info> {
     pub game: &'a mut Account<'info, Game>,
     pub escrow: &'a InterfaceAccount<'info, TokenAccount>,
@@ -32,7 +31,7 @@ pub(crate) struct SettlementAccounts<'a, 'info> {
 
 /// The one account fees may ever land in for a given mint: the constant
 /// treasury's canonical ATA, which `join_game` created before the request went
-/// out. Both settle paths pin it by this derivation.
+/// out. `settle` pins it by this derivation.
 pub(crate) fn treasury_ata(mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
     anchor_spl::associated_token::get_associated_token_address_with_program_id(
         &crate::treasury::ID,
@@ -68,7 +67,8 @@ pub(crate) fn require_payout_account(
 
 /// Pays the winner, takes the fee, closes the escrow, marks the game Settled.
 /// The pot is the escrow's actual balance so donated dust can never brick the
-/// close. Callers close the game account (`close = host`) and emit the event.
+/// close. The caller closes the game account (`close = host`) and emits the
+/// event.
 pub(crate) fn execute_settlement(
     accounts: SettlementAccounts,
     randomness: &[u8; 64],
@@ -86,8 +86,7 @@ pub(crate) fn execute_settlement(
 
     game.require_state(GameState::AwaitingRandomness)?;
 
-    // Guarded here, not at the call sites, so no settlement path can forget it
-    // (the callback's address-pinned accounts satisfy it trivially).
+    // Guarded here, not at the call site, so no settlement path can forget it.
     let token_program_id = token_program.key();
     require_payout_account(
         host_token_account,
