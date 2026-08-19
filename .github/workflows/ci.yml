@@ -59,10 +59,18 @@ jobs:
       # second command regenerates the IDL/TS-types separately (no cargo args
       # involved, so no conflict) — `anchor idl build` runs the same
       # CHECK-comment safety lint `anchor build` would have.
+      #
+      # `--features local` swaps the compile-time treasury constant for the
+      # committed test keypair; the e2e harness scans the loaded .so for it and
+      # refuses to run otherwise. CI only ever tests, never deploys — a
+      # DEPLOYMENT build (and the IDL shipped with it) must omit the feature,
+      # see the README's Deployment runbook.
       - name: anchor build (forces platform-tools v1.56)
-        run: anchor build --no-idl -- --tools-version v1.56
+        run: anchor build --no-idl -- --features local --tools-version v1.56
+      # Built with the same feature set as the binary above, so the IDL's
+      # TREASURY constant matches the program the tests run against.
       - name: anchor idl build (IDL + TS types)
-        run: anchor idl build -o target/idl/coinflip.json -t target/types/coinflip.ts
+        run: anchor idl build -o target/idl/coinflip.json -t target/types/coinflip.ts -- --features local
       # NOT --all-features: the idl-build feature is only meant to be turned
       # on by anchor's own IDL-generation pass and intentionally does not
       # compile standalone.

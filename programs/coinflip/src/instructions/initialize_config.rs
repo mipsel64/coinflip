@@ -16,7 +16,7 @@ pub struct InitializeConfig<'info> {
     pub config: Account<'info, Config>,
     /// This program, whose ProgramData names the upgrade authority. The config
     /// PDA is a one-shot singleton, so whoever wins the race to initialize it
-    /// picks the admin, the treasury and the fee: gate that on the deployer.
+    /// picks the admin and the fee: gate that on the deployer.
     #[account(
         constraint = program.programdata_address()? == Some(program_data.key())
             @ CoinflipError::OwnerMismatch,
@@ -33,22 +33,16 @@ pub struct InitializeConfig<'info> {
 pub(crate) fn handle(
     ctx: Context<InitializeConfig>,
     admin: Pubkey,
-    treasury: Pubkey,
     fee_bps: u16,
     refund_timeout_slots: u64,
 ) -> Result<()> {
     Config::validate_fee(fee_bps)?;
     require!(admin != Pubkey::default(), CoinflipError::InvalidAuthority);
-    require!(
-        treasury != Pubkey::default(),
-        CoinflipError::InvalidAuthority
-    );
     Config::validate_timeout(refund_timeout_slots)?;
     let config = &mut ctx.accounts.config;
     config.version = Config::LAYOUT_VERSION;
     config.bump = ctx.bumps.config;
     config.admin = admin;
-    config.treasury = treasury;
     config.fee_bps = fee_bps;
     config.refund_timeout_slots = refund_timeout_slots;
     config._reserved = [0; 64];

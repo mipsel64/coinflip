@@ -56,7 +56,7 @@ pub struct SettleFallback<'info> {
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
-        constraint = treasury_token_account.owner == config.treasury
+        constraint = treasury_token_account.owner == crate::treasury::ID
             @ CoinflipError::OwnerMismatch,
         constraint = treasury_token_account.mint == game.token_mint
             @ CoinflipError::MintMismatch,

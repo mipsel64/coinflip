@@ -52,6 +52,25 @@ pub fn config_pda() -> Pubkey {
     Pubkey::find_program_address(&[CONFIG_SEED], &coinflip::ID).0
 }
 
+/// The treasury the deployed `.so` enforces: the committed `local` fixture key.
+///
+/// Read from the fixture rather than from `coinflip::treasury::ID` because the
+/// host-side crate these tests link against is usually built WITHOUT the
+/// `local` feature (plain `cargo test -p coinflip`), where that constant is the
+/// real, deployable treasury instead.
+pub fn treasury() -> Pubkey {
+    static TREASURY: std::sync::OnceLock<Pubkey> = std::sync::OnceLock::new();
+    *TREASURY.get_or_init(|| {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/treasury-local.json"
+        );
+        solana_sdk::signature::read_keypair_file(path)
+            .expect("missing tests/fixtures/treasury-local.json")
+            .pubkey()
+    })
+}
+
 pub fn escrow_pda(game: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[ESCROW_SEED, game.as_ref()], &coinflip::ID).0
 }
@@ -129,6 +148,45 @@ fn assert_program_not_stale(so_path: &str) {
     );
 }
 
+/// Whether the compiled program embeds `key` as a constant.
+///
+/// Searches for the key's eight 4-byte words rather than the whole 32 bytes:
+/// the treasury constant is only ever *compared* against, and the release
+/// build turns that into immediate loads instead of a contiguous rodata blob —
+/// each SBF `lddw` carries its 64-bit immediate as two 4-byte halves in
+/// separate instruction words (verified against both builds: 8-byte runs never
+/// appear, every 4-byte word appears once per comparison site). Eight
+/// independent 4-byte hits cannot line up by chance.
+fn elf_embeds_key(elf: &[u8], key: &Pubkey) -> bool {
+    key.to_bytes()
+        .chunks(4)
+        .all(|word| elf.windows(4).any(|window| window == word))
+}
+
+/// The treasury is a compile-time constant, so the `.so` the suite loads must
+/// be the `local` build — otherwise every fee destination the harness derives
+/// is one the program rejects, and the whole suite fails at the constraint
+/// instead of at the actual mistake.
+fn assert_built_with_local_feature(elf: &[u8], so_path: &str) {
+    assert!(
+        elf_embeds_key(elf, &treasury()),
+        "{so_path} was built without --features local; run:\n  \
+         anchor build --no-idl -- --features local --tools-version v1.56\n  \
+         anchor idl build -o target/idl/coinflip.json -t target/types/coinflip.ts \
+         -- --features local"
+    );
+    // Only decidable when the host-side crate itself was built without the
+    // feature — there `coinflip::treasury::ID` is the deployable id, and
+    // finding it in the artifact would mean the constant never got swapped.
+    #[cfg(not(feature = "local"))]
+    assert!(
+        !elf_embeds_key(elf, &coinflip::treasury::ID),
+        "{so_path} still embeds the deployable treasury ({}) — rebuild it with \
+         --features local",
+        coinflip::treasury::ID
+    );
+}
+
 /// Registers the built program the way a real deployment does: an upgradeable
 /// loader program account pointing at a ProgramData account that names
 /// `upgrade_authority`. `add_program_from_file` installs programs under the
@@ -137,11 +195,9 @@ fn assert_program_not_stale(so_path: &str) {
 fn add_upgradeable_program(
     svm: &mut LiteSVM,
     program_id: Pubkey,
-    so_path: &str,
+    elf: &[u8],
     upgrade_authority: Pubkey,
 ) {
-    let elf = std::fs::read(so_path).unwrap_or_else(|_| panic!("{so_path}: run `anchor build`"));
-
     // bincode layout of `UpgradeableLoaderState::ProgramData`, then the ELF —
     // exactly what the loader (and LiteSVM's program loader) expects to find.
     let mut programdata = 3u32.to_le_bytes().to_vec();
@@ -152,7 +208,7 @@ fn add_upgradeable_program(
         programdata.len(),
         UpgradeableLoaderState::size_of_programdata_metadata()
     );
-    programdata.extend_from_slice(&elf);
+    programdata.extend_from_slice(elf);
     let programdata_address = program_data_address(&program_id);
     let lamports = svm.minimum_balance_for_rent_exemption(programdata.len());
     svm.set_account(
@@ -199,8 +255,10 @@ pub fn setup() -> (LiteSVM, Keypair) {
     let mut svm = LiteSVM::new();
     let so_path = coinflip_so_path();
     assert_program_not_stale(&so_path);
+    let elf = std::fs::read(&so_path).unwrap_or_else(|_| panic!("{so_path}: run `anchor build`"));
+    assert_built_with_local_feature(&elf, &so_path);
     let payer = Keypair::new();
-    add_upgradeable_program(&mut svm, coinflip::ID, &so_path, payer.pubkey());
+    add_upgradeable_program(&mut svm, coinflip::ID, &elf, payer.pubkey());
     svm.add_program_from_file(
         orao_solana_vrf_cb::ID,
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/orao_vrf_cb.so"),
@@ -749,7 +807,6 @@ pub fn request_callback_account_metas(svm: &LiteSVM, request: &Pubkey) -> Vec<(P
 pub fn ix_initialize_config(
     payer: Pubkey,
     admin: Pubkey,
-    treasury: Pubkey,
     fee_bps: u16,
     refund_timeout_slots: u64,
 ) -> Instruction {
@@ -765,7 +822,6 @@ pub fn ix_initialize_config(
         .to_account_metas(None),
         data: coinflip::instruction::InitializeConfig {
             admin,
-            treasury,
             fee_bps,
             refund_timeout_slots,
         }
@@ -829,7 +885,6 @@ pub struct GameFixture {
     pub mint: Pubkey,
     pub host_token_account: Pubkey,
     pub escrow: Pubkey,
-    pub treasury: Pubkey,
     pub amount: u64,
 }
 
@@ -852,14 +907,12 @@ pub fn setup_open_game_with_fee(
     amount: u64,
     fee_bps: u16,
 ) -> (GameFixture, TransactionMetadata) {
-    let treasury = Pubkey::new_unique();
     send_ok(
         svm,
         &[payer],
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            treasury,
             fee_bps,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -893,7 +946,6 @@ pub fn setup_open_game_with_fee(
             mint,
             host_token_account,
             escrow,
-            treasury,
             amount,
         },
         meta,
@@ -972,7 +1024,7 @@ pub fn ix_join_game_with_program(
     token_program: Pubkey,
 ) -> Instruction {
     let treasury_token_account =
-        get_associated_token_address_with_program_id(&f.treasury, &f.mint, &token_program);
+        get_associated_token_address_with_program_id(&treasury(), &f.mint, &token_program);
     let request = request_pda(&orao.client, &vrf_seed_for(&f.game.pubkey(), &joiner));
     Instruction {
         program_id: coinflip::ID,
@@ -985,7 +1037,7 @@ pub fn ix_join_game_with_program(
             escrow: f.escrow,
             joiner_token_account,
             host_token_account: f.host_token_account,
-            treasury: f.treasury,
+            treasury: treasury(),
             treasury_token_account,
             vrf: orao_solana_vrf_cb::ID,
             client: orao.client,
@@ -1044,7 +1096,7 @@ pub fn setup_joined_game_with_fee(
             joiner_token_account,
         )],
     );
-    let treasury_token_account = get_associated_token_address(&fixture.treasury, &fixture.mint);
+    let treasury_token_account = get_associated_token_address(&treasury(), &fixture.mint);
     let vrf_seed = vrf_seed_for(&fixture.game.pubkey(), &joiner.pubkey());
     let request = request_pda(&orao.client, &vrf_seed);
     (
@@ -1073,7 +1125,7 @@ pub fn ix_settle_fallback(j: &JoinedGame, cranker: Pubkey) -> Instruction {
 
 /// Like `ix_settle_fallback`, but lets the caller pick the payout/fee
 /// destinations (liveness: any winner-owned account of the game mint is
-/// accepted, and the fee must go to the CURRENT treasury's account).
+/// accepted, and the fee must go to an account the constant treasury owns).
 pub fn ix_settle_fallback_full(
     j: &JoinedGame,
     cranker: Pubkey,
@@ -1185,7 +1237,6 @@ pub fn ix_refund_timeout_with_request(
 pub fn ix_update_config(
     admin: Pubkey,
     new_admin: Option<Pubkey>,
-    new_treasury: Option<Pubkey>,
     new_fee_bps: Option<u16>,
     new_refund_timeout_slots: Option<u64>,
 ) -> Instruction {
@@ -1198,7 +1249,6 @@ pub fn ix_update_config(
         .to_account_metas(None),
         data: coinflip::instruction::UpdateConfig {
             new_admin,
-            new_treasury,
             new_fee_bps,
             new_refund_timeout_slots,
         }

@@ -6,6 +6,12 @@ pub const CONFIG_SEED: &[u8] = b"config";
 #[constant]
 pub const ESCROW_SEED: &[u8] = b"escrow";
 
+/// Fee destination authority, re-exported from `crate::treasury` so clients and
+/// indexers read it out of the IDL instead of hardcoding it. Compile-time: an
+/// IDL built with the `local` feature carries the test key, not the real one.
+#[constant]
+pub const TREASURY: Pubkey = crate::treasury::ID;
+
 /// Hard cap on the protocol fee: 10%.
 #[constant]
 pub const MAX_FEE_BPS: u16 = 1_000;

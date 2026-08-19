@@ -9,8 +9,15 @@ All notable changes to this project are documented in this file, in the
 
 - Coinflip program v0.1.0: an on-chain 1v1 coinflip game.
   - `initialize_config` / `update_config`: singleton `Config` PDA holding
-    admin, treasury, a configurable protocol fee (default 1%, hard cap 10%),
-    and a bounded `refund_timeout_slots`.
+    admin, a configurable protocol fee (default 1%, hard cap 10%), and a
+    bounded `refund_timeout_slots`.
+  - Treasury as a compile-time constant (`coinflip::treasury::ID`, exported to
+    the IDL as `TREASURY`) rather than admin-rotatable config state: both
+    settle paths pin the fee account to it, so a frozen callback account list
+    and a later fallback crank can never disagree. Rotating it is a program
+    upgrade. The `local` cargo feature swaps it for a committed test keypair
+    (constants and IDs only, never logic) — e2e builds use it, deployments
+    must not.
   - `create_game` / `cancel_game`: host opens a game against any accepted
     SPL/Token-2022 mint, escrowing the stake; cancellable before a joiner
     arrives.
@@ -42,6 +49,9 @@ All notable changes to this project are documented in this file, in the
   logs. `anchor-ts`'s `addEventListener`/`EventParser` will never fire for
   them — decode `meta.innerInstructions` instead (see `scripts/smoke.ts`'s
   `findGameSettledEvent` for a working reference).
+- There is no `config.treasury` field: read the fee destination from the IDL's
+  `TREASURY` constant (or let anchor-ts resolve the `treasury` account for
+  `join_game`, which the IDL pins by address).
 - Both players' payout token accounts must exist at join time — the
   callback's account list is fixed when the VRF request is made, before the
   winner is known, and the callback itself cannot create accounts.

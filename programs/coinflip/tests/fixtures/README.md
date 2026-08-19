@@ -16,3 +16,21 @@ relying on the `orao-solana-vrf-cb` crate's interface-only stubs.
 
 If ORAO upgrades this program, re-dump it with the command above and update
 the sha256 in this file so the fixture's provenance stays verifiable.
+
+# treasury-local.json
+
+The treasury the program uses when built with `--features local`, i.e. the fee
+destination the e2e suite derives every treasury ATA against. Pubkey:
+`9wR75bCR1bo68BygzHkgJ3N735u5TmGsVhzjRrFzNUtJ`.
+
+**This secret key is committed on purpose.** It is a throwaway generated with
+`solana-keygen new`, never funded, and never the deployed treasury — the real
+one (`BUs86uMPdNMJ9SiFijb4TABpFduhaEqqESs96pTGadsN`) is a compile-time constant
+in non-`local` builds and its keypair lives outside the repo. Committing this
+one keeps the fee destination stable across machines and CI; the harness reads
+the pubkey out of it (`tests/common/mod.rs`'s `treasury()`) rather than
+hardcoding it a second time.
+
+If it is ever regenerated, update `treasury::ID`'s `local` variant in
+`src/lib.rs` to match — the harness fails the run with instructions if the
+loaded `.so` doesn't embed this key.

@@ -13,8 +13,6 @@ pub struct Config {
     pub bump: u8,
     /// Can call update_config.
     pub admin: Pubkey,
-    /// Authority whose token accounts receive fees.
-    pub treasury: Pubkey,
     /// Fee on the pot, in basis points. Capped at MAX_FEE_BPS.
     pub fee_bps: u16,
     /// Slots after join before refund_timeout is allowed.
@@ -22,7 +20,7 @@ pub struct Config {
     pub _reserved: [u8; 64],
 }
 
-const_assert_eq!(Config::INIT_SPACE, 1 + 1 + 32 + 32 + 2 + 8 + 64);
+const_assert_eq!(Config::INIT_SPACE, 1 + 1 + 32 + 2 + 8 + 64);
 
 impl Config {
     pub const LAYOUT_VERSION: u8 = 1;
@@ -67,7 +65,6 @@ mod tests {
             version: Config::LAYOUT_VERSION,
             bump: 255,
             admin: Pubkey::new_unique(),
-            treasury: Pubkey::new_unique(),
             fee_bps: 100,
             refund_timeout_slots: 1_000,
             _reserved: [0; 64],

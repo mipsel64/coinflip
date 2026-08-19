@@ -47,8 +47,8 @@ pub struct JoinGame<'info> {
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, address = game.host_token_account @ CoinflipError::MintMismatch)]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// CHECK: fee-destination authority recorded in config.
-    #[account(address = config.treasury @ CoinflipError::OwnerMismatch)]
+    /// CHECK: the compile-time fee-destination authority.
+    #[account(address = crate::treasury::ID @ CoinflipError::OwnerMismatch)]
     pub treasury: AccountInfo<'info>,
     /// Must exist by settlement time — the oracle's callback cannot pay rent.
     #[account(

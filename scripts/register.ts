@@ -97,8 +97,24 @@ function idlConstant(name: string): anchor.BN {
   return new anchor.BN(found.value);
 }
 
+/** Same, for a `Pubkey` constant (the IDL stores it as a base58 string). */
+function idlConstantPubkey(name: string): web3.PublicKey {
+  const found = IDL_RAW.constants?.find((c) => c.name === name);
+  if (!found) {
+    throw new Error(
+      `IDL constant "${name}" not found in target/idl/coinflip.json — rebuild the IDL ` +
+        "(`anchor build`), or this #[constant] was renamed/removed in the program source"
+    );
+  }
+  return new web3.PublicKey(found.value);
+}
+
 const MIN_SETTLE_MARGIN_SLOTS = idlConstant("MIN_SETTLE_MARGIN_SLOTS");
 const MIN_REFUND_TIMEOUT_SLOTS = idlConstant("MIN_REFUND_TIMEOUT_SLOTS");
+// The fee destination is baked into the program, not stored in Config: an IDL
+// built with `--features local` carries the test key, so the IDL must come
+// from the same build as the deployed binary.
+const TREASURY = idlConstantPubkey("TREASURY");
 
 /**
  * Rejects anything but a plain base-10 non-negative integer string.
@@ -192,7 +208,6 @@ cli
       "(the deployer gate in initialize_config.rs)"
   )
   .option("--admin <pubkey>", "admin authority (defaults to the wallet)")
-  .option("--treasury <pubkey>", "fee-destination authority (defaults to the wallet)")
   .option("--fee-bps <n>", "protocol fee in basis points", "100")
   .option(
     "--refund-timeout-slots <n>",
@@ -204,20 +219,20 @@ cli
     const p = provider(cmd.parent.opts().cluster, cmd.parent.opts().key);
     const program = coinflipProgram(p);
     const admin = opts.admin ? new web3.PublicKey(opts.admin) : p.wallet.publicKey;
-    const treasury = opts.treasury ? new web3.PublicKey(opts.treasury) : p.wallet.publicKey;
     const feeBps = Number(parseIntegerOption(opts.feeBps, "--fee-bps"));
     const refundTimeoutSlots = new anchor.BN(
       parseIntegerOption(opts.refundTimeoutSlots, "--refund-timeout-slots")
     );
 
     const tx = await program.methods
-      .initializeConfig(admin, treasury, feeBps, refundTimeoutSlots)
+      .initializeConfig(admin, feeBps, refundTimeoutSlots)
       .accounts({
         payer: p.wallet.publicKey,
         programData: programDataAddress(PROGRAM_ID),
       })
       .rpc();
     console.log("Config initialized:", CONFIG_PDA.toBase58());
+    console.log("Treasury (compile-time constant):", TREASURY.toBase58());
     console.log("Tx:", tx);
   });
 
@@ -278,7 +293,6 @@ cli
 
     const gamePubkey = new web3.PublicKey(opts.game);
     const game = await program.account.game.fetch(gamePubkey);
-    const config = await program.account.config.fetch(CONFIG_PDA);
 
     const mintInfo = await p.connection.getAccountInfo(game.tokenMint);
     if (!mintInfo) {
@@ -289,7 +303,7 @@ cli
     // treasury ATA lives at a different address than the classic-SPL one.
     const treasuryTokenAccount = getAssociatedTokenAddressSync(
       game.tokenMint,
-      config.treasury,
+      TREASURY,
       true,
       mintInfo.owner
     );

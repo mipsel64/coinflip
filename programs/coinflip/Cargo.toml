@@ -12,6 +12,9 @@ workspace = true
 
 [features]
 default = []
+# Swaps the treasury constant for the committed test keypair. Constants and IDs
+# only — never logic. The e2e suite runs against a `.so` built with it.
+local = []
 cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []

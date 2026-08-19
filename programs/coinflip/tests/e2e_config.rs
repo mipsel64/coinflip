@@ -11,7 +11,6 @@ use solana_sdk::{pubkey::Pubkey, signature::Signer, transaction::TransactionErro
 fn initialize_and_update_config() {
     let (mut svm, payer) = setup();
     let admin = payer.pubkey();
-    let treasury = Pubkey::new_unique();
 
     send_ok(
         &mut svm,
@@ -19,7 +18,6 @@ fn initialize_and_update_config() {
         &[ix_initialize_config(
             payer.pubkey(),
             admin,
-            treasury,
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -29,13 +27,13 @@ fn initialize_and_update_config() {
     send_ok(
         &mut svm,
         &[&payer],
-        &[ix_update_config(admin, None, None, Some(250), None)],
+        &[ix_update_config(admin, None, Some(250), None)],
     );
 }
 
-/// The config PDA is a one-shot singleton whose initializer picks the admin,
-/// the treasury and the fee — so only the program's upgrade authority may
-/// claim it, no matter who wins the race to send the transaction.
+/// The config PDA is a one-shot singleton whose initializer picks the admin
+/// and the fee — so only the program's upgrade authority may claim it, no
+/// matter who wins the race to send the transaction.
 #[test]
 fn initialize_rejects_non_upgrade_authority() {
     let (mut svm, payer) = setup();
@@ -48,7 +46,6 @@ fn initialize_rejects_non_upgrade_authority() {
         &[ix_initialize_config(
             mallory.pubkey(),
             mallory.pubkey(),
-            Pubkey::new_unique(),
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -67,7 +64,6 @@ fn initialize_rejects_non_upgrade_authority() {
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            Pubkey::new_unique(),
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -83,7 +79,6 @@ fn initialize_rejects_fee_above_cap() {
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            Pubkey::new_unique(),
             1_001,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -100,7 +95,6 @@ fn update_config_rejects_non_admin() {
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            Pubkey::new_unique(),
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -111,13 +105,7 @@ fn update_config_rejects_non_admin() {
     let result = send(
         &mut svm,
         &[&mallory],
-        &[ix_update_config(
-            mallory.pubkey(),
-            None,
-            None,
-            Some(0),
-            None,
-        )],
+        &[ix_update_config(mallory.pubkey(), None, Some(0), None)],
     );
     assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
 }
@@ -128,7 +116,6 @@ fn initialize_config_is_one_shot() {
     let ix = ix_initialize_config(
         payer.pubkey(),
         payer.pubkey(),
-        Pubkey::new_unique(),
         DEFAULT_FEE_BPS,
         DEFAULT_TIMEOUT_SLOTS,
     );
@@ -156,7 +143,6 @@ fn update_config_rejects_fee_above_cap_and_bad_timeout() {
         &[ix_initialize_config(
             payer.pubkey(),
             admin,
-            Pubkey::new_unique(),
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -164,25 +150,26 @@ fn update_config_rejects_fee_above_cap_and_bad_timeout() {
     let result = send(
         &mut svm,
         &[&payer],
-        &[ix_update_config(admin, None, None, Some(1_001), None)],
+        &[ix_update_config(admin, None, Some(1_001), None)],
     );
     assert_coinflip_error(result, coinflip::errors::CoinflipError::FeeTooHigh);
     let result = send(
         &mut svm,
         &[&payer],
-        &[ix_update_config(admin, None, None, None, Some(0))],
+        &[ix_update_config(admin, None, None, Some(0))],
     );
     assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidTimeout);
 }
 
+/// The admin is the one authority still stored in config; a default key there
+/// would be an unusable (and unrotatable) admin.
 #[test]
-fn default_key_authorities_are_rejected() {
+fn default_key_admin_is_rejected() {
     let (mut svm, payer) = setup();
     let result = send(
         &mut svm,
         &[&payer],
         &[ix_initialize_config(
-            payer.pubkey(),
             payer.pubkey(),
             Pubkey::default(),
             DEFAULT_FEE_BPS,
@@ -197,7 +184,6 @@ fn default_key_authorities_are_rejected() {
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            Pubkey::new_unique(),
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -208,7 +194,6 @@ fn default_key_authorities_are_rejected() {
         &[ix_update_config(
             payer.pubkey(),
             Some(Pubkey::default()),
-            None,
             None,
             None,
         )],
@@ -225,7 +210,6 @@ fn admin_rotation_round_trip() {
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            Pubkey::new_unique(),
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -241,33 +225,20 @@ fn admin_rotation_round_trip() {
             Some(new_admin.pubkey()),
             None,
             None,
-            None,
         )],
     );
     // old admin is now rejected
     let result = send(
         &mut svm,
         &[&payer],
-        &[ix_update_config(
-            payer.pubkey(),
-            None,
-            None,
-            Some(200),
-            None,
-        )],
+        &[ix_update_config(payer.pubkey(), None, Some(200), None)],
     );
     assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
     // new admin works
     send_ok(
         &mut svm,
         &[&new_admin],
-        &[ix_update_config(
-            new_admin.pubkey(),
-            None,
-            None,
-            Some(200),
-            None,
-        )],
+        &[ix_update_config(new_admin.pubkey(), None, Some(200), None)],
     );
 }
 

@@ -85,11 +85,33 @@ if (!PROGRAM_KEYPAIR_PATH) {
 }
 const PROGRAM_ID = loadKeypair(PROGRAM_KEYPAIR_PATH).publicKey;
 
+interface RawIdlConstant {
+  name: string;
+  type: string;
+  value: string;
+}
 interface RawIdl {
   address: string;
+  constants?: RawIdlConstant[];
 }
 
 const IDL_RAW = require("../target/idl/coinflip.json") as RawIdl;
+
+/** Reads a `#[constant]` pubkey straight out of the IDL instead of hardcoding it. */
+function idlConstantPubkey(name: string): web3.PublicKey {
+  const found = IDL_RAW.constants?.find((c) => c.name === name);
+  if (!found) {
+    throw new Error(
+      `IDL constant "${name}" not found in target/idl/coinflip.json — rebuild the IDL ` +
+        "(`anchor build`), or this #[constant] was renamed/removed in the program source"
+    );
+  }
+  return new web3.PublicKey(found.value);
+}
+
+// Compile-time fee destination: an IDL built with `--features local` carries
+// the test key, so the IDL must come from the same build as the deployment.
+const TREASURY = idlConstantPubkey("TREASURY");
 
 const idlAddress = new web3.PublicKey(IDL_RAW.address);
 if (!idlAddress.equals(PROGRAM_ID)) {
@@ -203,7 +225,7 @@ async function main() {
   console.log("Program:", PROGRAM_ID.toBase58());
 
   const config = await program.account.config.fetch(CONFIG_PDA);
-  console.log("Treasury:", config.treasury.toBase58());
+  console.log("Treasury:", TREASURY.toBase58());
   console.log("Fee bps:", config.feeBps);
 
   // ---- ephemeral keys, persisted BEFORE any funding happens ----
@@ -275,7 +297,7 @@ async function main() {
   const [request] = requestAccountAddress(client, vrfSeed);
   const networkStateAccount = await vrf.getNetworkState();
   const oraoTreasury = networkStateAccount.config.treasury;
-  const treasuryTokenAccount = getAssociatedTokenAddressSync(mint, config.treasury, true);
+  const treasuryTokenAccount = getAssociatedTokenAddressSync(mint, TREASURY, true);
 
   const joinTx = await program.methods
     .joinGame()
@@ -286,7 +308,8 @@ async function main() {
       mint,
       joinerTokenAccount: joinerTokenAccount.address,
       hostTokenAccount: hostTokenAccount.address,
-      treasury: config.treasury,
+      // `treasury` is not passed: the IDL pins it to the program's constant, so
+      // anchor-ts resolves it (and the treasury ATA derived from it) itself.
       oraoTreasury,
       request,
       tokenProgram: TOKEN_PROGRAM_ID,
@@ -369,7 +392,7 @@ async function main() {
     process.exitCode = 1;
     console.log(
       "Timed out waiting for the callback. The permissionless settle_fallback crank " +
-        "derives everything it needs (request, escrow, client, current treasury ATA) " +
+        "derives everything it needs (request, escrow, client, treasury ATA) " +
         "from the game account itself — run:"
     );
     console.log(

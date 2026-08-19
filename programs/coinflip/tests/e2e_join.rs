@@ -74,7 +74,7 @@ fn join_escrows_stake_and_creates_vrf_request() {
     );
 
     // The treasury ATA exists ahead of settlement (the callback can't pay rent).
-    let treasury_ata = get_associated_token_address(&f.treasury, &f.mint);
+    let treasury_ata = get_associated_token_address(&treasury(), &f.mint);
     let treasury_ata_rent = svm
         .get_account(&treasury_ata)
         .expect("treasury ATA must exist")
@@ -173,14 +173,12 @@ fn join_pins_callback_account_order() {
 #[test]
 fn t22_game_full_join() {
     let (mut svm, payer) = setup();
-    let treasury = Pubkey::new_unique();
     send_ok(
         &mut svm,
         &[&payer],
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            treasury,
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -215,7 +213,6 @@ fn t22_game_full_join() {
         mint,
         host_token_account: host_ta,
         escrow: escrow_pda(&game_key),
-        treasury,
         amount: stake,
     };
     let orao = setup_orao(&mut svm);
@@ -245,7 +242,7 @@ fn t22_game_full_join() {
     assert_eq!(game_state.state, u8::from(GameState::AwaitingRandomness));
     // The treasury ATA was created under Token-2022, not the classic program.
     let treasury_ata =
-        get_associated_token_address_with_program_id(&treasury, &mint, &token_program);
+        get_associated_token_address_with_program_id(&treasury(), &mint, &token_program);
     assert_eq!(
         svm.get_account(&treasury_ata).unwrap().owner,
         token_program,
@@ -339,13 +336,13 @@ fn join_with_non_ata_treasury_account_fails() {
     svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
     let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), 10_000);
     // Treasury-owned and the right mint, but not at the ATA address.
-    let fake_treasury_ta = create_token_account(&mut svm, f.mint, f.treasury, 0);
+    let fake_treasury_ta = create_token_account(&mut svm, f.mint, treasury(), 0);
 
     let mut ix = ix_join_game(&f, &orao, joiner.pubkey(), joiner_ta);
     let ata_slot = ix
         .accounts
         .iter()
-        .position(|meta| meta.pubkey == get_associated_token_address(&f.treasury, &f.mint))
+        .position(|meta| meta.pubkey == get_associated_token_address(&treasury(), &f.mint))
         .expect("treasury ATA slot");
     ix.accounts[ata_slot].pubkey = fake_treasury_ta;
 

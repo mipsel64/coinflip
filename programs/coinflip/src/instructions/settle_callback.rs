@@ -60,14 +60,13 @@ pub struct SettleCallback<'info> {
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, address = game.joiner_token_account @ CoinflipError::InvalidPayoutAccount)]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// LIVE-treasury policy (unified with settle_fallback): the fee RATE is the
-    /// player guarantee (snapshotted); the destination is protocol-internal.
-    /// After a rotation, in-flight callbacks fail until the new treasury's
-    /// token account exists (runbook: create it BEFORE rotating), then ORAO
-    /// retries / degrades to fulfill-without-callback and fallback settles.
+    /// Owner-constrained against the compile-time treasury, exactly like
+    /// settle_fallback: the destination is fixed for the program's lifetime, so
+    /// the frozen callback list and a fallback crank can never disagree about
+    /// where the fee goes.
     #[account(
         mut,
-        constraint = treasury_token_account.owner == config.treasury
+        constraint = treasury_token_account.owner == crate::treasury::ID
             @ CoinflipError::OwnerMismatch,
         constraint = treasury_token_account.mint == game.token_mint
             @ CoinflipError::MintMismatch,

@@ -69,14 +69,12 @@ fn create_game_escrows_the_stake() {
 #[test]
 fn create_game_rejects_zero_amount() {
     let (mut svm, payer) = setup();
-    let treasury = solana_sdk::pubkey::Pubkey::new_unique();
     send_ok(
         &mut svm,
         &[&payer],
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            treasury,
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -104,14 +102,12 @@ fn create_game_rejects_zero_amount() {
 #[test]
 fn create_game_rejects_invalid_side() {
     let (mut svm, payer) = setup();
-    let treasury = solana_sdk::pubkey::Pubkey::new_unique();
     send_ok(
         &mut svm,
         &[&payer],
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            treasury,
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -144,14 +140,12 @@ fn create_game_rejects_denied_mint_extensions() {
         ExtensionType::PermanentDelegate,
     ] {
         let (mut svm, payer) = setup();
-        let treasury = solana_sdk::pubkey::Pubkey::new_unique();
         send_ok(
             &mut svm,
             &[&payer],
             &[ix_initialize_config(
                 payer.pubkey(),
                 payer.pubkey(),
-                treasury,
                 DEFAULT_FEE_BPS,
                 DEFAULT_TIMEOUT_SLOTS,
             )],
@@ -190,14 +184,12 @@ fn create_game_rejects_denied_mint_extensions() {
 #[test]
 fn create_game_rejects_mint_mismatch() {
     let (mut svm, payer) = setup();
-    let treasury = solana_sdk::pubkey::Pubkey::new_unique();
     send_ok(
         &mut svm,
         &[&payer],
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            treasury,
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -228,14 +220,12 @@ fn create_game_rejects_mint_mismatch() {
 #[test]
 fn create_game_rejects_non_owned_token_account() {
     let (mut svm, payer) = setup();
-    let treasury = solana_sdk::pubkey::Pubkey::new_unique();
     send_ok(
         &mut svm,
         &[&payer],
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            treasury,
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -266,14 +256,12 @@ fn create_game_rejects_non_owned_token_account() {
 #[test]
 fn create_game_rejects_stake_above_cap() {
     let (mut svm, payer) = setup();
-    let treasury = solana_sdk::pubkey::Pubkey::new_unique();
     send_ok(
         &mut svm,
         &[&payer],
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            treasury,
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -412,14 +400,12 @@ fn cancel_after_join_fails() {
 #[test]
 fn t22_allowed_extension_mint_creates_and_cancels() {
     let (mut svm, payer) = setup();
-    let treasury = solana_sdk::pubkey::Pubkey::new_unique();
     send_ok(
         &mut svm,
         &[&payer],
         &[ix_initialize_config(
             payer.pubkey(),
             payer.pubkey(),
-            treasury,
             DEFAULT_FEE_BPS,
             DEFAULT_TIMEOUT_SLOTS,
         )],
@@ -456,7 +442,6 @@ fn t22_allowed_extension_mint_creates_and_cancels() {
         mint,
         host_token_account: host_ta,
         escrow,
-        treasury,
         amount,
     };
     send_ok(

@@ -11,6 +11,20 @@ use instructions::*;
 
 declare_id!("7ZsoAuFYBBtTHt3jeCd8wWZvKcp7sqxEqAPscSNFte1n");
 
+/// Protocol fee destination. Compile-time, not admin-rotatable: rotating it is
+/// a program upgrade. Per the playbook, a feature flag may change constants and
+/// IDs only, never logic — the `local` variant is the committed test fixture
+/// keypair (`tests/fixtures/treasury-local.json`).
+pub mod treasury {
+    use super::*;
+
+    #[cfg(feature = "local")]
+    pub const ID: Pubkey = Pubkey::from_str_const("9wR75bCR1bo68BygzHkgJ3N735u5TmGsVhzjRrFzNUtJ");
+
+    #[cfg(not(feature = "local"))]
+    pub const ID: Pubkey = Pubkey::from_str_const("BUs86uMPdNMJ9SiFijb4TABpFduhaEqqESs96pTGadsN");
+}
+
 #[program]
 pub mod coinflip {
     use super::*;
@@ -18,27 +32,19 @@ pub mod coinflip {
     pub fn initialize_config(
         ctx: Context<InitializeConfig>,
         admin: Pubkey,
-        treasury: Pubkey,
         fee_bps: u16,
         refund_timeout_slots: u64,
     ) -> Result<()> {
-        instructions::initialize_config::handle(ctx, admin, treasury, fee_bps, refund_timeout_slots)
+        instructions::initialize_config::handle(ctx, admin, fee_bps, refund_timeout_slots)
     }
 
     pub fn update_config(
         ctx: Context<UpdateConfig>,
         new_admin: Option<Pubkey>,
-        new_treasury: Option<Pubkey>,
         new_fee_bps: Option<u16>,
         new_refund_timeout_slots: Option<u64>,
     ) -> Result<()> {
-        instructions::update_config::handle(
-            ctx,
-            new_admin,
-            new_treasury,
-            new_fee_bps,
-            new_refund_timeout_slots,
-        )
+        instructions::update_config::handle(ctx, new_admin, new_fee_bps, new_refund_timeout_slots)
     }
 
     pub fn create_game(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {

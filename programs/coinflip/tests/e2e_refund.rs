@@ -101,7 +101,6 @@ fn refund_uses_joined_timeout_snapshot() {
             payer.pubkey(),
             None,
             None,
-            None,
             Some(coinflip::constants::MAX_REFUND_TIMEOUT_SLOTS),
         )],
     );
@@ -344,7 +343,6 @@ fn refund_rejects_foreign_request() {
         mint: j.fixture.mint,
         host_token_account: host_b_ta,
         escrow: escrow_pda(&game_b_key),
-        treasury: j.fixture.treasury,
         amount: STAKE,
     };
     let joiner_b = Keypair::new();
@@ -389,7 +387,7 @@ fn refund_of_open_game_fails() {
     let orao = setup_orao(&mut svm);
     let joiner = Keypair::new();
     let joiner_token_account = create_token_account(&mut svm, fixture.mint, joiner.pubkey(), 0);
-    let treasury_token_account = get_associated_token_address(&fixture.treasury, &fixture.mint);
+    let treasury_token_account = get_associated_token_address(&treasury(), &fixture.mint);
     // An unjoined game carries a zeroed vrf_seed, so the request PDA its seeds
     // resolve to was never created.
     let vrf_seed = [0u8; 32];

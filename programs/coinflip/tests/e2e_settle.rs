@@ -373,10 +373,11 @@ fn settle_fallback_rejects_non_ata_payout_account() {
     assert_eq!(token_balance(&svm, &j.fixture.escrow), POT);
 }
 
-/// The fallback pays the CURRENT treasury: once the admin rotates it, the old
-/// treasury's account is no longer an acceptable fee destination.
+/// The fee destination is pinned to the compile-time treasury: a cranker
+/// cannot route the fee to an account somebody else owns, however well-formed
+/// that account is.
 #[test]
-fn settle_fallback_rejects_stale_treasury() {
+fn settle_rejects_non_treasury_fee_account() {
     let (mut svm, payer) = setup();
     let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
     write_fulfilled_request(
@@ -385,53 +386,10 @@ fn settle_fallback_rejects_stale_treasury() {
         j.vrf_seed,
         randomness_with_first_byte(2),
     );
-    send_ok(
-        &mut svm,
-        &[&payer],
-        &[ix_update_config(
-            payer.pubkey(),
-            None,
-            Some(Pubkey::new_unique()),
-            None,
-            None,
-        )],
-    );
+    // Right mint, real token account — but owned by a random key.
+    let mallory_ta = create_token_account(&mut svm, j.fixture.mint, Pubkey::new_unique(), 0);
 
     let result = send(
-        &mut svm,
-        &[&payer],
-        &[ix_settle_fallback(&j, payer.pubkey())],
-    );
-    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
-}
-
-/// ...and the rotated treasury's account works, ATA or not: the constraint is
-/// owner + mint, not the associated-token derivation.
-#[test]
-fn settle_fallback_pays_rotated_treasury() {
-    let (mut svm, payer) = setup();
-    let (j, _join_meta) = setup_joined_game(&mut svm, &payer, STAKE);
-    write_fulfilled_request(
-        &mut svm,
-        j.orao.client,
-        j.vrf_seed,
-        randomness_with_first_byte(2),
-    );
-    let new_treasury = Pubkey::new_unique();
-    send_ok(
-        &mut svm,
-        &[&payer],
-        &[ix_update_config(
-            payer.pubkey(),
-            None,
-            Some(new_treasury),
-            None,
-            None,
-        )],
-    );
-    let new_treasury_ta = create_token_account(&mut svm, j.fixture.mint, new_treasury, 0);
-
-    send_ok(
         &mut svm,
         &[&payer],
         &[ix_settle_fallback_full(
@@ -439,16 +397,16 @@ fn settle_fallback_pays_rotated_treasury() {
             payer.pubkey(),
             j.fixture.host_token_account,
             j.joiner_token_account,
-            new_treasury_ta,
+            mallory_ta,
         )],
     );
-
-    assert_eq!(token_balance(&svm, &new_treasury_ta), FEE);
-    assert_eq!(token_balance(&svm, &j.treasury_token_account), 0);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
     assert_eq!(
-        token_balance(&svm, &j.fixture.host_token_account),
-        REMAINING + PAYOUT
+        token_balance(&svm, &j.fixture.escrow),
+        POT,
+        "escrow must be untouched"
     );
+    assert_eq!(token_balance(&svm, &mallory_ta), 0);
 }
 
 /// The pot is the escrow's ACTUAL balance: tokens anyone donated straight into
@@ -546,7 +504,6 @@ fn settle_rejects_foreign_request() {
         mint: j.fixture.mint,
         host_token_account: host_b_ta,
         escrow: escrow_pda(&game_b_key),
-        treasury: j.fixture.treasury,
         amount: STAKE,
     };
     let joiner_b = Keypair::new();

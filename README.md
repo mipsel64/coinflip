@@ -24,8 +24,8 @@ trade-offs), see
 
 | # | Instruction | Signer | Behavior |
 |---|---|---|---|
-| 1 | `initialize_config(admin, treasury, fee_bps, refund_timeout_slots)` | the program's **upgrade authority** (verified against ProgramData) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to `[MIN, MAX]_REFUND_TIMEOUT_SLOTS`; admin/treasury must be non-default keys |
-| 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). Both settle paths always pay the *current* treasury |
+| 1 | `initialize_config(admin, fee_bps, refund_timeout_slots)` | the program's **upgrade authority** (verified against ProgramData) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to `[MIN, MAX]_REFUND_TIMEOUT_SLOTS`; admin must be a non-default key |
+| 2 | `update_config(...)` | `admin` | Rotate admin, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). The treasury is **not** config state — see [Treasury](#treasury) |
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates the mint. Inits `Game` + escrow, transfers the host stake into escrow, records the host's payout token account. State → `Open` |
 | 4 | `cancel_game` | host | Requires state `Open`. Refunds the host stake, closes escrow + game (rent to host) |
 | 5 | `join_game` | joiner | Requires state `Open`, `joiner != host`. Transfers the matching stake into escrow; ensures the treasury ATA exists; reimburses the ORAO VRF fee + pending-request rent from joiner → the program's ORAO Client PDA; CPIs ORAO's `Request` with a callback targeting `settle_callback`. Records the joiner and `joined_at_slot`. State → `AwaitingRandomness` |
@@ -72,10 +72,16 @@ export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
 Build, then test:
 
 ```bash
-anchor build --no-idl -- --tools-version v1.56
-anchor idl build -o target/idl/coinflip.json -t target/types/coinflip.ts
+anchor build --no-idl -- --features local --tools-version v1.56
+anchor idl build -o target/idl/coinflip.json -t target/types/coinflip.ts -- --features local
 cargo test -p coinflip
 ```
+
+`--features local` swaps the compile-time treasury constant for the committed
+test keypair (`programs/coinflip/tests/fixtures/treasury-local.json`) — see
+[Treasury](#treasury). The e2e harness scans the loaded `.so` for that key and
+refuses to run against a binary built without the feature. **Deployment builds
+must not use it** (see [Deployment runbook](#deployment-runbook)).
 
 The build is split into two `anchor` invocations rather than a single
 `anchor build -- --tools-version v1.56`: Anchor forwards everything after
@@ -96,15 +102,51 @@ an unneeded local validator; every test here runs against LiteSVM in-process,
 including the real, checked-in ORAO VRF callback program binary (see
 [Fixture provenance](#fixture-provenance)).
 
-78 tests should pass: 18 unit (fee math + enum round-trips) + 9 config + 14
-create/cancel + 12 join + 11 refund + 14 settle.
+77 tests should pass: 18 unit (fee math + enum round-trips) + 9 config + 14
+create/cancel + 12 join + 11 refund + 13 settle.
+
+## Treasury
+
+The fee destination is a **compile-time constant**
+(`coinflip::treasury::ID`, exported to the IDL as the `TREASURY` constant),
+not a config field: `BUs86uMPdNMJ9SiFijb4TABpFduhaEqqESs96pTGadsN`. Both settle
+paths validate the fee account's owner against it, so the account list frozen
+into a VRF request at join time and a later fallback crank can never disagree
+about where the fee goes.
+
+- **Rotating it is a program upgrade** (~0.003 SOL in transaction fees, plus a
+  refundable ~3.7 SOL buffer float while the upgrade buffer exists; run
+  `solana program extend` first if the binary outgrew its allocation). There is
+  no admin instruction for it and no rotation runbook.
+- **Back up `keys/treasury-keypair.json` off-machine**, alongside the program
+  keypair (both are gitignored): it is the only key that can move collected
+  fees out of the treasury's token accounts.
+- Under `--features local` the constant becomes the committed test keypair
+  `programs/coinflip/tests/fixtures/treasury-local.json`
+  (`9wR75bCR1bo68BygzHkgJ3N735u5TmGsVhzjRrFzNUtJ`). That file is a test fixture
+  with no value; it exists so the e2e suite has a stable, non-random fee
+  destination to derive ATAs against.
 
 ## Deployment runbook
 
-Order matters:
+Deployment builds must be **plain** builds — no `local` feature, or the
+deployed program would route fees to the test key:
+
+```bash
+anchor build --no-idl -- --tools-version v1.56
+anchor idl build -o target/idl/coinflip.json -t target/types/coinflip.ts
+```
+
+The IDL matters as much as the binary: `scripts/*.ts` read the treasury out of
+the IDL's `TREASURY` constant, so an IDL generated with `--features local`
+would point the ops CLI at the test key. CI builds both **with** the feature
+(it runs the tests; it never deploys).
+
+Then, order matters:
 
 1. `anchor deploy`
-2. **Back up the program keypair off-machine before doing anything else.**
+2. **Back up the program keypair off-machine before doing anything else** —
+   and `keys/treasury-keypair.json` with it (see [Treasury](#treasury)).
    `keys/coinflip-keypair.json` (gitignored) is not just a deploy credential —
    registering with ORAO (step 4) funds the ORAO **Client PDA**, which is
    derived from this exact program id. Losing the keypair after registration
@@ -147,8 +189,8 @@ authority first and that surplus is gone forever.
   owner-signed `Withdraw`. If a game ends in `Refunded` instead, that rent is
   recovered only if ORAO later force-fulfills the request (and even then it
   accrues to the Client PDA, never back to the joiner).
-- **First joiner per `(treasury, mint)` pays the treasury ATA's rent**
-  (~0.002 SOL) — `join_game` creates it `init_if_needed`.
+- **First joiner of a given mint pays the treasury ATA's rent** (~0.002 SOL) —
+  `join_game` creates it `init_if_needed`.
 - **Bait-and-burn nuisance:** a host can make their own open game unjoinable
   by closing their recorded token account before anyone joins. Joiners who
   try lose only transaction fees, not stake.
