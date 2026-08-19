@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main, "feat/**", "**audit**"]
+  pull_request:
+
+env:
+  RUST_TOOLCHAIN: 1.93.0
+  ANCHOR_VERSION: 0.32.1
+  SOLANA_VERSION: 2.3.9
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install Solana
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Install Anchor
+        run: cargo install --git https://github.com/coral-xyz/anchor avm --locked && avm install ${ANCHOR_VERSION} && avm use ${ANCHOR_VERSION}
+      # Solana 2.3.9's DEFAULT platform-tools (v1.48) bundle a cargo that
+      # cannot build this dependency tree: solana-program -> blake3 -> digest
+      # -> crypto-common pulls in edition2024 crates that an older cargo
+      # rejects. Force cargo-build-sbf to fetch/use platform-tools v1.56
+      # instead. This must run BEFORE `cargo test`: the LiteSVM test harness
+      # loads target/deploy/coinflip.so directly (tests/common/mod.rs) and
+      # hard-fails if that artifact is stale or missing — building first is
+      # deliberate, not an oversight.
+      #
+      # This is split into two anchor invocations rather than a single
+      # `anchor build -- --tools-version v1.56`: verified locally that
+      # `anchor build` forwards everything after `--` BOTH to the real
+      # `cargo build-sbf` (which understands `--tools-version`) AND to the
+      # internal `cargo test --features idl-build` invocation it uses to
+      # generate the IDL (which does not understand that flag and hard-fails
+      # with "unexpected argument '--tools-version' found"). `--no-idl` skips
+      # that internal step so the SBF compile can be pinned cleanly; the
+      # second command regenerates the IDL/TS-types separately (no cargo args
+      # involved, so no conflict) — `anchor idl build` runs the same
+      # CHECK-comment safety lint `anchor build` would have.
+      - name: anchor build (forces platform-tools v1.56)
+        run: anchor build --no-idl -- --tools-version v1.56
+      - name: anchor idl build (IDL + TS types)
+        run: anchor idl build -o target/idl/coinflip.json -t target/types/coinflip.ts
+      # NOT --all-features: the idl-build feature is only meant to be turned
+      # on by anchor's own IDL-generation pass and intentionally does not
+      # compile standalone.
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test -p coinflip
+      # scripts/register.ts and scripts/smoke.ts import the target/types
+      # generated above, so this runs here rather than as a separate job —
+      # a separate job would need artifact upload/download to see that file.
+      - name: scripts typecheck
+        run: npm ci && npx tsc --noEmit
+        working-directory: scripts

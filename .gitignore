@@ -1,0 +1,9 @@
+target/
+.anchor/
+node_modules/
+test-ledger/
+keys/
+.DS_Store
+.env*
+dist/
+scripts/.smoke-keys*.json

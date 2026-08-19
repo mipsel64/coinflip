@@ -473,15 +473,17 @@ pub struct Game {
     pub token_mint: Pubkey,
     /// Per-player stake in base units.
     pub amount: u64,
+    /// Fee snapshot from Config at create (added in the Task 6 review round).
+    pub fee_bps: u16,
     pub host_token_account: Pubkey,
     pub joiner_token_account: Pubkey,
     pub joined_at_slot: u64,
-    pub _reserved: [u8; 64],
+    pub _reserved: [u8; 62],
 }
 
 const_assert_eq!(
     Game::INIT_SPACE,
-    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 32 + 32 + 8 + 64
+    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 2 + 32 + 32 + 8 + 62
 );
 
 impl Game {
@@ -554,10 +556,11 @@ mod tests {
             joiner,
             token_mint: Pubkey::new_unique(),
             amount: 5,
+            fee_bps: 100,
             host_token_account: host_ta,
             joiner_token_account: joiner_ta,
             joined_at_slot: 0,
-            _reserved: [0; 64],
+            _reserved: [0; 62],
         };
         assert_eq!(game.winner(Side::Heads).unwrap(), (host, host_ta));
         assert_eq!(game.winner(Side::Tails).unwrap(), (joiner, joiner_ta));
@@ -577,6 +580,15 @@ Expected: PASS (3 tests). Also `cargo check -p coinflip` clean (the `const_asser
 ```bash
 git add -A && git commit -m "feat: Config and Game state with layout asserts"
 ```
+
+> **Post-review amendments (applied after Task 4's code review):** `Game::winner()`
+> was replaced by `winner_is_host(outcome) -> Result<bool>` (callers pick the
+> account/pubkey themselves — no pubkey re-comparison in the payout path);
+> `Side::from_byte(u8) -> Result<Side>` centralizes the InvalidSide mapping;
+> tests now also pin enum discriminant VALUES, the borsh byte layout/offsets
+> (crank memcmp depends on state at offset 9), require_state/state()/host_side()
+> error paths, and validate_fee boundaries. Later tasks' snippets already reflect
+> the new API.
 
 ---
 
@@ -598,6 +610,9 @@ pub struct GameCreated {
     pub mint: Pubkey,
     pub amount: u64,
     pub host_side: u8,
+    /// Fee snapshot the game was created under (events are the only durable
+    /// history once accounts close).
+    pub fee_bps: u16,
 }
 
 #[event]
@@ -611,6 +626,7 @@ pub struct GameJoined {
 pub struct GameSettled {
     pub game: Pubkey,
     pub winner: Pubkey,
+    pub mint: Pubkey,
     pub outcome: u8,
     pub pot: u64,
     pub fee: u64,
@@ -619,11 +635,20 @@ pub struct GameSettled {
 #[event]
 pub struct GameCancelled {
     pub game: Pubkey,
+    pub host: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
 }
 
 #[event]
 pub struct GameRefunded {
     pub game: Pubkey,
+    pub host: Pubkey,
+    pub joiner: Pubkey,
+    pub mint: Pubkey,
+    pub host_refund: u64,
+    /// Includes any donated dust.
+    pub joiner_refund: u64,
 }
 ```
 
@@ -674,7 +699,7 @@ pub struct InitializeConfig<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handle(
+pub(crate) fn handle(
     ctx: Context<InitializeConfig>,
     admin: Pubkey,
     treasury: Pubkey,
@@ -713,7 +738,7 @@ pub struct UpdateConfig<'info> {
     pub config: Account<'info, Config>,
 }
 
-pub fn handle(
+pub(crate) fn handle(
     ctx: Context<UpdateConfig>,
     new_admin: Option<Pubkey>,
     new_treasury: Option<Pubkey>,
@@ -792,6 +817,16 @@ pub mod coinflip {
 anchor build
 git add -A && git commit -m "feat: config instructions"
 ```
+
+> **Post-review amendments (applied after Task 6's code review):** handlers are
+> `pub(crate) fn handle` and `instructions/mod.rs` uses plain glob re-exports (no
+> `#[allow(ambiguous_glob_reexports)]`); both config handlers guard
+> admin/treasury against `Pubkey::default()` (`InvalidAuthority`, 6013) and bound
+> `refund_timeout_slots` to `[MIN_REFUND_TIMEOUT_SLOTS, MAX_REFUND_TIMEOUT_SLOTS]`
+> (`InvalidTimeout`, 6014) via `Config::validate_timeout`; `Game` gained a
+> `fee_bps: u16` snapshot field (reserved shrunk to 62) written at create and
+> used by settlement, so admin fee changes never retro-apply. Later tasks'
+> snippets already reflect all of this.
 
 ---
 
@@ -1120,7 +1155,74 @@ fn update_config_rejects_non_admin() {
     let result = send(&mut svm, &[&mallory], &[ix_update_config(
         mallory.pubkey(), None, None, Some(0), None,
     )]);
-    assert!(result.is_err()); // has_one = admin fails (ConstraintHasOne)
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+}
+
+#[test]
+fn initialize_config_is_one_shot() {
+    let (mut svm, payer) = setup();
+    let ix = ix_initialize_config(
+        payer.pubkey(), payer.pubkey(), Pubkey::new_unique(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    );
+    send(&mut svm, &[&payer], &[ix.clone()]).unwrap();
+    // second init must fail: the PDA already exists
+    assert!(send(&mut svm, &[&payer], &[ix]).is_err());
+}
+
+#[test]
+fn update_config_rejects_fee_above_cap_and_bad_timeout() {
+    let (mut svm, payer) = setup();
+    let admin = payer.pubkey();
+    send(&mut svm, &[&payer], &[ix_initialize_config(
+        payer.pubkey(), admin, Pubkey::new_unique(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    )])
+    .unwrap();
+    let result = send(&mut svm, &[&payer], &[ix_update_config(admin, None, None, Some(1_001), None)]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::FeeTooHigh);
+    let result = send(&mut svm, &[&payer], &[ix_update_config(admin, None, None, None, Some(0))]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidTimeout);
+}
+
+#[test]
+fn default_key_authorities_are_rejected() {
+    let (mut svm, payer) = setup();
+    let result = send(&mut svm, &[&payer], &[ix_initialize_config(
+        payer.pubkey(), payer.pubkey(), Pubkey::default(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    )]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidAuthority);
+
+    send(&mut svm, &[&payer], &[ix_initialize_config(
+        payer.pubkey(), payer.pubkey(), Pubkey::new_unique(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    )])
+    .unwrap();
+    let result = send(&mut svm, &[&payer], &[ix_update_config(
+        payer.pubkey(), Some(Pubkey::default()), None, None, None,
+    )]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::InvalidAuthority);
+}
+
+#[test]
+fn admin_rotation_round_trip() {
+    let (mut svm, payer) = setup();
+    send(&mut svm, &[&payer], &[ix_initialize_config(
+        payer.pubkey(), payer.pubkey(), Pubkey::new_unique(), DEFAULT_FEE_BPS, DEFAULT_TIMEOUT_SLOTS,
+    )])
+    .unwrap();
+    let new_admin = solana_sdk::signature::Keypair::new();
+    svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+    // old admin rotates to new
+    send(&mut svm, &[&payer], &[ix_update_config(
+        payer.pubkey(), Some(new_admin.pubkey()), None, None, None,
+    )])
+    .unwrap();
+    // old admin is now rejected
+    let result = send(&mut svm, &[&payer], &[ix_update_config(payer.pubkey(), None, None, Some(200), None)]);
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::OwnerMismatch);
+    // new admin works
+    send(&mut svm, &[&new_admin], &[ix_update_config(
+        new_admin.pubkey(), None, None, Some(200), None,
+    )])
+    .unwrap();
 }
 ```
 
@@ -1159,10 +1261,10 @@ use anchor_spl::{
 };
 
 use crate::{
-    constants::ESCROW_SEED,
+    constants::{CONFIG_SEED, ESCROW_SEED},
     errors::CoinflipError,
     events::GameCreated,
-    state::{Game, GameState, Side},
+    state::{Config, Game, GameState, Side},
 };
 
 #[event_cpi]
@@ -1170,6 +1272,9 @@ use crate::{
 pub struct CreateGame<'info> {
     #[account(mut)]
     pub host: Signer<'info>,
+    /// Fee snapshot source; games settle at the fee they were created under.
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
     /// Fresh keypair account — its pubkey IS the game id (it signs init only).
     #[account(init, payer = host, space = 8 + Game::INIT_SPACE)]
     pub game: Box<Account<'info, Game>>,
@@ -1187,6 +1292,7 @@ pub struct CreateGame<'info> {
     #[account(
         mut,
         constraint = host_token_account.mint == mint.key() @ CoinflipError::MintMismatch,
+        constraint = host_token_account.owner == host.key() @ CoinflipError::OwnerMismatch,
     )]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,
@@ -1219,9 +1325,9 @@ fn validate_mint(mint_info: &AccountInfo) -> Result<()> {
     Ok(())
 }
 
-pub fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
+pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
     require!(amount > 0, CoinflipError::ZeroAmount);
-    let side = Side::try_from(side).map_err(|_| error!(CoinflipError::InvalidSide))?;
+    let side = Side::from_byte(side)?;
     validate_mint(&ctx.accounts.mint.to_account_info())?;
 
     token_interface::transfer_checked(
@@ -1247,10 +1353,11 @@ pub fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
     game.joiner = Pubkey::default();
     game.token_mint = ctx.accounts.mint.key();
     game.amount = amount;
+    game.fee_bps = ctx.accounts.config.fee_bps;
     game.host_token_account = ctx.accounts.host_token_account.key();
     game.joiner_token_account = Pubkey::default();
     game.joined_at_slot = 0;
-    game._reserved = [0; 64];
+    game._reserved = [0; 62];
 
     emit_cpi!(GameCreated {
         game: game.key(),
@@ -1258,6 +1365,7 @@ pub fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<()> {
         mint: game.token_mint,
         amount,
         host_side: game.host_side,
+        fee_bps: game.fee_bps,
     });
     Ok(())
 }
@@ -1286,6 +1394,7 @@ pub fn ix_create_game(
         program_id: coinflip::ID,
         accounts: coinflip::accounts::CreateGame {
             host,
+            config: config_pda(),
             game,
             mint,
             escrow: escrow_pda(&game),
@@ -1436,12 +1545,18 @@ pub struct CancelGame<'info> {
     pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mut, seeds = [ESCROW_SEED, game.key().as_ref()], bump = game.escrow_bump)]
     pub escrow: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(mut, address = game.host_token_account @ CoinflipError::MintMismatch)]
+    /// Any host-owned account of the game mint (liveness: the recorded one may
+    /// have been closed since create).
+    #[account(
+        mut,
+        constraint = host_token_account.owner == game.host @ CoinflipError::OwnerMismatch,
+        constraint = host_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn handle(ctx: Context<CancelGame>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<CancelGame>) -> Result<()> {
     ctx.accounts.game.require_state(GameState::Open)?;
 
     let game_key = ctx.accounts.game.key();
@@ -1476,7 +1591,12 @@ pub fn handle(ctx: Context<CancelGame>) -> Result<()> {
     ))?;
 
     ctx.accounts.game.state = GameState::Cancelled.into();
-    emit_cpi!(GameCancelled { game: game_key });
+    emit_cpi!(GameCancelled {
+        game: game_key,
+        host: ctx.accounts.game.host,
+        mint: ctx.accounts.game.token_mint,
+        amount: ctx.accounts.game.amount,
+    });
     Ok(())
 }
 ```
@@ -1545,6 +1665,15 @@ git add -A && git commit -m "feat: cancel_game"
 ```
 Expected: PASS (5 tests).
 
+> **Post-review amendments (applied after Task 9's code review):** the cancel
+> suite grew to 12 tests (stake-cap boundary, liveness refund accounts,
+> wrong-mint/non-owned refund rejections, event + rent-delta assertions);
+> `ix_cancel_game` delegates to `ix_cancel_game_with_refund_account`;
+> `GameCancelled`/`GameRefunded` were enriched pre-ABI for standalone
+> indexability (see the Task 5 snippet, already updated). Note: the
+> `state = Cancelled` write is dead (Anchor `close` skips serialization) — the
+> re-cancel guard is account closure itself; never make that byte load-bearing.
+
 ---
 
 ### Task 10: join_game (ORAO Request CPI)
@@ -1556,7 +1685,7 @@ Expected: PASS (5 tests).
 
 The callback account list is FIXED here, at request time. Order (after ORAO's 4 fixed accounts) — this order must match `SettleCallback`'s struct order in Task 12 exactly:
 `game(w), escrow(w), host(w), host_token_account(w), joiner_token_account(w), treasury_token_account(w), mint(ro), token_program(ro), event_authority(ro), program(ro)`.
-All five writables are "arbitrary writable" — they must ALSO be appended as writable remaining accounts to the Request CPI (that's how ORAO authorizes them).
+All six writables are "arbitrary writable" — they must ALSO be appended as writable remaining accounts to the Request CPI (that's how ORAO authorizes them).
 
 - [ ] **Step 1: Write `instructions/join_game.rs`**
 
@@ -1604,6 +1733,7 @@ pub struct JoinGame<'info> {
     #[account(
         mut,
         constraint = joiner_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+        constraint = joiner_token_account.owner == joiner.key() @ CoinflipError::OwnerMismatch,
     )]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, address = game.host_token_account @ CoinflipError::MintMismatch)]
@@ -1638,21 +1768,17 @@ pub struct JoinGame<'info> {
     /// CHECK: asserted by the CPI.
     #[account(mut, address = network_state.config.treasury)]
     pub orao_treasury: AccountInfo<'info>,
-    /// CHECK: created by the CPI; seed = game pubkey, so it's unique per game
-    /// and a pre-existing (precomputed) request makes the join fail.
-    #[account(
-        mut,
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.key().as_ref()],
-        seeds::program = orao_solana_vrf_cb::ID,
-        bump,
-    )]
+    /// CHECK: created (and PDA-validated against the seed we pass) by the ORAO
+    /// CPI itself. The seed is sha256("coinflip-vrf-seed", game, joiner) —
+    /// unpredictable pre-join, so the address cannot be grief-pre-funded.
+    #[account(mut)]
     pub request: AccountInfo<'info>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
-pub fn handle(ctx: Context<JoinGame>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
     ctx.accounts.game.require_state(GameState::Open)?;
     require!(
         ctx.accounts.joiner.key() != ctx.accounts.game.host,
@@ -1764,7 +1890,7 @@ pub struct SettleCallback<'info> {
     pub client: AccountInfo<'info>,
 }
 
-pub fn handle(_ctx: Context<SettleCallback>) -> Result<()> {
+pub(crate) fn handle(_ctx: Context<SettleCallback>) -> Result<()> {
     err!(CoinflipError::RandomnessNotFulfilled)
 }
 ```
@@ -1851,6 +1977,15 @@ pub fn setup_joined_game(svm: &mut LiteSVM, payer: &Keypair, amount: u64) -> Joi
 }
 ```
 
+- [ ] **Step 5 (carried from Task 9 review): two additional tests**
+
+In `tests/e2e_create_cancel.rs`: `cancel_after_join_fails` — after a full join
+(state AwaitingRandomness), host attempts cancel → `InvalidGameState` (this is
+the guard between a joined game and the host stealing the joiner's stake — first
+testable now). And a Token-2022 ALLOWED-extension happy path: a t22 mint with
+`MetadataPointer` flows create → cancel end-to-end (needs the crafter to support
+an allowed extension and a token_program parameter on the cancel builder).
+
 - [ ] **Step 5: Write `tests/e2e_join.rs`**
 
 ```rust
@@ -1914,7 +2049,18 @@ fn join_with_wrong_mint_token_account_fails() {
 anchor build && cargo test -p coinflip --test e2e_join
 git add -A && git commit -m "feat: join_game with ORAO callback VRF request"
 ```
-Expected: PASS (4 tests). This is the task where the real dumped ORAO binary runs — if the `request` CPI fails with an unexpected ORAO error, print the tx logs (`FailedTransactionMetadata.meta.logs`) and compare against the crate's `error.rs`; the usual suspects are the client balance being too small (raise the funding in `setup_orao`) or a stale fixture (re-dump the `.so`).
+Expected: PASS (4 tests).
+
+> **Post-review amendments (applied after Task 10's code review):** the VRF seed
+> is now `sha256("coinflip-vrf-seed", game, joiner)` stored in `Game.vrf_seed`
+> (reserved shrunk to 30) — the request account in JoinGame is a CHECK'd
+> AccountInfo whose PDA the ORAO CPI itself enforces; the joiner reimburses
+> `request_fee + rent(pending request)` sized via `RequestAccount::expected_size`
+> so the Client PDA is exactly neutral per join (asserted in tests);
+> `orao_treasury` carries a typed error; `token_program` is constrained to the
+> mint's owner; the join suite gained lamport-delta, CU-budget, T22-join, and
+> three negative constraint tests. Tasks 11-13 derive the request PDA from
+> `game.vrf_seed` (snippets already updated). This is the task where the real dumped ORAO binary runs — if the `request` CPI fails with an unexpected ORAO error, print the tx logs (`FailedTransactionMetadata.meta.logs`) and compare against the crate's `error.rs`; the usual suspects are the client balance being too small (raise the funding in `setup_orao`) or a stale fixture (re-dump the `.so`).
 
 ---
 
@@ -1960,21 +2106,21 @@ pub(crate) fn execute_settlement<'info>(
     treasury_token_account: &InterfaceAccount<'info, TokenAccount>,
     token_program: &Interface<'info, TokenInterface>,
     host: &AccountInfo<'info>,
-    fee_bps: u16,
     randomness: &[u8; 64],
 ) -> Result<SettlementOutcome> {
+    // Fee comes from the game's snapshot, never live config: admin fee
+    // changes must not retro-apply to already-created games.
     game.require_state(GameState::AwaitingRandomness)?;
 
     let outcome = Side::from_randomness(randomness);
-    let (winner, winner_token_key) = game.winner(outcome)?;
-    let winner_token_account = if winner_token_key == host_token_account.key() {
-        host_token_account
+    let (winner, winner_token_account) = if game.winner_is_host(outcome)? {
+        (game.host, host_token_account)
     } else {
-        joiner_token_account
+        (game.joiner, joiner_token_account)
     };
 
     let pot = escrow.amount;
-    let fee = fee_amount(pot, fee_bps)?;
+    let fee = fee_amount(pot, game.fee_bps)?;
     let payout = pot.checked_sub(fee).ok_or(CoinflipError::NumericalOverflow)?;
 
     let game_key = game.key();
@@ -2057,7 +2203,7 @@ pub struct SettleFallback<'info> {
     pub client: Box<Account<'info, Client>>,
     /// Seed binding: this must be THE request for this game.
     #[account(
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.key().as_ref()],
+        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.vrf_seed.as_ref()],
         seeds::program = orao_solana_vrf_cb::ID,
         bump = request.bump,
     )]
@@ -2069,9 +2215,19 @@ pub struct SettleFallback<'info> {
     /// CHECK: rent receiver, must be the game's host.
     #[account(mut, address = game.host @ CoinflipError::OwnerMismatch)]
     pub host: AccountInfo<'info>,
-    #[account(mut, address = game.host_token_account @ CoinflipError::MintMismatch)]
+    /// Any host-owned account of the game mint (liveness: recorded one may be closed).
+    #[account(
+        mut,
+        constraint = host_token_account.owner == game.host @ CoinflipError::OwnerMismatch,
+        constraint = host_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(mut, address = game.joiner_token_account @ CoinflipError::MintMismatch)]
+    /// Any joiner-owned account of the game mint.
+    #[account(
+        mut,
+        constraint = joiner_token_account.owner == game.joiner @ CoinflipError::OwnerMismatch,
+        constraint = joiner_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
@@ -2086,7 +2242,7 @@ pub struct SettleFallback<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn handle(ctx: Context<SettleFallback>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<SettleFallback>) -> Result<()> {
     let randomness = ctx
         .accounts
         .request
@@ -2103,13 +2259,13 @@ pub fn handle(ctx: Context<SettleFallback>) -> Result<()> {
         &ctx.accounts.treasury_token_account,
         &ctx.accounts.token_program,
         &ctx.accounts.host,
-        ctx.accounts.config.fee_bps,
         &randomness,
     )?;
 
     emit_cpi!(GameSettled {
         game: ctx.accounts.game.key(),
         winner: outcome.winner,
+        mint: ctx.accounts.game.token_mint,
         outcome: outcome.outcome,
         pot: outcome.pot,
         fee: outcome.fee,
@@ -2238,6 +2394,26 @@ Expected: PASS (4 tests). Note the payout numbers implement the spec's worked ex
 **Files:**
 - Modify: `programs/coinflip/src/instructions/settle_callback.rs` (replace the Task 10 shell), `tests/common/mod.rs`, `tests/e2e_settle.rs`
 
+- [ ] **Step 0 (carried from Task 11 review): two small refactors**
+
+Move the two `require_payout_account` calls from `settle_fallback`'s handler
+INSIDE `execute_settlement` (guarding host+joiner there makes the rule
+unforgettable for every settlement call site; the callback's address-pinned
+accounts satisfy it trivially). And in `join_game`, add a dynamic invariant
+check after the network_state account is available:
+```rust
+    // The refund window must never open before ORAO gives up on the callback,
+    // or a player could sabotage their payout account and force a refund.
+    require!(
+        ctx.accounts.config.refund_timeout_slots
+            > ctx.accounts.network_state.config.callback_deadline,
+        CoinflipError::InvalidTimeout
+    );
+```
+Also: bump the stale "measured ~42k" CU comment in e2e_settle.rs (real: ~47k),
+and rename `settle_fallback_pays_any_winner_owned_account` to
+`settle_fallback_pays_ata_when_recorded_account_is_gone`.
+
 - [ ] **Step 1: Replace `instructions/settle_callback.rs`** — ORAO's fixed prefix (client signer, state, network_state, request), then OUR accounts in exactly the order `join_game` declared:
 
 ```rust
@@ -2279,7 +2455,7 @@ pub struct SettleCallback<'info> {
     )]
     pub network_state: Box<Account<'info, NetworkState>>,
     #[account(
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.key().as_ref()],
+        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.vrf_seed.as_ref()],
         seeds::program = orao_solana_vrf_cb::ID,
         bump = request.bump,
     )]
@@ -2296,6 +2472,11 @@ pub struct SettleCallback<'info> {
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, address = game.joiner_token_account @ CoinflipError::MintMismatch)]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// LIVE-treasury policy (unified with settle_fallback): the fee RATE is the
+    /// player guarantee (snapshotted); the destination is protocol-internal.
+    /// After a rotation, in-flight callbacks fail until the new treasury's
+    /// token account exists (runbook: create it BEFORE rotating), then ORAO
+    /// retries / degrades to fulfill-without-callback and fallback settles.
     #[account(
         mut,
         constraint = treasury_token_account.owner == config.treasury
@@ -2309,7 +2490,7 @@ pub struct SettleCallback<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn handle(ctx: Context<SettleCallback>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<SettleCallback>) -> Result<()> {
     let randomness = ctx
         .accounts
         .request
@@ -2326,13 +2507,13 @@ pub fn handle(ctx: Context<SettleCallback>) -> Result<()> {
         &ctx.accounts.treasury_token_account,
         &ctx.accounts.token_program,
         &ctx.accounts.host,
-        ctx.accounts.config.fee_bps,
         &randomness,
     )?;
 
     emit_cpi!(GameSettled {
         game: ctx.accounts.game.key(),
         winner: outcome.winner,
+        mint: ctx.accounts.game.token_mint,
         outcome: outcome.outcome,
         pot: outcome.pot,
         fee: outcome.fee,
@@ -2465,6 +2646,7 @@ use crate::{
     constants::{CONFIG_SEED, ESCROW_SEED},
     errors::CoinflipError,
     events::GameRefunded,
+    instructions::settlement::require_payout_account,
     state::{Config, Game, GameState},
 };
 
@@ -2481,7 +2663,7 @@ pub struct RefundTimeout<'info> {
     )]
     pub client: Box<Account<'info, Client>>,
     #[account(
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.key().as_ref()],
+        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.vrf_seed.as_ref()],
         seeds::program = orao_solana_vrf_cb::ID,
         bump = request.bump,
     )]
@@ -2493,17 +2675,43 @@ pub struct RefundTimeout<'info> {
     /// CHECK: rent receiver, must be the game's host.
     #[account(mut, address = game.host @ CoinflipError::OwnerMismatch)]
     pub host: AccountInfo<'info>,
-    #[account(mut, address = game.host_token_account @ CoinflipError::MintMismatch)]
+    /// Any host-owned account of the game mint (liveness: recorded one may be closed).
+    #[account(
+        mut,
+        constraint = host_token_account.owner == game.host @ CoinflipError::OwnerMismatch,
+        constraint = host_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub host_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(mut, address = game.joiner_token_account @ CoinflipError::MintMismatch)]
+    /// Any joiner-owned account of the game mint.
+    #[account(
+        mut,
+        constraint = joiner_token_account.owner == game.joiner @ CoinflipError::OwnerMismatch,
+        constraint = joiner_token_account.mint == game.token_mint @ CoinflipError::MintMismatch,
+    )]
     pub joiner_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(address = game.token_mint @ CoinflipError::MintMismatch)]
     pub mint: Box<InterfaceAccount<'info, Mint>>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
+pub(crate) fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
     ctx.accounts.game.require_state(GameState::AwaitingRandomness)?;
+    // Permissionless cranker: refunds may only land on recorded-or-ATA
+    // destinations (same rule as settle_fallback; see settlement.rs).
+    require_payout_account(
+        &ctx.accounts.host_token_account,
+        ctx.accounts.game.host_token_account,
+        ctx.accounts.game.host,
+        ctx.accounts.game.token_mint,
+        ctx.accounts.token_program.key(),
+    )?;
+    require_payout_account(
+        &ctx.accounts.joiner_token_account,
+        ctx.accounts.game.joiner_token_account,
+        ctx.accounts.game.joiner,
+        ctx.accounts.game.token_mint,
+        ctx.accounts.token_program.key(),
+    )?;
     // A fulfilled request must be settled on its outcome, never refunded.
     require!(
         ctx.accounts.request.fulfilled().is_none(),
@@ -2574,7 +2782,14 @@ pub fn handle(ctx: Context<RefundTimeout>) -> Result<()> {
     ))?;
 
     ctx.accounts.game.state = GameState::Refunded.into();
-    emit_cpi!(GameRefunded { game: game_key });
+    emit_cpi!(GameRefunded {
+        game: game_key,
+        host: ctx.accounts.game.host,
+        joiner: ctx.accounts.game.joiner,
+        mint: ctx.accounts.game.token_mint,
+        host_refund,
+        joiner_refund,
+    });
     Ok(())
 }
 ```
@@ -2670,9 +2885,23 @@ Expected: all unit + e2e suites PASS.
 ### Task 14: Deployment scripts + devnet smoke test
 
 **Files:**
-- Create: `scripts/package.json`, `scripts/tsconfig.json`, `scripts/register.ts`
+- Create: `scripts/package.json`, `scripts/tsconfig.json`, `scripts/register.ts`, `scripts/smoke.ts`
 
-- [ ] **Step 1: Write `scripts/package.json`**
+**Implementation note (post-hoc):** the scope grew during implementation beyond
+what's drafted below — `register.ts` gained two more subcommands
+(`init-config`, wrapping `initialize_config`; `check-orao`, which fetches
+ORAO's `NetworkState` + our `Config` and warns if `refund_timeout_slots`
+doesn't clear ORAO's `callback_deadline` by the required margin) — and a
+standalone `scripts/smoke.ts` was added for the devnet e2e walkthrough
+described in Step 3 (create_game + join_game against the real deployed ORAO
+program, then poll for the callback to settle it). Also: the `PROGRAM_ID`
+snippet in Step 2 below is broken pseudo-code (a `readFileSync` used as a
+truthiness check inside a ternary, which can't compile) — the actual
+`register.ts` instead tries `target/deploy/coinflip-keypair.json` then falls
+back to `keys/coinflip-keypair.json`, reading only the pubkey out of whichever
+exists. All four steps below are done; see `scripts/` for the real code.
+
+- [x] **Step 1: Write `scripts/package.json`**
 
 ```json
 {
@@ -2708,7 +2937,7 @@ Expected: all unit + e2e suites PASS.
 }
 ```
 
-- [ ] **Step 2: Write `scripts/register.ts`** — modeled on ORAO's example `cli.ts` (`RegisterBuilder` + a system transfer to the client PDA). The wallet must be the **program's upgrade authority**:
+- [x] **Step 2: Write `scripts/register.ts`** — modeled on ORAO's example `cli.ts` (`RegisterBuilder` + a system transfer to the client PDA). The wallet must be the **program's upgrade authority**:
 
 ```ts
 import * as anchor from "@coral-xyz/anchor";
@@ -2788,7 +3017,14 @@ cli.parseAsync();
 ```
 (If the `RegisterBuilder` constructor signature differs on the published 0.4.x package, mirror the exact call in ORAO's `callback/rust/examples/cpi/cli.ts` — it is the canonical usage.)
 
-- [ ] **Step 3: Devnet smoke test (manual, documents the callback happy path the LiteSVM suite can't reach)**
+- [x] **Step 3: Devnet smoke test (manual, documents the callback happy path the LiteSVM suite can't reach)**
+
+IMPORTANT runbook items: (1) NEVER burn the program upgrade authority without
+first running ORAO's `Transfer` to move the client `owner` to a surviving key —
+owner-signed `Withdraw` is the only way to recover the Client PDA's accumulating
+rent surplus. (2) The Register call must set the ORAO client `owner` to a
+team-controlled key — owner-signed `Withdraw` is the only way to recover the
+rent surplus that accumulates in the Client PDA (~0.0067 SOL per fulfilled game).
 
 ```bash
 # one-time
@@ -2796,16 +3032,18 @@ anchor build && anchor deploy --provider.cluster devnet
 cd scripts && npm install
 npx tsx register.ts -k ~/.config/solana/id.json register
 npx tsx register.ts -k ~/.config/solana/id.json deposit --lamports 100000000  # 0.1 SOL
-# initialize config, create + join a wSOL game with two test wallets (anchor console
-# or a scratch TS script), then watch the game settle WITHOUT any settle tx:
+npx tsx register.ts -k ~/.config/solana/id.json init-config   # one-shot; payer must be the upgrade authority
+npx tsx register.ts -k ~/.config/solana/id.json check-orao    # confirms callback_deadline + margin < refund_timeout_slots
+# create + join a throwaway SPL-mint game with two ephemeral wallets, then watch it settle WITHOUT any settle tx:
+npx tsx smoke.ts
 solana logs <PROGRAM_ID> -u devnet     # expect the SettleCallback + GameSettled event CPI
 ```
-Expected: after `join_game` confirms, within ~a few slots the ORAO oracle fulfills and the program logs show `settle_callback` executing — the winner's ATA balance changes with no third transaction. Record the tx signatures in the README (Task 15).
+Expected: after `join_game` confirms, within ~a few slots the ORAO oracle fulfills and the program logs show `settle_callback` executing — the winner's ATA balance changes with no third transaction. `smoke.ts` polls for exactly this (the game account closing) and prints both players' final balances plus an explorer link to the fulfill tx. Record the tx signatures in the README (Task 15).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
-git add -A && git commit -m "chore: ORAO register/deposit scripts"
+git add -A && git commit -m "chore: ORAO register/deposit/init/smoke scripts"
 ```
 
 ---
@@ -2861,7 +3099,10 @@ jobs:
       - run: cargo test
 ```
 
-- [ ] **Step 2: Write `README.md`** — cover: what the game is (spec summary + the 5 SOL / 9.9 SOL example), the instruction table from the spec, the ORAO callback flow diagram (create → join(request) → oracle callback → settled; fallback + refund backstops), how to build/test (`anchor build && cargo test`), deployment steps (deploy → `initialize_config` → `scripts register` → `deposit`), and the note that the crank/dealer bot lives in the backend repo. Point to `docs/superpowers/specs/2026-08-18-coinflip-program-design.md` for the full design.
+- [ ] **Step 2: Write `README.md`** — cover (Economics notes to include: first joiner for a given (treasury, mint) pays the treasury ATA rent ~0.002 SOL; the joiner pays VRF fee + pending-request rent ~0.0096 SOL per join, never refunded to them: ~0.0019 stays locked in the permanent ORAO request account and ~0.0067 returns to the protocol's ORAO Client PDA on fulfillment (an implicit protocol fee, recoverable via ORAO's owner-signed Withdraw); a host can make their open game unjoinable by closing the recorded host token account — bait-and-burn nuisance, joiners lose only tx fees; a REFUNDED game's request rent is recovered only if ORAO later force-fulfills (then it accrues to the protocol's Client PDA, never back to the joiner); client SDKs must NEVER reuse a game keypair — a resurrected game at the same address re-derives the same vrf_seed per joiner and those joins fail forever. Also include a Limitations note: the e2e
+  suite exercises Token-2022 only on create/cancel; joins/settlements are tested
+  on classic SPL — a T22 join needs a program-parameterized join builder and
+  `get_associated_token_address_with_program_id` for the treasury ATA): what the game is (spec summary + the 5 SOL / 9.9 SOL example), the instruction table from the spec, the ORAO callback flow diagram (create → join(request) → oracle callback → settled; fallback + refund backstops), how to build/test (`anchor build && cargo test`), deployment steps (deploy → `initialize_config` → `scripts register` → `deposit`), and the note that the crank/dealer bot lives in the backend repo. Point to `docs/superpowers/specs/2026-08-18-coinflip-program-design.md` for the full design.
 
 - [ ] **Step 3: Write `CHANGELOG.md`** (Keep a Changelog format)
 
