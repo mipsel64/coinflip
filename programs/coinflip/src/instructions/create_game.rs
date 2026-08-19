@@ -119,7 +119,8 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
     game.host_token_account = ctx.accounts.host_token_account.key();
     game.joiner_token_account = Pubkey::default();
     game.joined_at_slot = 0;
-    game._reserved = [0; 62];
+    game.vrf_seed = [0; 32];
+    game._reserved = [0; 30];
 
     emit_cpi!(GameCreated {
         game: game.key(),

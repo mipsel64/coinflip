@@ -10,8 +10,9 @@ use orao_solana_vrf_cb::{
     state::{
         client::{Callback, Client, RemainingAccount},
         network_state::NetworkState,
+        request::RequestAccount,
     },
-    RequestParams, CB_CLIENT_ACCOUNT_SEED, CB_CONFIG_ACCOUNT_SEED, CB_REQUEST_ACCOUNT_SEED,
+    RequestParams, CB_CLIENT_ACCOUNT_SEED, CB_CONFIG_ACCOUNT_SEED,
 };
 
 use crate::{
@@ -74,18 +75,18 @@ pub struct JoinGame<'info> {
     )]
     pub network_state: Box<Account<'info, NetworkState>>,
     /// CHECK: asserted by the CPI.
-    #[account(mut, address = network_state.config.treasury)]
+    #[account(mut, address = network_state.config.treasury @ CoinflipError::OwnerMismatch)]
     pub orao_treasury: AccountInfo<'info>,
-    /// CHECK: created by the CPI; seed = game pubkey, so it's unique per game
-    /// and a pre-existing (precomputed) request makes the join fail.
-    #[account(
-        mut,
-        seeds = [CB_REQUEST_ACCOUNT_SEED, client.key().as_ref(), game.key().as_ref()],
-        seeds::program = orao_solana_vrf_cb::ID,
-        bump,
-    )]
+    /// CHECK: created (and PDA-validated against the seed we pass) by the ORAO
+    /// CPI itself. The seed is sha256("coinflip-vrf-seed", game, joiner) —
+    /// unpredictable pre-join, so the address cannot be grief-pre-funded.
+    #[account(mut)]
     pub request: AccountInfo<'info>,
     pub associated_token_program: Program<'info, AssociatedToken>,
+    #[account(
+        constraint = token_program.key() == *mint.to_account_info().owner
+            @ CoinflipError::MintMismatch,
+    )]
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
@@ -96,35 +97,6 @@ pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
         ctx.accounts.joiner.key() != ctx.accounts.game.host,
         CoinflipError::HostCannotJoin
     );
-
-    // Matching stake into escrow.
-    token_interface::transfer_checked(
-        CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            TransferChecked {
-                from: ctx.accounts.joiner_token_account.to_account_info(),
-                mint: ctx.accounts.mint.to_account_info(),
-                to: ctx.accounts.escrow.to_account_info(),
-                authority: ctx.accounts.joiner.to_account_info(),
-            },
-        ),
-        ctx.accounts.game.amount,
-        ctx.accounts.mint.decimals,
-    )?;
-
-    // The ORAO Client PDA pays the request fee; the joiner reimburses it so
-    // the client balance stays neutral.
-    invoke(
-        &system_instruction::transfer(
-            &ctx.accounts.joiner.key(),
-            &ctx.accounts.client.key(),
-            ctx.accounts.network_state.config.request_fee,
-        ),
-        &[
-            ctx.accounts.joiner.to_account_info(),
-            ctx.accounts.client.to_account_info(),
-        ],
-    )?;
 
     // Callback account list — order must match SettleCallback's struct.
     let game_key = ctx.accounts.game.key();
@@ -141,6 +113,55 @@ pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
             RemainingAccount::readonly(ctx.accounts.event_authority.key()),
             RemainingAccount::readonly(crate::ID),
         ]);
+
+    // Matching stake into escrow.
+    token_interface::transfer_checked(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            TransferChecked {
+                from: ctx.accounts.joiner_token_account.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                to: ctx.accounts.escrow.to_account_info(),
+                authority: ctx.accounts.joiner.to_account_info(),
+            },
+        ),
+        ctx.accounts.game.amount,
+        ctx.accounts.mint.decimals,
+    )?;
+
+    // The ORAO Client PDA pays the request fee AND the pending request's rent;
+    // the joiner reimburses both, so the shared client balance is exactly
+    // neutral per join and cheap join spam cannot drain it. ORAO's own sizing
+    // helper excludes the 8-byte account discriminator (matching its
+    // `8 + Client::STATIC_SIZE` allocation convention), so add it back here.
+    let request_size = 8 + RequestAccount::expected_size(&ctx.accounts.client, Some(&callback));
+    let reimbursement = ctx
+        .accounts
+        .network_state
+        .config
+        .request_fee
+        .checked_add(Rent::get()?.minimum_balance(request_size))
+        .ok_or(CoinflipError::NumericalOverflow)?;
+    invoke(
+        &system_instruction::transfer(
+            &ctx.accounts.joiner.key(),
+            &ctx.accounts.client.key(),
+            reimbursement,
+        ),
+        &[
+            ctx.accounts.joiner.to_account_info(),
+            ctx.accounts.client.to_account_info(),
+        ],
+    )?;
+
+    // Unpredictable before the joiner commits: nobody can pre-fund the request
+    // PDA to permanently block this game's join.
+    let vrf_seed = solana_sha256_hasher::hashv(&[
+        b"coinflip-vrf-seed",
+        game_key.as_ref(),
+        ctx.accounts.joiner.key().as_ref(),
+    ])
+    .to_bytes();
 
     let mut cpi_accounts = orao_cpi::accounts::Request {
         payer: ctx.accounts.joiner.to_account_info(),
@@ -169,13 +190,14 @@ pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
         ]);
     orao_cpi::request(
         cpi_ctx,
-        RequestParams::new(game_key.to_bytes()).with_callback(Some(callback)),
+        RequestParams::new(vrf_seed).with_callback(Some(callback)),
     )?;
 
     let game = &mut ctx.accounts.game;
     game.joiner = ctx.accounts.joiner.key();
     game.joiner_token_account = ctx.accounts.joiner_token_account.key();
     game.joined_at_slot = Clock::get()?.slot;
+    game.vrf_seed = vrf_seed;
     game.state = GameState::AwaitingRandomness.into();
 
     emit_cpi!(GameJoined {

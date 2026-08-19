@@ -4,7 +4,9 @@ use anchor_lang::{
     AccountDeserialize, AnchorDeserialize, AnchorSerialize, Discriminator, InstructionData,
     ToAccountMetas,
 };
-use anchor_spl::associated_token::get_associated_token_address;
+use anchor_spl::associated_token::{
+    get_associated_token_address, get_associated_token_address_with_program_id,
+};
 use anchor_spl::token::spl_token;
 use anchor_spl::token_2022::spl_token_2022;
 use coinflip::constants::{CONFIG_SEED, ESCROW_SEED};
@@ -162,6 +164,31 @@ pub fn assert_coinflip_error(
         "error did not originate in coinflip (first failure: {origin:?}); logs:\n{}",
         failure.meta.pretty_logs()
     );
+}
+
+/// Like `assert_coinflip_error`, but for an error the Anchor framework itself
+/// raises (its own 2000/3000-range codes) rather than one of ours. Also proves
+/// the transaction actually executed, instead of being dropped as a duplicate.
+#[allow(clippy::result_large_err)]
+pub fn assert_anchor_error(
+    result: Result<(), FailedTransactionMetadata>,
+    expected: anchor_lang::error::ErrorCode,
+) {
+    let failure = result.unwrap_err();
+    match &failure.err {
+        TransactionError::InstructionError(_, InstructionError::Custom(code)) => {
+            assert_eq!(
+                *code,
+                u32::from(expected),
+                "wrong anchor error; logs:\n{}",
+                failure.meta.pretty_logs()
+            );
+        }
+        other => panic!(
+            "expected custom error, got {other:?}; logs:\n{}",
+            failure.meta.pretty_logs()
+        ),
+    }
 }
 
 /// Serialize an Anchor account (discriminator + borsh) into the SVM.
@@ -484,8 +511,15 @@ pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
     }
 }
 
-pub fn request_pda(client: &Pubkey, game: &Pubkey) -> Pubkey {
-    RequestAccount::find_address(client, &game.to_bytes(), &orao_solana_vrf_cb::ID).0
+/// Mirrors the program's VRF seed derivation (`join_game`): the request PDA is
+/// keyed by a hash of the game and joiner, not by the game pubkey alone, so
+/// the address is unpredictable until the joiner commits.
+pub fn vrf_seed_for(game: &Pubkey, joiner: &Pubkey) -> [u8; 32] {
+    solana_sdk::hash::hashv(&[b"coinflip-vrf-seed", game.as_ref(), joiner.as_ref()]).to_bytes()
+}
+
+pub fn request_pda(client: &Pubkey, seed: &[u8; 32]) -> Pubkey {
+    RequestAccount::find_address(client, seed, &orao_solana_vrf_cb::ID).0
 }
 
 /// Overwrite a request account with a fulfilled state carrying `randomness`.
@@ -495,25 +529,24 @@ pub fn request_pda(client: &Pubkey, game: &Pubkey) -> Pubkey {
 /// `Some(responses)` instead — harmless here because only `randomness` is
 /// ever read back out of a fulfilled request in these tests.
 ///
-/// Panics if `client`+`game` doesn't already have a (real, pending) request
+/// Panics if `client`+`seed` doesn't already have a (real, pending) request
 /// account in the SVM: this helper is meant to settle a request that a real
 /// `request` CPI created, not to conjure one out of nothing. For a standalone
 /// write with no pre-existing request, use `write_fulfilled_request_unchecked`.
 pub fn write_fulfilled_request(
     svm: &mut LiteSVM,
     client: Pubkey,
-    game: Pubkey,
+    seed: [u8; 32],
     randomness: [u8; 64],
 ) -> Pubkey {
-    let (addr, _) =
-        RequestAccount::find_address(&client, &game.to_bytes(), &orao_solana_vrf_cb::ID);
+    let (addr, _) = RequestAccount::find_address(&client, &seed, &orao_solana_vrf_cb::ID);
     assert!(
         svm.get_account(&addr).is_some(),
         "request account {addr} does not exist yet; join the game (or otherwise \
          trigger a real `request` CPI) before fulfilling it, or use \
          write_fulfilled_request_unchecked for a standalone write"
     );
-    write_fulfilled_request_unchecked(svm, client, game, randomness)
+    write_fulfilled_request_unchecked(svm, client, seed, randomness)
 }
 
 /// Like `write_fulfilled_request`, but doesn't require a pre-existing request
@@ -522,16 +555,15 @@ pub fn write_fulfilled_request(
 pub fn write_fulfilled_request_unchecked(
     svm: &mut LiteSVM,
     client: Pubkey,
-    game: Pubkey,
+    seed: [u8; 32],
     randomness: [u8; 64],
 ) -> Pubkey {
-    let (addr, bump) =
-        RequestAccount::find_address(&client, &game.to_bytes(), &orao_solana_vrf_cb::ID);
+    let (addr, bump) = RequestAccount::find_address(&client, &seed, &orao_solana_vrf_cb::ID);
     let request = RequestAccount::new(
         bump,
         0,
         client,
-        game.to_bytes(),
+        seed,
         RequestState::Fulfilled(Fulfilled::new(randomness, None)),
     );
     write_anchor_account(svm, addr, orao_solana_vrf_cb::ID, &request, 0, None);
@@ -762,6 +794,7 @@ pub struct JoinedGame {
     pub treasury_token_account: Pubkey,
     pub orao: OraoEnv,
     pub request: Pubkey,
+    pub vrf_seed: [u8; 32],
 }
 
 pub fn ix_join_game(
@@ -770,8 +803,22 @@ pub fn ix_join_game(
     joiner: Pubkey,
     joiner_token_account: Pubkey,
 ) -> Instruction {
-    let treasury_token_account = get_associated_token_address(&f.treasury, &f.mint);
-    let request = request_pda(&orao.client, &f.game.pubkey());
+    ix_join_game_with_program(f, orao, joiner, joiner_token_account, spl_token::ID)
+}
+
+/// Like `ix_join_game`, but lets the caller pick the token program (a
+/// Token-2022 game must be joined through `spl_token_2022::ID`, which also
+/// moves the treasury ATA to that program's derivation).
+pub fn ix_join_game_with_program(
+    f: &GameFixture,
+    orao: &OraoEnv,
+    joiner: Pubkey,
+    joiner_token_account: Pubkey,
+    token_program: Pubkey,
+) -> Instruction {
+    let treasury_token_account =
+        get_associated_token_address_with_program_id(&f.treasury, &f.mint, &token_program);
+    let request = request_pda(&orao.client, &vrf_seed_for(&f.game.pubkey(), &joiner));
     Instruction {
         program_id: coinflip::ID,
         accounts: coinflip::accounts::JoinGame {
@@ -791,7 +838,7 @@ pub fn ix_join_game(
             orao_treasury: orao.orao_treasury,
             request,
             associated_token_program: anchor_spl::associated_token::ID,
-            token_program: spl_token::ID,
+            token_program,
             system_program: system_program::ID,
             event_authority: event_authority(),
             program: coinflip::ID,
@@ -833,7 +880,8 @@ pub fn setup_joined_game(
         )],
     );
     let treasury_token_account = get_associated_token_address(&fixture.treasury, &fixture.mint);
-    let request = request_pda(&orao.client, &fixture.game.pubkey());
+    let vrf_seed = vrf_seed_for(&fixture.game.pubkey(), &joiner.pubkey());
+    let request = request_pda(&orao.client, &vrf_seed);
     (
         JoinedGame {
             fixture,
@@ -842,6 +890,7 @@ pub fn setup_joined_game(
             treasury_token_account,
             orao,
             request,
+            vrf_seed,
         },
         meta,
     )

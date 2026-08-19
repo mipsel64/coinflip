@@ -240,8 +240,14 @@ fn orao_accounts_round_trip() {
     let (mut svm, _payer) = setup();
     let orao = setup_orao(&mut svm);
     let game = Pubkey::new_unique();
+    let joiner = Pubkey::new_unique();
     let randomness = [7u8; 64];
-    let request_addr = write_fulfilled_request_unchecked(&mut svm, orao.client, game, randomness);
+    let request_addr = write_fulfilled_request_unchecked(
+        &mut svm,
+        orao.client,
+        vrf_seed_for(&game, &joiner),
+        randomness,
+    );
 
     let ns_account = svm.get_account(&orao.network_state).unwrap();
     let network_state = NetworkState::try_deserialize(&mut &ns_account.data[..]).unwrap();

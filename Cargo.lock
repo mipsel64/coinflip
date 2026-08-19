@@ -856,6 +856,7 @@ dependencies = [
  "orao-solana-vrf-cb",
  "proptest",
  "solana-sdk",
+ "solana-sha256-hasher 2.3.0",
  "static_assertions",
 ]
 

@@ -25,6 +25,7 @@ idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "orao-solana-vrf-c
 anchor-lang = { workspace = true, features = ["event-cpi", "init-if-needed"] }
 anchor-spl = { workspace = true }
 orao-solana-vrf-cb = { workspace = true }
+solana-sha256-hasher = { workspace = true }
 num_enum = { workspace = true }
 static_assertions = { workspace = true }
 

@@ -61,12 +61,16 @@ pub struct Game {
     pub host_token_account: Pubkey,
     pub joiner_token_account: Pubkey,
     pub joined_at_slot: u64,
-    pub _reserved: [u8; 62],
+    /// sha256("coinflip-vrf-seed", game, joiner), stored at join; the ORAO
+    /// request PDA derives from it. Unpredictable pre-join, so the address
+    /// cannot be grief-pre-funded.
+    pub vrf_seed: [u8; 32],
+    pub _reserved: [u8; 30],
 }
 
 const_assert_eq!(
     Game::INIT_SPACE,
-    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 2 + 32 + 32 + 8 + 62
+    1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 2 + 32 + 32 + 8 + 32 + 30
 );
 
 impl Game {
@@ -152,7 +156,8 @@ mod tests {
             host_token_account: Pubkey::new_unique(),
             joiner_token_account: Pubkey::new_unique(),
             joined_at_slot: 0,
-            _reserved: [0; 62],
+            vrf_seed: [0; 32],
+            _reserved: [0; 30],
         }
     }
 
@@ -184,7 +189,8 @@ mod tests {
             host_token_account: Pubkey::new_unique(),
             joiner_token_account: Pubkey::new_unique(),
             joined_at_slot: 123,
-            _reserved: [7; 62],
+            vrf_seed: [9; 32],
+            _reserved: [7; 30],
         };
         let bytes = game.try_to_vec().unwrap();
         assert_eq!(bytes.len(), Game::INIT_SPACE); // borsh runtime == InitSpace
