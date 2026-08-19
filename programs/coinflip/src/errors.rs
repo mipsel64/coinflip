@@ -41,4 +41,6 @@ pub enum CoinflipError {
          and the fee account must be the treasury's associated token account"
     )]
     InvalidPayoutAccount, // 6015
+    #[msg("ORAO request fee exceeds the caller's maximum")]
+    VrfFeeTooHigh, // 6016
 }

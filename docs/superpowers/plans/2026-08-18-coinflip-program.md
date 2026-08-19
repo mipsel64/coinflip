@@ -3209,3 +3209,36 @@ Scope:
 
 Followed by Task 18: winner-pays bond (Option A) sized to the new, smaller
 joiner outlay.
+
+#### Post-review amendment (2026-08-19)
+
+Quality review of the Task 17 implementation approved the behavior and required
+three additions, all applied in the same change (nothing is deployed, so ABI
+churn is free):
+
+1. **Client nonce in the VRF seed.** `join_game(nonce: u64, ..)`; the seed
+   becomes `sha256("coinflip-vrf-seed", game, joiner, nonce_le)`. Plain VRF's
+   request namespace is global, so a front-run request at one nonce's address
+   is now recoverable in-protocol: the client retries at `nonce + 1`. The
+   residual drops from "permanent block on a (game, joiner) pair" to a
+   per-attempt race that costs the attacker ~2.35M lamports each time and the
+   joiner ~5k to retry. Clients MUST retry on `Custom(0)`
+   (`AccountAlreadyInUse`).
+2. **VRF fee cap.** `join_game(.., max_vrf_fee: u64)` rejects an ORAO
+   `request_fee` above the joiner's stated ceiling (`VrfFeeTooHigh`, 6016).
+   ORAO's fee is live config its authority can raise, and the joiner pays it
+   directly, so the ceiling belongs to the joiner rather than to an admin.
+3. **`config` dropped from `Settle` and `RefundTimeout`.** It was vestigial
+   (the callback-era client PDA derived from it) and unread by both handlers;
+   removing it saves an account and ~8k CU per crank transaction. This resolves
+   the deferral flagged in the Task 17 implementation report.
+
+Corrected claims (the old wording was false after the dependency swap): a
+pre-funded lamport does NOT block a join — ORAO creates the request with
+Anchor's `init`, which absorbs it — and the "bait-and-burn" host griefing note
+is void, since `join_game` no longer touches host accounts at all (the real
+residual is a host front-running a join with `cancel_game`, costing the joiner
+a transaction fee).
+
+Measured after the amendment: `join_game` 75_983 CU, `settle` 39_241 CU, 74
+tests.

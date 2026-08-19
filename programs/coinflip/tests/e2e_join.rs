@@ -38,7 +38,7 @@ fn join_escrows_stake_and_creates_vrf_request() {
     assert_eq!(token_balance(&svm, &f.escrow), stake * 2);
     assert_eq!(token_balance(&svm, &joiner_ta), stake * 10 - stake);
 
-    let vrf_seed = vrf_seed_for(&f.game.pubkey(), &joiner.pubkey());
+    let vrf_seed = vrf_seed_for(&f.game.pubkey(), &joiner.pubkey(), 0);
     let request_addr = request_pda(&vrf_seed);
     let game = read_game(&svm, &f.game.pubkey());
     assert_eq!(game.state, u8::from(GameState::AwaitingRandomness));
@@ -94,9 +94,9 @@ fn join_escrows_stake_and_creates_vrf_request() {
     );
 
     // Budget guard: token transfer + ATA init + the ORAO CPI must stay well
-    // inside one transaction's compute budget.
+    // inside one transaction's compute budget (measured ~75k).
     assert!(
-        meta.compute_units_consumed < 150_000,
+        meta.compute_units_consumed < 100_000,
         "join used {} CU",
         meta.compute_units_consumed
     );
@@ -315,7 +315,7 @@ fn pre_funded_request_address_does_not_block_join() {
     // this join will ACTUALLY use.
     svm.airdrop(&request_pda(&f.game.pubkey().to_bytes()), 1)
         .unwrap();
-    let real = request_pda(&vrf_seed_for(&f.game.pubkey(), &joiner.pubkey()));
+    let real = request_pda(&vrf_seed_for(&f.game.pubkey(), &joiner.pubkey(), 0));
     svm.airdrop(&real, 1).unwrap();
 
     send_ok(
@@ -327,14 +327,14 @@ fn pre_funded_request_address_does_not_block_join() {
     assert_eq!(game.state, u8::from(GameState::AwaitingRandomness));
 }
 
-/// What the hashed seed actually defends against under plain VRF: requests
-/// live in ORAO's GLOBAL namespace, so anyone may create one for any seed. If
-/// the seed were the game pubkey (public the moment a game opens), an attacker
-/// could send ORAO's own `request_v2` first and permanently block that game's
-/// join. Prove the block is real for a seed the attacker can predict — which
-/// is exactly why the real seed is `sha256(.., game, joiner)`.
+/// Requests live in ORAO's GLOBAL namespace, so anyone may create one for any
+/// seed — an attacker who can predict the seed can front-run the join and make
+/// it fail. The `nonce` is the in-protocol recovery: the same joiner retries at
+/// nonce+1, which is a completely different address, and the attacker has to
+/// win the race all over again (paying ORAO's fee and the request's rent each
+/// time) to keep the block up.
 #[test]
-fn front_run_request_for_the_same_seed_blocks_join() {
+fn front_run_request_is_recovered_by_bumping_the_nonce() {
     let (mut svm, payer) = setup();
     let (f, _meta) = setup_open_game(&mut svm, &payer, 1_000);
     let orao = setup_orao(&mut svm);
@@ -342,10 +342,11 @@ fn front_run_request_for_the_same_seed_blocks_join() {
     svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
     let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), 10_000);
 
-    // The attacker knows (or guesses) the joiner, so they can derive the seed.
+    // The attacker knows (or guesses) the joiner, so they can derive nonce 0's
+    // seed and take that address first.
     let mallory = Keypair::new();
     svm.airdrop(&mallory.pubkey(), 10_000_000_000).unwrap();
-    let seed = vrf_seed_for(&f.game.pubkey(), &joiner.pubkey());
+    let seed = vrf_seed_for(&f.game.pubkey(), &joiner.pubkey(), 0);
     send_ok(
         &mut svm,
         &[&mallory],
@@ -357,8 +358,6 @@ fn front_run_request_for_the_same_seed_blocks_join() {
         &[&joiner],
         &[ix_join_game(&f, &orao, joiner.pubkey(), joiner_ta)],
     );
-    // Anchor's `init` refuses an address that already holds an initialized
-    // account owned by someone else.
     // Anchor's `init` falls back to allocate+assign on a pre-funded address,
     // and the system program refuses to allocate an account that already has
     // data: SystemError::AccountAlreadyInUse == Custom(0). (Anchor-level codes
@@ -374,6 +373,94 @@ fn front_run_request_for_the_same_seed_blocks_join() {
         read_game(&svm, &f.game.pubkey()).state,
         u8::from(GameState::Open),
         "the blocked join must leave the game untouched"
+    );
+
+    // The recovery, with no help from anyone: same game, same joiner, nonce 1.
+    send_ok(
+        &mut svm,
+        &[&joiner],
+        &[ix_join_game_with_nonce(
+            &f,
+            &orao,
+            joiner.pubkey(),
+            joiner_ta,
+            1,
+        )],
+    );
+    let game = read_game(&svm, &f.game.pubkey());
+    assert_eq!(game.state, u8::from(GameState::AwaitingRandomness));
+    assert_eq!(
+        game.vrf_seed,
+        vrf_seed_for(&f.game.pubkey(), &joiner.pubkey(), 1),
+        "the game must record the seed it actually requested"
+    );
+    // ...and that request is ours, not the attacker's.
+    let request = read_request(&svm, &request_pda(&game.vrf_seed));
+    assert_eq!(*request.client(), joiner.pubkey());
+}
+
+/// ORAO's request fee is live config its authority can raise at any time, and
+/// the joiner pays it directly — so the joiner states a ceiling and the join
+/// fails closed rather than silently overpaying.
+#[test]
+fn join_rejects_vrf_fee_above_the_callers_maximum() {
+    let (mut svm, payer) = setup();
+    let stake = 1_000;
+    let (f, _meta) = setup_open_game(&mut svm, &payer, stake);
+    let orao = setup_orao(&mut svm);
+    let joiner = Keypair::new();
+    svm.airdrop(&joiner.pubkey(), 10_000_000_000).unwrap();
+    let joiner_ta = create_token_account(&mut svm, f.mint, joiner.pubkey(), stake * 10);
+
+    let result = send(
+        &mut svm,
+        &[&joiner],
+        &[ix_join_game_full(
+            &f,
+            &orao,
+            joiner.pubkey(),
+            joiner_ta,
+            anchor_spl::token::ID,
+            0,
+            REQUEST_FEE - 1,
+        )],
+    );
+    assert_coinflip_error(result, coinflip::errors::CoinflipError::VrfFeeTooHigh);
+
+    // Nothing moved: no stake escrowed, no request created.
+    assert_eq!(token_balance(&svm, &f.escrow), stake);
+    assert_eq!(token_balance(&svm, &joiner_ta), stake * 10);
+    assert_eq!(
+        read_game(&svm, &f.game.pubkey()).state,
+        u8::from(GameState::Open)
+    );
+    assert!(
+        svm.get_account(&request_pda(&vrf_seed_for(
+            &f.game.pubkey(),
+            &joiner.pubkey(),
+            0
+        )))
+        .is_none(),
+        "a rejected join must not leave a request account behind"
+    );
+
+    // Exactly at the cap it goes through.
+    send_ok(
+        &mut svm,
+        &[&joiner],
+        &[ix_join_game_full(
+            &f,
+            &orao,
+            joiner.pubkey(),
+            joiner_ta,
+            anchor_spl::token::ID,
+            0,
+            REQUEST_FEE,
+        )],
+    );
+    assert_eq!(
+        read_game(&svm, &f.game.pubkey()).state,
+        u8::from(GameState::AwaitingRandomness)
     );
 }
 

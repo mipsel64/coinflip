@@ -55,8 +55,8 @@ pub mod coinflip {
         instructions::cancel_game::handle(ctx)
     }
 
-    pub fn join_game(ctx: Context<JoinGame>) -> Result<()> {
-        instructions::join_game::handle(ctx)
+    pub fn join_game(ctx: Context<JoinGame>, nonce: u64, max_vrf_fee: u64) -> Result<()> {
+        instructions::join_game::handle(ctx, nonce, max_vrf_fee)
     }
 
     pub fn settle(ctx: Context<Settle>) -> Result<()> {

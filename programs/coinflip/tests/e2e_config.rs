@@ -280,7 +280,7 @@ fn orao_accounts_round_trip() {
     let orao = setup_orao(&mut svm);
     let game = Pubkey::new_unique();
     let joiner = Pubkey::new_unique();
-    let seed = vrf_seed_for(&game, &joiner);
+    let seed = vrf_seed_for(&game, &joiner, 0);
     let randomness = [7u8; 64];
     let request_addr = write_fulfilled_request_unchecked(&mut svm, joiner, seed, randomness);
 

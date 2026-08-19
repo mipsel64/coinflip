@@ -29,7 +29,7 @@ trade-offs), see
 | 2 | `update_config(...)` | `admin` | Rotate admin, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). The treasury is **not** config state — see [Treasury](#treasury) |
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates the mint. Inits `Game` + escrow, transfers the host stake into escrow, records the host's payout token account. State → `Open` |
 | 4 | `cancel_game` | host | Requires state `Open`. Refunds the host stake, closes escrow + game (rent to host) |
-| 5 | `join_game` | joiner | Requires state `Open`, `joiner != host`. Transfers the matching stake into escrow; ensures the treasury ATA exists; CPIs ORAO's `request_v2` with the joiner as ORAO's payer (they pay the VRF fee and the request account's rent directly — the program holds no VRF float). Records the joiner, `joined_at_slot`, and the refund-timeout snapshot. State → `AwaitingRandomness` |
+| 5 | `join_game(nonce, max_vrf_fee)` | joiner | Requires state `Open`, `joiner != host`. Transfers the matching stake into escrow; ensures the treasury ATA exists; rejects an ORAO fee above `max_vrf_fee`; CPIs ORAO's `request_v2` with the joiner as ORAO's payer (they pay the VRF fee and the request account's rent directly — the program holds no VRF float). `nonce` salts the VRF seed so a blocked request address can be retried at a fresh one. Records the joiner, `joined_at_slot`, and the refund-timeout snapshot. State → `AwaitingRandomness` |
 | 6 | `settle` | anyone (the crank, in practice) | Requires state `AwaitingRandomness` and a **fulfilled** request. Runs the core settlement |
 | 7 | `refund_timeout` | anyone | Requires state `AwaitingRandomness`, past `refund_timeout_slots`, and randomness **not** fulfilled. Returns both stakes, no fee |
 
@@ -233,9 +233,11 @@ when this was written — `scripts/ops.ts check-orao` reprints it live).
   `join_game` creates it `init_if_needed` so that no cranker ever has to.
 - **Reimbursing the joiner out of the pot is not implemented** (planned as a
   winner-pays bond). Today the joiner carries the VRF cost of every game.
-- **Bait-and-burn nuisance:** a host can make their own open game unjoinable
-  by closing their recorded token account before anyone joins. Joiners who
-  try lose only transaction fees, not stake.
+- **A host can front-run a join with `cancel_game`.** Both target an `Open`
+  game, so whichever lands first wins; the loser's join fails on the state
+  check having moved nothing. The joiner is out a transaction fee, never
+  stake. (The host cannot grief a join by closing their own token account —
+  `join_game` does not touch host accounts at all.)
 - **Never reuse a game keypair.** Client SDKs must always generate a fresh
   keypair per game. `Game.vrf_seed` is derived from `sha256(game, joiner)`, and
   ORAO's request accounts are never closed, so a "resurrected" game reusing an
@@ -265,19 +267,30 @@ when this was written — `scripts/ops.ts check-orao` reprints it live).
   and accepted here.
 - ORAO's request accounts live in a **global** namespace
   (`[b"orao-vrf-randomness-request", seed]`, no client component), so anyone
-  may create the request for any seed. The VRF seed
-  (`sha256("coinflip-vrf-seed", game, joiner)`) is therefore computed at join
-  time and not derivable before then: with a predictable seed, an attacker
-  could send ORAO's own `request_v2` first and permanently block that game's
-  join. A stray lamport at the address is harmless — ORAO creates the account
-  with Anchor's `init`, which absorbs a pre-funded balance. Residual: an
-  attacker who guesses the intended joiner's wallet can block that specific
-  (game, joiner) pair by paying ORAO's fee and rent themselves; the victim
-  joins from another wallet.
+  may create the request for any seed. Two things keep that from blocking
+  games. The VRF seed
+  (`sha256("coinflip-vrf-seed", game, joiner, nonce)`) is not derivable before
+  the joiner commits, and the client-chosen **`nonce`** moves the address on
+  demand: a join that loses the race retries at `nonce + 1`, a fresh address
+  the attacker has to guess and beat all over again. A stray lamport at the
+  address is harmless either way — ORAO creates the account with Anchor's
+  `init`, which absorbs a pre-funded balance. Residual: a **per-attempt** race,
+  open only to someone who knows (game, joiner, nonce) and can outrun the join
+  transaction. The economics are lopsided — roughly 0.0066 SOL per attempt for
+  the attacker (ORAO's fee plus the request's rent, most of it locked in a
+  request nobody will ever settle) against ~0.000005 SOL for the joiner to
+  retry — so it is a nuisance with a cost floor, not a durable block.
+- **Clients must implement the retry.** On `AccountAlreadyInUse` (`Custom(0)`)
+  from a join, resubmit with the next nonce. `scripts/smoke.ts` documents the
+  pattern.
 - Refunds are only possible while the randomness is still secret:
   `refund_timeout` requires the request be **unfulfilled**, so a loser can
   never race a refund after learning the outcome. This is what makes the delay
-  between fulfillment and settlement harmless.
+  between fulfillment and settlement harmless. The one informed refund left
+  requires colluding with the oracles to learn the randomness *before* it is
+  fulfilled on-chain and then landing a refund in an outage tail — which is
+  strictly dominated by the oracle-trust assumption above (an oracle that can
+  do that can simply steer the outcome instead).
 - `settle` verifies the request account by PDA derivation from the stored
   `vrf_seed` *and* by Anchor's typed `Account<RandomnessV2>` (ORAO must own it
   and it must carry ORAO's discriminator), so no hand-rolled account can feed
@@ -340,8 +353,15 @@ elsewhere:
   explicitly is a type error. You **must** pass `oraoTreasury` (read it from
   ORAO's `NetworkState`) and `request` (`[b"orao-vrf-randomness-request",
   sha256("coinflip-vrf-seed", game, joiner)]` under ORAO's program).
+- **`join_game` takes two arguments now:** `nonce: u64` (start at 0; on a
+  `Custom(0)` failure retry with the next value — see Randomness & trust) and
+  `max_vrf_fee: u64` (the largest ORAO request fee the joiner accepts; read the
+  live fee from ORAO's `NetworkState` and allow some headroom, or the join
+  fails with `VrfFeeTooHigh` (6016) after ORAO raises it).
 - **`join_game` no longer takes `host` or `hostTokenAccount`.** They were only
   ever there to authorize the callback's frozen account list.
+- **`settle` and `refund_timeout` no longer take `config`.** Neither reads it;
+  a client passing it now has one account too many.
 - **`settle_fallback`/`settle_callback` are gone**, replaced by a single
   `settle`. Its `request` account is IDL-resolvable (anchor-ts reads
   `game.vrf_seed` for you); non-anchor clients derive it from the seed above.

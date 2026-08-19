@@ -61,6 +61,8 @@ if (!IDL_ADDRESS.equals(PROGRAM_ID)) {
 
 const MIN_REFUND_TIMEOUT_SLOTS = idlConstant("MIN_REFUND_TIMEOUT_SLOTS");
 const MAX_REFUND_TIMEOUT_SLOTS = idlConstant("MAX_REFUND_TIMEOUT_SLOTS");
+/** Deployment default: 3x the program's floor — see `--refund-timeout-slots`. */
+const DEFAULT_REFUND_TIMEOUT_SLOTS = MIN_REFUND_TIMEOUT_SLOTS.muln(3);
 // The fee destination is baked into the program, not stored in Config: an IDL
 // built with `--features local` carries the test key, so the IDL must come
 // from the same build as the deployed binary.
@@ -123,7 +125,12 @@ cli
     "--refund-timeout-slots <n>",
     `slots after join before refund_timeout is allowed (bounded to ` +
       `[${MIN_REFUND_TIMEOUT_SLOTS}, ${MAX_REFUND_TIMEOUT_SLOTS}])`,
-    MIN_REFUND_TIMEOUT_SLOTS.toString()
+    // 3x the program's floor (~30 min, not ~10). The floor is what the program
+    // will accept; a deployment wants headroom above it, because every slot of
+    // the refund window is also the window in which a crank outage can still be
+    // fixed by settling rather than unwinding the game. Lower it only with a
+    // crank you trust to be up.
+    DEFAULT_REFUND_TIMEOUT_SLOTS.toString()
   )
   .action(async (opts, cmd) => {
     const p = provider(cmd.parent.opts().cluster, cmd.parent.opts().key);
@@ -229,6 +236,16 @@ cli
       true,
       mintInfo.owner
     );
+    // Default to each player's recorded account, which is the common case.
+    //
+    // FOR CRANK AUTHORS: this is the one call that needs a retry policy. The
+    // program accepts either the recorded account OR the player's canonical
+    // ATA, so if a player closed their recorded account the transaction fails
+    // with `InvalidPayoutAccount` (6015) — retry it with
+    //   getAssociatedTokenAddressSync(game.tokenMint, <player>, true, mintInfo.owner)
+    // for the offending side (pass `mintInfo.owner`, or a Token-2022 game
+    // derives the wrong address). The ATA is permissionlessly re-creatable, so
+    // funds are never stranded; if it does not exist yet, create it first.
     const hostTokenAccount = opts.hostTokenAccount
       ? new web3.PublicKey(opts.hostTokenAccount)
       : game.hostTokenAccount;

@@ -60,8 +60,9 @@ pub struct JoinGame<'info> {
     #[account(mut, address = network_state.config.treasury @ CoinflipError::OwnerMismatch)]
     pub orao_treasury: AccountInfo<'info>,
     /// CHECK: created (and PDA-validated against the seed we pass) by the ORAO
-    /// CPI itself. The seed is sha256("coinflip-vrf-seed", game, joiner) —
-    /// unpredictable pre-join, so the address cannot be grief-pre-funded.
+    /// CPI itself. The seed is
+    /// sha256("coinflip-vrf-seed", game, joiner, nonce) — see the handler for
+    /// what the hash and the nonce each defend against.
     #[account(mut)]
     pub request: AccountInfo<'info>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -73,7 +74,14 @@ pub struct JoinGame<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
+/// * `nonce` — client-chosen salt for the VRF seed. Any value works; clients
+///   start at 0 and retry with the next one if the request address is already
+///   taken (see the seed derivation below).
+/// * `max_vrf_fee` — the largest ORAO request fee, in lamports, the joiner
+///   accepts paying. ORAO's fee is live config that its authority can raise at
+///   any time, and the joiner pays it directly, so the joiner — not this
+///   program — states their limit.
+pub(crate) fn handle(ctx: Context<JoinGame>, nonce: u64, max_vrf_fee: u64) -> Result<()> {
     ctx.accounts.game.require_state(GameState::Open)?;
     require!(
         ctx.accounts.joiner.key() != ctx.accounts.game.host,
@@ -97,14 +105,31 @@ pub(crate) fn handle(ctx: Context<JoinGame>) -> Result<()> {
         ctx.accounts.mint.decimals,
     )?;
 
-    // Unpredictable before the joiner commits: nobody can pre-fund the request
-    // PDA to permanently block this game's join.
+    // ORAO's request PDAs live in a GLOBAL namespace (no per-client component),
+    // so anyone may create the request for any seed and thereby make this join
+    // fail. Two properties keep that from being a durable block: the hash is
+    // unpredictable before the joiner commits, and the client-chosen `nonce`
+    // moves the address on demand — a join that loses the race retries at
+    // nonce+1, a fresh address the attacker must guess and win all over again.
+    // Residual: a per-ATTEMPT race, open only to someone who knows
+    // (game, joiner, nonce) and can outrun the join transaction, and who pays
+    // ORAO's fee plus the request's rent for each attempt while the joiner
+    // pays a transaction fee to retry.
     let vrf_seed = solana_sha256_hasher::hashv(&[
         b"coinflip-vrf-seed",
         game_key.as_ref(),
         ctx.accounts.joiner.key().as_ref(),
+        &nonce.to_le_bytes(),
     ])
     .to_bytes();
+
+    // ORAO's fee is live config, raisable by ORAO's authority between the
+    // client building this transaction and it landing. The joiner pays it from
+    // their own wallet, so they get to bound it.
+    require!(
+        ctx.accounts.network_state.config.request_fee <= max_vrf_fee,
+        CoinflipError::VrfFeeTooHigh
+    );
 
     // The joiner is ORAO's payer: they fund the request account's rent and the
     // request fee out of their own wallet, so this program holds no VRF float

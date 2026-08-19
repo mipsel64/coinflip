@@ -354,7 +354,7 @@ fn refund_rejects_foreign_request() {
         &[&joiner_b],
         &[ix_join_game(&f_b, &j.orao, joiner_b.pubkey(), joiner_b_ta)],
     );
-    let request_b = request_pda(&vrf_seed_for(&game_b_key, &joiner_b.pubkey()));
+    let request_b = request_pda(&vrf_seed_for(&game_b_key, &joiner_b.pubkey(), 0));
 
     svm.warp_to_slot(DEADLINE + 1);
     let result = send(
@@ -405,7 +405,14 @@ fn refund_of_open_game_fails() {
         &[ix_refund_timeout(&j, payer.pubkey())],
     );
     // Account resolution runs before the handler, so the missing request
-    // account — not `require_state` — is what rejects this.
+    // account — not `require_state` — is what rejects this. Note what this does
+    // and does not prove: the zero seed's address happens to be vacant in
+    // ORAO's GLOBAL request namespace, and anyone could create a request there
+    // to change which error fires. The real backstops for an Open game are
+    // `require_state(AwaitingRandomness)` and the joiner-owner constraint on
+    // `joiner_token_account` (an Open game's `joiner` is the default pubkey, so
+    // no real token account can satisfy it) — this assertion just pins today's
+    // first failure.
     assert_anchor_error(result, anchor_lang::error::ErrorCode::AccountNotInitialized);
     assert_eq!(token_balance(&svm, &j.fixture.escrow), STAKE);
 }

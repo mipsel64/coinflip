@@ -121,7 +121,7 @@ pub(crate) fn handle(ctx: Context<CreateGame>, side: u8, amount: u64) -> Result<
     game.joined_at_slot = 0;
     game.vrf_seed = [0; 32];
     // Snapshotted at join, not here: the refund window starts when the joiner
-    // commits, under whatever timeout the margin check validated then.
+    // commits, under whatever timeout was configured then.
     game.refund_timeout_slots = 0;
     game._reserved = [0; 22];
 

@@ -61,7 +61,7 @@ fn settle_pays_host_when_host_side_wins() {
     );
 
     // Budget guard: the request PDA derivation + two transfers + a close + the
-    // event CPI (measured ~47k with both payout accounts recorded; the
+    // event CPI (measured ~39k with both payout accounts recorded; the
     // ATA-fallback path derives two more).
     assert!(
         meta.compute_units_consumed < 60_000,
@@ -366,7 +366,7 @@ fn settle_rejects_foreign_request() {
     );
     let request_b = write_fulfilled_request(
         &mut svm,
-        vrf_seed_for(&game_b_key, &joiner_b.pubkey()),
+        vrf_seed_for(&game_b_key, &joiner_b.pubkey(), 0),
         randomness_with_first_byte(2),
     );
 

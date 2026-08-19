@@ -61,13 +61,13 @@ pub struct Game {
     pub host_token_account: Pubkey,
     pub joiner_token_account: Pubkey,
     pub joined_at_slot: u64,
-    /// sha256("coinflip-vrf-seed", game, joiner), stored at join; the ORAO
-    /// request PDA derives from it. Unpredictable pre-join, so the address
-    /// cannot be grief-pre-funded.
+    /// sha256("coinflip-vrf-seed", game, joiner, nonce_le), stored at join; the
+    /// ORAO request PDA derives from it. Stored rather than recomputed, so
+    /// settlement never needs the nonce (see `join_game` for what the hash and
+    /// the nonce each defend against).
     pub vrf_seed: [u8; 32],
-    /// Snapshot of config.refund_timeout_slots at join — the margin invariant
-    /// verified at join then holds for this game's lifetime, immune to later
-    /// config or ORAO-deadline changes.
+    /// Snapshot of config.refund_timeout_slots at join — this game's refund
+    /// window is fixed when the joiner commits, immune to later config changes.
     pub refund_timeout_slots: u64,
     pub _reserved: [u8; 22],
 }

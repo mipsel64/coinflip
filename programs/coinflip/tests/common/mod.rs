@@ -682,11 +682,17 @@ pub fn setup_orao(svm: &mut LiteSVM) -> OraoEnv {
     }
 }
 
-/// Mirrors the program's VRF seed derivation (`join_game`): the request PDA is
-/// keyed by a hash of the game and joiner, not by the game pubkey alone, so
-/// the address is unpredictable until the joiner commits.
-pub fn vrf_seed_for(game: &Pubkey, joiner: &Pubkey) -> [u8; 32] {
-    solana_sdk::hash::hashv(&[b"coinflip-vrf-seed", game.as_ref(), joiner.as_ref()]).to_bytes()
+/// Mirrors the program's VRF seed derivation (`join_game`): a hash of the
+/// game, the joiner, and the client-chosen nonce — unpredictable until the
+/// joiner commits, and movable to a fresh address if that one is taken.
+pub fn vrf_seed_for(game: &Pubkey, joiner: &Pubkey, nonce: u64) -> [u8; 32] {
+    solana_sdk::hash::hashv(&[
+        b"coinflip-vrf-seed",
+        game.as_ref(),
+        joiner.as_ref(),
+        &nonce.to_le_bytes(),
+    ])
+    .to_bytes()
 }
 
 /// The ORAO request PDA for `seed`. Plain VRF namespaces requests globally —
@@ -965,6 +971,7 @@ pub struct JoinedGame {
     pub vrf_seed: [u8; 32],
 }
 
+/// The common case: nonce 0 and no cap on ORAO's fee.
 pub fn ix_join_game(
     f: &GameFixture,
     orao: &OraoEnv,
@@ -984,9 +991,50 @@ pub fn ix_join_game_with_program(
     joiner_token_account: Pubkey,
     token_program: Pubkey,
 ) -> Instruction {
+    ix_join_game_full(
+        f,
+        orao,
+        joiner,
+        joiner_token_account,
+        token_program,
+        0,
+        u64::MAX,
+    )
+}
+
+/// Like `ix_join_game`, but with an explicit VRF-seed nonce — the retry knob a
+/// client turns when someone else already created the request at nonce N.
+pub fn ix_join_game_with_nonce(
+    f: &GameFixture,
+    orao: &OraoEnv,
+    joiner: Pubkey,
+    joiner_token_account: Pubkey,
+    nonce: u64,
+) -> Instruction {
+    ix_join_game_full(
+        f,
+        orao,
+        joiner,
+        joiner_token_account,
+        spl_token::ID,
+        nonce,
+        u64::MAX,
+    )
+}
+
+/// The full builder: every `join_game` argument spelled out.
+pub fn ix_join_game_full(
+    f: &GameFixture,
+    orao: &OraoEnv,
+    joiner: Pubkey,
+    joiner_token_account: Pubkey,
+    token_program: Pubkey,
+    nonce: u64,
+    max_vrf_fee: u64,
+) -> Instruction {
     let treasury_token_account =
         get_associated_token_address_with_program_id(&treasury(), &f.mint, &token_program);
-    let request = request_pda(&vrf_seed_for(&f.game.pubkey(), &joiner));
+    let request = request_pda(&vrf_seed_for(&f.game.pubkey(), &joiner, nonce));
     Instruction {
         program_id: coinflip::ID,
         accounts: coinflip::accounts::JoinGame {
@@ -1009,7 +1057,7 @@ pub fn ix_join_game_with_program(
             program: coinflip::ID,
         }
         .to_account_metas(None),
-        data: coinflip::instruction::JoinGame {}.data(),
+        data: coinflip::instruction::JoinGame { nonce, max_vrf_fee }.data(),
     }
 }
 
@@ -1055,7 +1103,7 @@ pub fn setup_joined_game_with_fee(
         )],
     );
     let treasury_token_account = get_associated_token_address(&treasury(), &fixture.mint);
-    let vrf_seed = vrf_seed_for(&fixture.game.pubkey(), &joiner.pubkey());
+    let vrf_seed = vrf_seed_for(&fixture.game.pubkey(), &joiner.pubkey(), 0);
     let request = request_pda(&vrf_seed);
     (
         JoinedGame {
@@ -1115,7 +1163,6 @@ pub fn ix_settle_with_request(
         program_id: coinflip::ID,
         accounts: coinflip::accounts::Settle {
             cranker,
-            config: config_pda(),
             request,
             game: j.fixture.game.pubkey(),
             escrow: j.fixture.escrow,
@@ -1173,7 +1220,6 @@ pub fn ix_refund_timeout_with_request(
         program_id: coinflip::ID,
         accounts: coinflip::accounts::RefundTimeout {
             cranker,
-            config: config_pda(),
             request,
             game: j.fixture.game.pubkey(),
             escrow: j.fixture.escrow,

@@ -22,10 +22,12 @@ All notable changes to this project are documented in this file, in the
   - `create_game` / `cancel_game`: host opens a game against any accepted
     SPL/Token-2022 mint, escrowing the stake; cancellable before a joiner
     arrives.
-  - `join_game`: joiner matches the stake and CPIs ORAO VRF's `request_v2` as
-    ORAO's own payer — the VRF fee and the request account's rent come
-    straight out of the joiner's wallet, so the program holds no float and
-    needs no ORAO registration.
+  - `join_game(nonce, max_vrf_fee)`: joiner matches the stake and CPIs ORAO
+    VRF's `request_v2` as ORAO's own payer — the VRF fee and the request
+    account's rent come straight out of the joiner's wallet, so the program
+    holds no float and needs no ORAO registration. `nonce` salts the VRF seed
+    (retry knob for a front-run request address); `max_vrf_fee` bounds what
+    ORAO may charge.
   - `settle`: permissionless settlement once ORAO has fulfilled the request.
     Sent by the crank in practice; anyone can send it.
   - `refund_timeout`: permissionless backstop returning both stakes if
@@ -72,6 +74,10 @@ All notable changes to this project are documented in this file, in the
   - Joiner economics improved: they front ~0.0066 SOL at join and ORAO returns
     ~0.00426 SOL of it to them when it fulfills (the freed request rent), where
     the callback design routed that surplus to a program-owned Client PDA.
+  - `join_game` gained `nonce` and `max_vrf_fee` arguments (see above), and
+    `settle`/`refund_timeout` dropped the `config` account neither of them
+    reads — one account and ~8k CU less in every crank transaction.
+  - New error `VrfFeeTooHigh` (6016).
 
 ### Notes for integrators
 

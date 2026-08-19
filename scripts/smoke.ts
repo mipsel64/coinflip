@@ -96,12 +96,13 @@ if (!IDL_ADDRESS.equals(PROGRAM_ID)) {
 
 const [CONFIG_PDA] = web3.PublicKey.findProgramAddressSync([Buffer.from("config")], PROGRAM_ID);
 
-/** Mirrors join_game's own derivation: sha256("coinflip-vrf-seed", game, joiner). */
-function vrfSeedFor(game: web3.PublicKey, joiner: web3.PublicKey): Buffer {
+/** Mirrors join_game's own derivation: sha256("coinflip-vrf-seed", game, joiner, nonce_le). */
+function vrfSeedFor(game: web3.PublicKey, joiner: web3.PublicKey, nonce: anchor.BN): Buffer {
   return createHash("sha256")
     .update(Buffer.from("coinflip-vrf-seed"))
     .update(game.toBuffer())
     .update(joiner.toBuffer())
+    .update(nonce.toArrayLike(Buffer, "le", 8))
     .digest();
 }
 
@@ -262,14 +263,32 @@ async function main() {
   console.log("create_game tx:", createTx);
 
   // ---- join_game ----
-  const vrfSeed = vrfSeedFor(game.publicKey, joiner.publicKey);
-  const request = randomnessAccountAddress(vrfSeed);
+  // Nonce 0 is the normal case. If someone front-runs the request account at
+  // this seed the join fails with the system program's AccountAlreadyInUse
+  // (Custom(0)) and the recovery is simply to retry with nonce + 1, which is a
+  // different request address — a real client should loop over nonces on that
+  // error rather than giving up. Nothing else about the join changes.
+  const NONCE = new anchor.BN(0);
   const networkStateAccount = await vrf.getNetworkState();
   const oraoTreasury = networkStateAccount.config.treasury;
-  const treasuryTokenAccount = getAssociatedTokenAddressSync(mint, TREASURY, true);
+  // Bound what ORAO may charge: the fee is live config and the joiner pays it
+  // from their own wallet. 2x the fee we just read tolerates a raise between
+  // now and the transaction landing without accepting an unbounded one.
+  const maxVrfFee = networkStateAccount.config.requestFee.muln(2);
+  const vrfSeed = vrfSeedFor(game.publicKey, joiner.publicKey, NONCE);
+  const request = randomnessAccountAddress(vrfSeed);
+  // Pass the mint's owning program: a Token-2022 game's treasury ATA sits at a
+  // different address than the classic-SPL one. `scripts/ops.ts` is the
+  // canonical reference for the derivations a crank needs.
+  const treasuryTokenAccount = getAssociatedTokenAddressSync(
+    mint,
+    TREASURY,
+    true,
+    TOKEN_PROGRAM_ID
+  );
 
   const joinTx = await program.methods
-    .joinGame()
+    .joinGame(NONCE, maxVrfFee)
     .accounts({
       joiner: joiner.publicKey,
       game: game.publicKey,
@@ -287,6 +306,7 @@ async function main() {
     .rpc();
   console.log("join_game tx:", joinTx);
   console.log("VRF request:", request.toBase58());
+  console.log("ORAO request fee paid by the joiner:", networkStateAccount.config.requestFee.toString());
 
   // treasuryTokenAccount is init_if_needed'd by join_game, so it's guaranteed
   // to exist by now — this is our pre-settlement baseline for the fee delta.

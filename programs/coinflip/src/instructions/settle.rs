@@ -3,11 +3,11 @@ use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use orao_solana_vrf::{state::RandomnessV2, RANDOMNESS_ACCOUNT_SEED};
 
 use crate::{
-    constants::{CONFIG_SEED, ESCROW_SEED},
+    constants::ESCROW_SEED,
     errors::CoinflipError,
     events::GameSettled,
     instructions::settlement::{execute_settlement, treasury_ata, SettlementAccounts},
-    state::{Config, Game},
+    state::Game,
 };
 
 #[event_cpi]
@@ -15,8 +15,6 @@ use crate::{
 pub struct Settle<'info> {
     /// Permissionless fee-payer slot; carries no authority.
     pub cranker: Signer<'info>,
-    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, Config>>,
     /// Seed binding: this must be THE request for this game. The seed lives in
     /// ORAO's global request namespace, so `game.vrf_seed` is the whole binding.
     #[account(
