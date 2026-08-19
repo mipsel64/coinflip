@@ -96,10 +96,17 @@ than a stored field, with nothing to keep in sync.
 | `host_token_account` | `Pubkey` | Payout target, recorded at create |
 | `joiner_token_account` | `Pubkey` | Payout target, recorded at join |
 | `joined_at_slot` | `u64` | Set at join; drives the refund timeout |
-| `_reserved` | `[u8; 62]` | |
+| `vrf_seed` | `[u8; 32]` | `sha256("coinflip-vrf-seed", game, joiner)`, computed and stored at join; the ORAO request PDA derives from it |
+| `_reserved` | `[u8; 30]` | |
 
-The **VRF seed is the game's pubkey** — unique per game by construction, so no
-stored force field is needed. Enums stored as `u8`, defined `#[repr(u8)]` with
+The **VRF seed is `sha256("coinflip-vrf-seed", game_pubkey, joiner_pubkey)`**,
+computed at join and stored in `Game.vrf_seed`. It is unique per game (a game
+joins at most once) and — unlike the game pubkey alone — unpredictable before a
+joiner commits, so nobody can grief-block a game by pre-funding its
+publicly-derivable request PDA with one lamport (which makes ORAO's account
+creation fail forever). Residual: an adversary who sees the join transaction
+pre-execution (leader/MEV level) could still front-run the derived address —
+accepted as a high-effort, no-profit nuisance. Enums stored as `u8`, defined `#[repr(u8)]` with
 `num_enum::TryFromPrimitive`; every read converts with `try_from(..).map_err(..)`.
 Discriminant 0 of each enum is the correct default meaning (`Open`, `Heads`).
 `#[derive(InitSpace)]` plus `const_assert_eq!(T::INIT_SPACE, N)` on both types.
@@ -119,10 +126,10 @@ delegating call (playbook Phase 4). One file per instruction. `settle_callback` 
 | # | Instruction | Signer | Behavior |
 |---|---|---|---|
 | 1 | `initialize_config(admin, treasury, fee_bps, refund_timeout_slots)` | deployer (first caller — initialize immediately after deploy) | One-time. `fee_bps <= MAX_FEE_BPS`; timeout bounded to [MIN, MAX]_REFUND_TIMEOUT_SLOTS; admin/treasury must be non-default keys |
-| 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). Treasury rotation: in-flight joined games' callbacks still reference the old treasury ATA — settle them via `settle_fallback` with the new treasury ATA if the callback starts failing |
+| 2 | `update_config(...)` | `admin` | Rotate admin/treasury, change `fee_bps` (re-checked against cap) and timeout (re-bounded). Fee changes affect only games created afterwards (snapshot). Treasury rotation: in-flight joined games' callbacks keep paying the OLD treasury's frozen ATA (consistent with the fee-snapshot philosophy; the callback does not re-check live config); new games route to the new treasury. `settle_fallback` always uses the CURRENT treasury |
 | 3 | `create_game(side, amount)` | host + game keypair | `amount > 0`. Validates mint (see Token rules). Inits `Game` + escrow, `transfer_checked` host stake into escrow, records host token account. State = Open |
 | 4 | `cancel_game` | host | Requires state == Open. Refund host stake, close escrow + game (rent to host) |
-| 5 | `join_game` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; ensure treasury ATA exists (`init_if_needed`, payer = joiner). Transfer the current VRF fee (read from ORAO `NetworkState`) in lamports joiner → Client PDA. CPI ORAO `Request` (seed = game pubkey, `Config` PDA signs, Client PDA pays) with a request-level callback targeting `settle_callback` and carrying: game, escrow, host + joiner token accounts, treasury ATA, mint, token program. Record joiner, joiner token account, `joined_at_slot`. State = AwaitingRandomness |
+| 5 | `join_game` | joiner | Requires state == Open, `joiner != host`. Transfer matching stake into escrow; ensure treasury ATA exists (`init_if_needed`, payer = joiner). Transfer the current VRF fee PLUS the pending request account's rent (sized via ORAO's own `RequestAccount::expected_size`) in lamports joiner → Client PDA, so the shared Client balance is exactly neutral per join and cannot be drained by cheap join spam. CPI ORAO `Request` (seed = game pubkey, `Config` PDA signs, Client PDA pays) with a request-level callback targeting `settle_callback` and carrying: game, escrow, host + joiner token accounts, treasury ATA, mint, token program. Record joiner, joiner token account, `joined_at_slot`. State = AwaitingRandomness |
 | 6 | `settle_callback` | ORAO (Client PDA signs via CPI) | Accounts per ORAO's required order: Client PDA (signer, validated by seed derivation under the ORAO program), `Config` (writable), `NetworkState`, fulfilled request account, then our accounts. Runs core settlement (below) |
 | 7 | `settle_fallback` | anyone | Backstop for a failed/ignored callback. Requires state == AwaitingRandomness and the request account for seed = game pubkey is **fulfilled**. Runs the same core settlement |
 | 8 | `refund_timeout` | anyone | Requires state == AwaitingRandomness, `current_slot > joined_at_slot + refund_timeout_slots`, and randomness NOT fulfilled. Return each stake to its player, no fee. Close escrow + game, rent to host |
@@ -151,8 +158,9 @@ create_game ──▶ Open ──cancel_game──▶ Cancelled (host refunded)
 
 ## Randomness safety
 
-- Seed = game pubkey, unique per game. ORAO's `Request` CPI creates the request
-  account for that seed; a pre-existing (precomputed) request makes the join fail.
+- Seed = `sha256("coinflip-vrf-seed", game, joiner)`, unique per game and
+  unpredictable pre-join (see State section). ORAO's `Request` CPI creates the
+  request account for that seed; a pre-existing account makes the join fail.
 - `settle_callback` accepts only the ORAO Client PDA as a signer, validated by seed
   derivation (`[CB_CLIENT_ACCOUNT_SEED, program_id, config]` under the ORAO program) —
   only the VRF program can produce that signature, so nobody can invoke the callback
