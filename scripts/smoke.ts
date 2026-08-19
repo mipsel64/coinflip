@@ -29,7 +29,7 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -54,8 +54,18 @@ function loadKeypair(path: string): web3.Keypair {
   return web3.Keypair.fromSecretKey(new Uint8Array(raw));
 }
 
-/** Persists ephemeral keypairs to a gitignored scratch file so a mid-run crash never strands funds. */
+/**
+ * Persists ephemeral keypairs to a gitignored scratch file so a mid-run crash
+ * never strands funds. Never overwrites a leftover file from a previous run —
+ * that would be exactly the moment its keys are still needed for recovery —
+ * so an existing file is renamed aside (with a timestamp) first.
+ */
 function saveKeys(path: string, keys: Record<string, web3.Keypair>): void {
+  if (existsSync(path)) {
+    const backupPath = path.replace(/\.json$/, `.${Date.now()}.json`);
+    renameSync(path, backupPath);
+    console.log(`Existing ${path} found — moved it to ${backupPath} first.`);
+  }
   const data: Record<string, number[]> = {};
   for (const [name, kp] of Object.entries(keys)) {
     data[name] = Array.from(kp.secretKey);
@@ -75,6 +85,21 @@ if (!PROGRAM_KEYPAIR_PATH) {
 }
 const PROGRAM_ID = loadKeypair(PROGRAM_KEYPAIR_PATH).publicKey;
 
+interface RawIdl {
+  address: string;
+}
+
+const IDL_RAW = require("../target/idl/coinflip.json") as RawIdl;
+
+const idlAddress = new web3.PublicKey(IDL_RAW.address);
+if (!idlAddress.equals(PROGRAM_ID)) {
+  throw new Error(
+    `program id mismatch: target/idl/coinflip.json's address (${idlAddress.toBase58()}) ` +
+      `does not match the keypair's pubkey (${PROGRAM_ID.toBase58()}) — rebuild the IDL ` +
+      "(`anchor build`) after redeploying under a new program id"
+  );
+}
+
 const [CONFIG_PDA] = web3.PublicKey.findProgramAddressSync([Buffer.from("config")], PROGRAM_ID);
 
 /** Mirrors join_game's own derivation: sha256("coinflip-vrf-seed", game, joiner). */
@@ -93,6 +118,22 @@ function sleep(ms: number): Promise<void> {
 function loadProvider(): anchor.AnchorProvider {
   const walletPath = process.env.ANCHOR_WALLET ?? join(homedir(), ".config/solana/id.json");
   const url = process.env.ANCHOR_PROVIDER_URL ?? web3.clusterApiUrl("devnet");
+
+  // This script plays a real game with real funds — refuse anything that
+  // doesn't look like devnet unless the operator explicitly opts in.
+  if (!url.includes("devnet")) {
+    if (process.env.SMOKE_ALLOW_NON_DEVNET !== "1") {
+      throw new Error(
+        `refusing to run against a non-devnet URL (${url}) — this script creates games and ` +
+          "moves real funds. Set SMOKE_ALLOW_NON_DEVNET=1 to override if this is intentional."
+      );
+    }
+    console.warn(
+      `\n*** WARNING: SMOKE_ALLOW_NON_DEVNET=1 is set — running against a NON-DEVNET ` +
+        `cluster (${url}) with REAL funds. ***\n`
+    );
+  }
+
   const wallet = new anchor.Wallet(loadKeypair(walletPath));
   // First output, before anything else happens.
   console.log("Cluster:", url);
@@ -136,7 +177,11 @@ async function findGameSettledEvent(
       const decoded = program.coder.events.decode(
         anchor.utils.bytes.base64.encode(raw.subarray(8))
       );
-      if (decoded?.name === "GameSettled") {
+      // `Program` camelCases the IDL internally before building the events
+      // coder (verified: `program.idl.events[].name` is "gameSettled", not
+      // the "GameSettled" the raw IDL/Rust struct uses), so the decoded
+      // event's name comes back lowercase-first too.
+      if (decoded?.name === "gameSettled") {
         return decoded.data as GameSettledEvent;
       }
     }
@@ -152,8 +197,7 @@ async function main() {
     throw new Error("provider wallet has no local payer keypair");
   }
 
-  const idl = require("../target/idl/coinflip.json") as Coinflip;
-  const program = new anchor.Program<Coinflip>(idl, provider);
+  const program = new anchor.Program<Coinflip>(IDL_RAW as unknown as Coinflip, provider);
   const vrf = new OraoCb(provider);
 
   console.log("Program:", PROGRAM_ID.toBase58());
@@ -299,6 +343,9 @@ async function main() {
         "Could not decode a GameSettled event from the closing transaction " +
           "(check the explorer link below)."
       );
+      // The event is the verifiable proof this smoke test exists to produce —
+      // a missing decode is a failure, not a footnote.
+      process.exitCode = 1;
     }
 
     const treasuryBalanceAfter = await connection.getTokenAccountBalance(treasuryTokenAccount);
@@ -317,6 +364,9 @@ async function main() {
           : `  https://explorer.solana.com/address/${PROGRAM_ID.toBase58()}?cluster=devnet`)
     );
   } else {
+    // The callback not firing within the window is exactly the failure mode
+    // this script exists to catch — it must not exit 0.
+    process.exitCode = 1;
     console.log(
       "Timed out waiting for the callback. The permissionless settle_fallback crank " +
         "derives everything it needs (request, escrow, client, current treasury ATA) " +

@@ -100,6 +100,18 @@ function idlConstant(name: string): anchor.BN {
 const MIN_SETTLE_MARGIN_SLOTS = idlConstant("MIN_SETTLE_MARGIN_SLOTS");
 const MIN_REFUND_TIMEOUT_SLOTS = idlConstant("MIN_REFUND_TIMEOUT_SLOTS");
 
+/**
+ * Rejects anything but a plain base-10 non-negative integer string.
+ * `Number("1oo")` is `NaN`, which borsh would silently serialize as 0 into a
+ * one-shot config account — reject early instead of corrupting it quietly.
+ */
+function parseIntegerOption(value: string, flagName: string): string {
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`invalid ${flagName} "${value}" — must be a non-negative integer`);
+  }
+  return value;
+}
+
 const ALLOWED_CLUSTERS = ["devnet", "mainnet"] as const;
 
 function clusterUrl(cluster: string): string {
@@ -193,14 +205,13 @@ cli
     const program = coinflipProgram(p);
     const admin = opts.admin ? new web3.PublicKey(opts.admin) : p.wallet.publicKey;
     const treasury = opts.treasury ? new web3.PublicKey(opts.treasury) : p.wallet.publicKey;
+    const feeBps = Number(parseIntegerOption(opts.feeBps, "--fee-bps"));
+    const refundTimeoutSlots = new anchor.BN(
+      parseIntegerOption(opts.refundTimeoutSlots, "--refund-timeout-slots")
+    );
 
     const tx = await program.methods
-      .initializeConfig(
-        admin,
-        treasury,
-        Number(opts.feeBps),
-        new anchor.BN(opts.refundTimeoutSlots)
-      )
+      .initializeConfig(admin, treasury, feeBps, refundTimeoutSlots)
       .accounts({
         payer: p.wallet.publicKey,
         programData: programDataAddress(PROGRAM_ID),
@@ -237,6 +248,8 @@ cli
           `exceeds refund_timeout_slots (${config.refundTimeoutSlots.toString()}) — join_game ` +
           "will reject every join until refund_timeout_slots is raised via update_config."
       );
+      // Non-zero so this can gate a monitor/runbook, not just a human reading stdout.
+      process.exitCode = 1;
     } else {
       console.log(
         "OK: refund_timeout_slots clears ORAO's callback deadline by the required margin."
@@ -267,10 +280,18 @@ cli
     const game = await program.account.game.fetch(gamePubkey);
     const config = await program.account.config.fetch(CONFIG_PDA);
 
+    const mintInfo = await p.connection.getAccountInfo(game.tokenMint);
+    if (!mintInfo) {
+      throw new Error(`mint ${game.tokenMint.toBase58()} not found`);
+    }
+
+    // Must pass the mint's actual owning token program: a Token-2022 game's
+    // treasury ATA lives at a different address than the classic-SPL one.
     const treasuryTokenAccount = getAssociatedTokenAddressSync(
       game.tokenMint,
       config.treasury,
-      true
+      true,
+      mintInfo.owner
     );
     const hostTokenAccount = opts.hostTokenAccount
       ? new web3.PublicKey(opts.hostTokenAccount)
@@ -278,11 +299,6 @@ cli
     const joinerTokenAccount = opts.joinerTokenAccount
       ? new web3.PublicKey(opts.joinerTokenAccount)
       : game.joinerTokenAccount;
-
-    const mintInfo = await p.connection.getAccountInfo(game.tokenMint);
-    if (!mintInfo) {
-      throw new Error(`mint ${game.tokenMint.toBase58()} not found`);
-    }
 
     const tx = await program.methods
       .settleFallback()
